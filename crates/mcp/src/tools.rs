@@ -1,0 +1,2617 @@
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+use anyhow::{Context, Result, anyhow, ensure};
+use base64::{Engine as _, prelude::BASE64_STANDARD};
+use nuzky_analysis::{SceneParams, SilenceParams};
+use nuzky_engine::{
+    Pending, Project, Renderer, check,
+    edit::{EditCmd, TimeRange, new_id},
+    export::{ExportOptions, ExportPhase, Quality, check_options, export},
+    media::probe,
+    model::{ClipContent, ReelStatus, Thumbnail, ThumbnailFormat},
+    thumbnail::ImageKind,
+};
+use nuzky_session::{
+    Expect, Mode, ProjectSession, SessionState, Target,
+    host::Host,
+    jobs::{Progress, check_cancel},
+};
+use rmcp::model::{CallToolResult, ContentBlock};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+use crate::{activity, media, params::*, plugins, reels, transcript, vision_models, waveform};
+
+const PREVIEW_CHARS: usize = 400;
+/// apply_edits leaves out clips longer than this: restyling 117 captions once answered 64 thousand characters,
+/// more than the agent could read.
+const MAX_CLIPS_CHARS: usize = 8_000;
+/// How long activity waits for its job before handing it over to the client.
+const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct PreparedImport {
+    paths: Vec<String>,
+    assets: Vec<nuzky_engine::model::Asset>,
+    expect: Expect,
+}
+
+struct PreparedTranscriptEdit {
+    arguments: Value,
+    edits: Vec<EditCmd>,
+    expect: Expect,
+    response: Value,
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    #[serde(rename = "read")]
+    ReadOnly,
+    Write,
+}
+
+pub struct Client {
+    pub id: String,
+    pub access: Access,
+}
+
+pub struct Backend {
+    pub host: Arc<Host>,
+    client: Client,
+    runs: Mutex<HashSet<String>>,
+    closed: AtomicBool,
+    project_dir: PathBuf,
+    project_path: PathBuf,
+    export_queue: Arc<Mutex<()>>,
+    transcript_requests: Mutex<HashMap<(String, String), PreparedTranscriptEdit>>,
+    import_requests: Mutex<HashMap<(String, String), PreparedImport>>,
+    sound_requests: Mutex<HashMap<(String, String), (String, PreparedSound)>>,
+    video_requests: Mutex<HashMap<(String, String), PreparedVideo>>,
+    sticker_requests: Mutex<HashMap<(String, String), PreparedSticker>>,
+    /// Why this agent cannot have the speech model: the user said not now, stopped the download or it failed.
+    model_refused: Arc<Mutex<Option<String>>>,
+    vision_refused: vision_models::Refused,
+}
+
+/// The asset the sound became and the edits that add it.
+type PreparedSound = (String, Vec<EditCmd>, Expect);
+type PreparedVideo = (Value, String, Vec<EditCmd>, Expect);
+type PreparedSticker = (Value, crate::stickers::Prepared, Expect);
+
+impl Backend {
+    pub fn open(project: &Path, allow_write: bool, cache: PathBuf) -> Result<Self> {
+        let session = ProjectSession::open(project, if allow_write { Mode::Write } else { Mode::ReadOnly }, None)?;
+        Self::shared(
+            Arc::new(Host::new(session, cache)?),
+            project,
+            Client { id: new_id(), access: if allow_write { Access::Write } else { Access::ReadOnly } },
+        )
+    }
+
+    pub fn shared(host: Arc<Host>, project: &Path, client: Client) -> Result<Self> {
+        let project_path = dunce::canonicalize(project).context("PROJECT_MISSING: resolving project")?;
+        let project_dir = project_path.parent().context("INVALID_PROJECT: no directory")?.to_path_buf();
+        std::fs::create_dir_all(&host.cache_dir).context("CACHE_UNAVAILABLE: creating media cache")?;
+        Ok(Self {
+            host,
+            client,
+            runs: Mutex::default(),
+            closed: AtomicBool::new(false),
+            project_dir,
+            project_path,
+            export_queue: Arc::default(),
+            transcript_requests: Mutex::default(),
+            import_requests: Mutex::default(),
+            sound_requests: Mutex::default(),
+            video_requests: Mutex::default(),
+            sticker_requests: Mutex::default(),
+            model_refused: Arc::default(),
+            vision_refused: Arc::default(),
+        })
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.host.jobs.cancel_owner(&self.client.id);
+    }
+
+    pub fn disconnect(&self) -> Result<()> {
+        self.close();
+        let runs = self.runs.lock().unwrap();
+        if let Some(run) = self.host.session.state()?.open_run
+            && runs.contains(&run.run_id)
+        {
+            self.host.session.end_run(&run.run_id, nuzky_session::EndAction::Keep)?;
+        }
+        Ok(())
+    }
+
+    pub fn call(&self, name: &str, arguments: Value) -> Result<CallToolResult> {
+        self.call_inner(name, arguments).map(crate::limits::tool_result)
+    }
+
+    /// The call as a client gets it: a failure, or a panic, is the tool's error result.
+    pub fn answer(&self, name: &str, arguments: Value) -> CallToolResult {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.call(name, arguments)))
+            .unwrap_or_else(|_| Err(anyhow!("TOOL_FAILED: worker panicked")))
+            .unwrap_or_else(|e| tool_error(self, format!("{e:#}")))
+    }
+
+    fn call_inner(&self, name: &str, arguments: Value) -> Result<CallToolResult> {
+        let rules = crate::rules::find(name);
+        let read = rules.is_some_and(|rules| rules.reads(&arguments));
+        let mut runs = (!read).then(|| self.runs.lock().unwrap());
+        ensure!(!self.closed.load(Ordering::Acquire), "CLIENT_CLOSED: client disconnected");
+        // Reads never hold this client's run lock while the session is locked.
+        let owned = match &runs {
+            Some(runs) => self.host.session.touch_run(|run| runs.contains(run)),
+            None => {
+                let runs = self.runs.lock().unwrap().clone();
+                self.host.session.touch_run(|run| runs.contains(run))
+            }
+        };
+        owned?;
+        let mut state = self.host.session.state()?;
+        // Reads hold no run lock, so they look up whose run it is for the moment of this check.
+        let mine = |run: &str| match &runs {
+            Some(runs) => runs.contains(run),
+            None => self.runs.lock().unwrap().contains(run),
+        };
+        if rules.is_some_and(|rules| rules.run_job) && state.open_run.as_ref().is_some_and(|run| !mine(&run.run_id)) {
+            state.open_run = None;
+        }
+        ensure!(read || self.client.access == Access::Write, "READ_ONLY: this client cannot mutate");
+        if let Some(run) = arguments.get("run_id").and_then(Value::as_str) {
+            ensure!(mine(run), "INVALID_RUN: run belongs to another client");
+            if name != "undo_run" {
+                self.host.session.check_run(run)?;
+            }
+        }
+        state.read_only |= self.client.access == Access::ReadOnly;
+        if name == "inspect_frames" {
+            return self.inspect(parse(arguments)?, &state);
+        }
+        if name == "inspect_thumbnail" {
+            return self.inspect_thumbnail(parse(arguments)?, &state);
+        }
+        if name == "inspect_image" {
+            return self.inspect_image(parse(arguments)?, &state);
+        }
+        if name == "get_waveform" {
+            return self.waveform(parse(arguments)?, &state);
+        }
+        let mut value = self.dispatch(name, arguments, &state)?;
+        if name == "begin_run"
+            && let Some(id) = value["run_id"].as_str()
+            && let Some(runs) = &mut runs
+        {
+            runs.insert(id.to_owned());
+        }
+        let object = value.as_object_mut().context("Tool produced a non-object result")?;
+        object.entry("revision").or_insert(json!(state.stamp.revision));
+        object.entry("session_epoch").or_insert(json!(state.stamp.session_epoch));
+        Ok(CallToolResult::structured(value))
+    }
+
+    fn dispatch(&self, name: &str, arguments: Value, state: &SessionState) -> Result<Value> {
+        match name {
+            "get_state" => {
+                let args: State = parse(arguments)?;
+                let unfiltered = args.range.is_none() && args.clip_ids.is_none();
+                let mut value = state_value(state, args)?;
+                if unfiltered {
+                    share_text_defaults(&mut value);
+                }
+                Ok(value)
+            }
+            "begin_run" => {
+                let a: Begin = parse(arguments)?;
+                Ok(serde_json::to_value(self.host.session.begin_run(a.label)?)?)
+            }
+            "resolve_recovery" => {
+                let a: Recovery = parse(arguments)?;
+                let action = match a.action {
+                    RecoveryAction::Keep => nuzky_session::RecoveryAction::Keep,
+                    RecoveryAction::Restore => nuzky_session::RecoveryAction::Restore,
+                };
+                Ok(serde_json::to_value(self.host.session.resolve_recovery(action)?)?)
+            }
+            "apply_edits" => {
+                let a: Apply = parse(arguments)?;
+                check_new_assets(&a.edits)?;
+                let warnings = crate::fonts::warnings(a.edits.iter().flat_map(crate::fonts::edit_families));
+                let mut result = serde_json::to_value(self.host.session.apply_edits(
+                    &a.run_id,
+                    &a.request_id,
+                    a.edits,
+                    Expect { revision: a.expected_revision, speech_layout_key: a.expected_speech_layout_key },
+                )?)?;
+                if result["clips"].to_string().len() > MAX_CLIPS_CHARS
+                    && let Some(clips) = result.as_object_mut().and_then(|r| r.remove("clips"))
+                {
+                    result["clips_omitted"] = json!(clips.as_array().map_or(0, Vec::len));
+                }
+                Ok(with_warnings(result, warnings))
+            }
+            "end_run" => {
+                let a: End = parse(arguments)?;
+                let action = match a.action {
+                    EndAction::Keep => nuzky_session::EndAction::Keep,
+                    EndAction::Discard => nuzky_session::EndAction::Discard,
+                };
+                Ok(serde_json::to_value(self.host.session.end_run(&a.run_id, action)?)?)
+            }
+            "undo_run" => {
+                let a: Undo = parse(arguments)?;
+                Ok(serde_json::to_value(self.host.session.undo_run(&a.run_id)?)?)
+            }
+            "list_history" => {
+                let a: ListHistory = parse(arguments)?;
+                let limit = a.limit.unwrap_or(20);
+                ensure!((1..=nuzky_session::MAX_VERSIONS).contains(&limit), "INVALID_ARGUMENTS: limit is 1 to 200");
+                Ok(serde_json::to_value(self.host.session.list_history(limit)?)?)
+            }
+            "undo_to" => {
+                let a: UndoTo = parse(arguments)?;
+                let target = match (a.index, a.hash) {
+                    (Some(index), None) => Target::Index(index),
+                    (None, Some(hash)) => Target::Hash(hash),
+                    _ => anyhow::bail!("INVALID_ARGUMENTS: give index or hash"),
+                };
+                Ok(serde_json::to_value(self.host.session.undo_to(target)?)?)
+            }
+            // The style belongs to the creator, not to the project: no run, and the project is untouched.
+            "get_style" => {
+                let _: GetStyle = parse(arguments)?;
+                crate::style::for_agent(&crate::style::Store::default().view()?)
+            }
+            "change_style" => {
+                let a: ChangeStyle = parse(arguments)?;
+                crate::style::for_agent(&crate::style::Store::default().act_for_agent(a.action)?)
+            }
+            "list_plugins" => {
+                let a: ListPlugins = parse(arguments)?;
+                let mut result = json!({"plugins": plugins::list()?, "api": plugins::API});
+                if a.guide == Some(true) {
+                    result["guide"] = json!(plugins::GUIDE);
+                }
+                Ok(result)
+            }
+            "save_plugin" => {
+                let a: SavePlugin = parse(arguments)?;
+                let (script, readme) = (a.script.as_deref(), a.readme.as_deref());
+                Ok(json!({"plugin": plugins::save_with_files(&a.manifest, script, readme, &a.files, &a.effects)?}))
+            }
+            "run_plugin" => self.run_plugin(parse(arguments)?, state),
+            "suggest_options" => {
+                let a: SuggestOptions = parse(arguments)?;
+                ensure!((2..=6).contains(&a.options.len()), "INVALID_ARGUMENTS: offer 2 to 6 options");
+                let short = |text: &Option<String>| text.as_ref().is_none_or(|t| t.chars().count() <= 300);
+                ensure!(short(&a.question), "INVALID_ARGUMENTS: keep the question under 300 characters");
+                ensure!(
+                    a.options.iter().all(|c| short(&c.detail)),
+                    "INVALID_ARGUMENTS: keep each detail under 300 characters"
+                );
+                let mut seen = HashSet::new();
+                for choice in &a.options {
+                    let label = choice.label.trim();
+                    ensure!(
+                        !label.is_empty() && label.chars().count() <= 80,
+                        "INVALID_ARGUMENTS: each label needs 1 to 80 characters"
+                    );
+                    ensure!(seen.insert(label.to_lowercase()), "INVALID_ARGUMENTS: labels must differ");
+                }
+                Ok(
+                    json!({"shown": a.options.len(), "next": "End your turn with a short message in the user's language: first say what you changed this turn, if anything, then that the choices are below. The label the user picks arrives as their next message."}),
+                )
+            }
+            "import_media" => self.import(parse(arguments)?, state),
+            "search_sounds" => search_sounds(parse(arguments)?),
+            "add_sound" => self.add_sound(parse(arguments)?, state),
+            "add_youtube_video" => self.add_youtube_video(parse(arguments)?, state),
+            "import_web_image" => self.import_web_image(parse(arguments)?, state),
+            "add_sticker" => self.add_sticker(parse(arguments)?, state),
+            "activity" => self.activity(parse(arguments)?, state),
+            "analyze" => self.analyze(parse(arguments)?, state),
+            "segment_subject" => self.segment_subject(parse(arguments)?, state),
+            "reframe" => self.reframe(parse(arguments)?, state),
+            "transcribe" => self.transcribe(parse(arguments)?, state),
+            "get_transcript" => self.get_transcript(parse(arguments)?, state),
+            "edit_transcript" => self.edit_transcript(parse(arguments)?, state),
+            "correct_words" => self.correct_words(parse(arguments)?, state),
+            "job" => {
+                let a: Job = parse(arguments)?;
+                if matches!(a.action, JobAction::Wait) {
+                    let timeout = a.timeout_s.unwrap_or(25);
+                    ensure!(timeout <= 30, "INVALID_ARGUMENTS: timeout_s is at most 30");
+                    self.host.jobs.wait_for(
+                        &self.client.id,
+                        &a.job_id,
+                        std::time::Duration::from_secs(timeout),
+                        &self.closed,
+                    )
+                } else {
+                    self.host.jobs.get_for(Some(&self.client.id), &a.job_id, matches!(a.action, JobAction::Cancel))
+                }
+            }
+            "build_captions" => self.captions(parse(arguments)?, state),
+            "apply_zooms" => self.apply_zooms(parse(arguments)?, state),
+            "cut_to_beats" => self.cut_to_beats(parse(arguments)?, state),
+            "apply_motion" => self.apply_motion(parse(arguments)?, state),
+            "propose_reels" => self.propose_reels(parse(arguments)?, state),
+            "make_reels" => self.make_reels(parse(arguments)?, state),
+            "export_video" => self.export(parse(arguments)?, state),
+            "export_thumbnail" => self.export_thumbnail(parse(arguments)?, state),
+            _ => anyhow::bail!("UNKNOWN_TOOL: {name}"),
+        }
+    }
+
+    fn inspect(&self, args: Inspect, state: &SessionState) -> Result<CallToolResult> {
+        if let Some(job_id) = &args.export_job_id {
+            return self.inspect_export(job_id, &args);
+        }
+        let project = self.media_project(&state.project);
+        let mut info = json!({"revision": state.stamp.revision, "session_epoch": state.stamp.session_epoch,
+            "labels": "seconds.microseconds"});
+        let times = match args.sample {
+            None => {
+                ensure!(
+                    args.range_us.is_none()
+                        && args.cursor.is_none()
+                        && args.max_frames.is_none()
+                        && args.min_change.is_none(),
+                    "INVALID_ARGUMENTS: range_us, cursor, max_frames and min_change go with sample \"changes\""
+                );
+                args.times_us.context("INVALID_ARGUMENTS: give times_us, or sample \"changes\"")?
+            }
+            Some(Sample::Changes) => {
+                ensure!(args.times_us.is_none(), "INVALID_ARGUMENTS: give times_us or sample, not both");
+                let max = args.max_frames.unwrap_or(media::MAX_FRAMES);
+                ensure!((1..=media::MAX_FRAMES).contains(&max), "INVALID_ARGUMENTS: max_frames must be 1..=16");
+                let cursor = match args.cursor {
+                    Some(cursor) => {
+                        ensure!(
+                            args.range_us.is_none() && args.min_change.is_none(),
+                            "INVALID_ARGUMENTS: the cursor carries range_us and min_change; leave them out"
+                        );
+                        activity::Cursor::decode(&cursor, &state.stamp.session_epoch, state.stamp.revision)?
+                    }
+                    None => {
+                        let min_change = args.min_change.unwrap_or(activity::DEFAULT_MIN_CHANGE);
+                        ensure!(min_change < 64, "INVALID_ARGUMENTS: min_change must be 0..=63");
+                        let range = activity::timeline_range(&project, args.range_us)?;
+                        activity::Cursor::new(&state.stamp.session_epoch, state.stamp.revision, range, min_change)
+                    }
+                };
+                media::check_media(&project)?;
+                let (range, every) = (cursor.range(), cursor.every());
+                let found = activity::changes(&project, cursor, max, &|| self.closed.load(Ordering::Acquire))?;
+                info["sample"] = json!("changes");
+                info["range_us"] = json!([range.0, range.1]);
+                info["candidate_every_us"] = json!(every);
+                info["skipped"] = json!(found.skipped);
+                info["next"] = json!(found.next);
+                if found.times.is_empty() {
+                    info["times_us"] = json!([]);
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(info.to_string())]));
+                }
+                found.times
+            }
+        };
+        self.require_mattes(&project, state)?;
+        let bytes = media::contact_sheet(&project, &times, args.width, args.safe_area, &self.host.cache_dir)?;
+        info["times_us"] = json!(times);
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(info.to_string()),
+            ContentBlock::image(BASE64_STANDARD.encode(bytes), "image/png"),
+        ]))
+    }
+
+    /// Frames of the file an export of this client wrote, decoded from the file: the path comes from the job, never
+    /// from the agent.
+    fn inspect_export(&self, job_id: &str, args: &Inspect) -> Result<CallToolResult> {
+        ensure!(
+            args.sample.is_none()
+                && args.range_us.is_none()
+                && args.cursor.is_none()
+                && args.max_frames.is_none()
+                && args.min_change.is_none()
+                && !args.safe_area,
+            "INVALID_ARGUMENTS: with export_job_id give only times_us and width"
+        );
+        let times = args.times_us.as_ref().context("INVALID_ARGUMENTS: give times_us with export_job_id")?;
+        let job = self.host.jobs.get_for(Some(&self.client.id), job_id, false)?;
+        ensure!(
+            job["owner"] == self.client.id.as_str() && job["kind"] == "export",
+            "INVALID_ARGUMENTS: export_job_id must name an export_video job you started"
+        );
+        ensure!(
+            job["status"] == "done",
+            "EXPORT_NOT_DONE: the export is {}; wait with job action wait until done",
+            job["status"].as_str().unwrap_or("unknown")
+        );
+        let path = job["result"]["path"].as_str().context("The export job names no file")?;
+        let bytes = media::file_sheet(Path::new(path), times, args.width, &|| self.closed.load(Ordering::Acquire))?;
+        let info = json!({"export_job_id": job_id, "path": path, "times_us": times, "labels": "seconds.microseconds"});
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(info.to_string()),
+            ContentBlock::image(BASE64_STANDARD.encode(bytes), "image/png"),
+        ]))
+    }
+
+    fn waveform(&self, args: Waveform, state: &SessionState) -> Result<CallToolResult> {
+        let width = args.width.unwrap_or(waveform::DEFAULT_WIDTH);
+        ensure!((400..=2400).contains(&width), "INVALID_ARGUMENTS: width must be 400..=2400");
+        let project = self.media_project(&state.project);
+        let range = activity::timeline_range(&project, Some(args.range_us))?;
+        ensure!(
+            range.1 - range.0 <= waveform::MAX_RANGE_US,
+            "INVALID_RANGE: range_us spans at most 60 s; look at a second or two around a cut"
+        );
+        media::check_media(&project)?;
+        let derived = transcript::derive(&project, &self.host.transcripts)?;
+        self.prepare_sound(&project, state, "get_waveform")?;
+        let (png, cuts) = waveform::draw(&project, &derived.sources, &self.host.cache_dir, range, width)?;
+        let info = json!({"revision": state.stamp.revision, "session_epoch": state.stamp.session_epoch,
+            "range_us": [range.0, range.1], "cuts": cuts, "untranscribed": derived.untranscribed});
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(info.to_string()),
+            ContentBlock::image(BASE64_STANDARD.encode(png), "image/png"),
+        ]))
+    }
+
+    /// Renders and mixes the range as a job, so a long range reports progress and can be cancelled,
+    /// and answers in this call when the job finishes within a few seconds.
+    fn activity(&self, args: Activity, state: &SessionState) -> Result<Value> {
+        let points = args.points.unwrap_or(60);
+        ensure!((8..=200).contains(&points), "INVALID_ARGUMENTS: points must be 8..=200");
+        let project = self.media_project(&state.project);
+        let range = activity::timeline_range(&project, args.range_us)?;
+        media::check_media(&project)?;
+        let cache = self.host.cache_dir.clone();
+        // Everything the mix can play, music included, also sound that a transition carries over
+        // the range's edge; the mix leaves out files whose sound is not prepared.
+        let heard: HashSet<&str> = project
+            .tracks
+            .iter()
+            .filter(|track| !track.muted && track.kind != nuzky_engine::model::TrackKind::Text)
+            .flat_map(|track| &track.clips)
+            .filter_map(|clip| match &clip.content {
+                nuzky_engine::model::ClipContent::Media { asset_id, volume, .. } if *volume > 0.0 => {
+                    Some(asset_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let unprepared: Vec<_> = project
+            .assets
+            .iter()
+            .filter(|a| heard.contains(a.id.as_str()) && nuzky_engine::audio::has_audio(a))
+            .filter(|a| !nuzky_engine::audio::pcm_path(&cache, a).exists())
+            .cloned()
+            .collect();
+        let job = self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "activity",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                for (i, asset) in unprepared.iter().enumerate() {
+                    progress.set("preparing_audio", Some(i as f32 / unprepared.len() as f32));
+                    nuzky_engine::audio::ensure_pcm(&cache, asset, |_| check_cancel(&cancel))?;
+                }
+                let cancelled = || cancel.load(Ordering::Relaxed);
+                activity::activity(&project, &cache, range, points, &cancelled, &|done| {
+                    progress.set("looking", Some(done))
+                })
+            },
+        )?;
+        self.answer_job(&job)
+    }
+
+    /// The job's result when it finishes within a few seconds, else the job to wait for.
+    fn answer_job(&self, job: &Value) -> Result<Value> {
+        let id = job["job_id"].as_str().context("Job has no id")?.to_owned();
+        let deadline = std::time::Instant::now() + ANSWER_WAIT;
+        loop {
+            let job = self.host.jobs.get(&id, false)?;
+            match job["status"].as_str() {
+                Some("done") => return Ok(job["result"].clone()),
+                Some("failed") => anyhow::bail!("{}", job["error"].as_str().unwrap_or("JOB_FAILED")),
+                Some("running") if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => return Ok(job),
+            }
+        }
+    }
+
+    fn run_plugin(&self, args: RunPlugin, state: &SessionState) -> Result<Value> {
+        let (run, mode) = if args.dry_run {
+            (state.open_run.as_ref().map(|run| run.run_id.clone()), plugins::Mode::DryRun)
+        } else {
+            let run_id = args.run_id.context("INVALID_ARGUMENTS: run_id is required unless dry_run is true")?;
+            owns_run(state, &run_id)?;
+            (Some(run_id), plugins::Mode::Apply)
+        };
+        let prepared = plugins::prepare(
+            &self.host,
+            state,
+            &args.id,
+            &args.inputs,
+            args.action.as_deref(),
+            args.selection,
+            args.playhead_us,
+        )?;
+        self.answer_job(&plugins::start(&self.host, &self.client.id, run, mode, prepared, state)?)
+    }
+
+    fn import(&self, args: Import, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        ensure!(!args.paths.is_empty(), "INVALID_ARGUMENTS: no paths to import");
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let mut requests = self.import_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &args.run_id);
+        // A retry after a failed save reuses the probed assets, so it never adds them twice.
+        let prepared = match requests.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                ensure!(entry.get().paths == args.paths, "REQUEST_CONFLICT: request_id was used with different paths");
+                entry.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let assets = args
+                    .paths
+                    .iter()
+                    .map(|p| {
+                        let path = self.resolve(p);
+                        ensure!(path.is_file(), "MEDIA_MISSING: {}", path.display());
+                        probe(&kept(dunce::canonicalize(&path).context("Resolving media path")?)?, new_id())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entry.insert(PreparedImport {
+                    paths: args.paths,
+                    assets,
+                    expect: Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+                })
+            }
+        };
+        let ids: Vec<_> = prepared.assets.iter().map(|a| a.id.clone()).collect();
+        let result = self.host.session.apply_edits(
+            &args.run_id,
+            &request_id,
+            vec![EditCmd::AddAssets { assets: prepared.assets.clone() }],
+            prepared.expect.clone(),
+        )?;
+        Ok(json!({"revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch, "asset_ids": ids}))
+    }
+
+    /// Downloads the sound when needed, then adds it and its clip as one edit of the run.
+    fn add_sound(&self, args: AddSound, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        ensure!(args.at_us >= 0, "INVALID_ARGUMENTS: at_us must not be negative");
+        if args.rights_confirmed == Some(true) && args.id.starts_with("youtube:") {
+            crate::sounds::confirm_youtube_rights()?;
+        }
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let prepared = {
+            let mut requests = self.sound_requests.lock().unwrap();
+            requests.retain(|(run, _), _| run == &args.run_id);
+            match requests.get(&key) {
+                Some((id, prepared)) => {
+                    ensure!(id == &args.id, "REQUEST_CONFLICT: request_id was used with another sound");
+                    prepared.clone()
+                }
+                None => {
+                    // A retry after a failed save reuses this, so the asset is never added twice.
+                    let mut edits = Vec::new();
+                    let asset_id = match crate::sounds::existing(&state.project.assets, &args.id) {
+                        Some(asset) => asset.id.clone(),
+                        None => {
+                            // Stop in the app ends the run, and with it the download.
+                            let stopped = || {
+                                self.closed.load(Ordering::Acquire)
+                                    || self.host.session.check_run(&args.run_id).is_err()
+                            };
+                            let asset = crate::sounds::asset(&args.id, &self.host.cache_dir, stopped, |_| {})?;
+                            let id = asset.id.clone();
+                            edits.push(EditCmd::AddAssets { assets: vec![asset] });
+                            id
+                        }
+                    };
+                    edits.push(EditCmd::AddClip {
+                        asset_id: asset_id.clone(),
+                        start_us: Some(args.at_us),
+                        track_id: None,
+                    });
+                    let prepared =
+                        (asset_id, edits, Expect { revision: Some(state.stamp.revision), speech_layout_key: None });
+                    requests.insert(key, (args.id.clone(), prepared.clone()));
+                    prepared
+                }
+            }
+        };
+        let (asset_id, edits, expect) = prepared;
+        let result = self.host.session.apply_edits(&args.run_id, &request_id, edits, expect)?;
+        let snapshot = self.host.session.state()?.project;
+        let asset = snapshot.asset(&asset_id).context("Added sound is missing")?;
+        let clip = result.clips.iter().find(|c| matches!(&c.clip.content, nuzky_engine::model::ClipContent::Media { asset_id: a, .. } if a == &asset_id));
+        let credit = asset.credit.as_ref();
+        Ok(json!({
+            "revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch,
+            "asset_id": asset_id, "clip_id": clip.map(|c| &c.clip.id), "track_id": clip.map(|c| &c.track_id),
+            "start_us": clip.map(|c| c.clip.start_us), "duration_us": clip.map(|c| c.clip.duration_us),
+            "needs_credit": credit.is_some_and(|c| c.license == nuzky_engine::model::License::CcBy),
+            "credit": credit,
+        }))
+    }
+
+    fn add_youtube_video(&self, args: AddYoutubeVideo, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        ensure!(args.at_us.is_none_or(|t| t >= 0), "INVALID_ARGUMENTS: at_us must not be negative");
+        let part = match (args.start_us, args.end_us) {
+            (Some(start_us), Some(end_us)) => Some(nuzky_engine::model::Part { start_us, end_us }),
+            (None, None) => None,
+            _ => anyhow::bail!("INVALID_ARGUMENTS: pass both start_us and end_us, or neither"),
+        };
+        if args.rights_confirmed == Some(true) {
+            crate::sounds::confirm_youtube_rights()?;
+        }
+        let request_id = args.request_id.unwrap_or_else(new_id);
+        let tag = json!([args.link, args.start_us, args.end_us, args.at_us]);
+        let (_, asset_id, edits, expect) = {
+            let mut requests = self.video_requests.lock().unwrap();
+            requests.retain(|(run, _), _| run == &args.run_id);
+            let key = (args.run_id.clone(), request_id.clone());
+            match requests.get(&key) {
+                Some(prepared) => {
+                    ensure!(prepared.0 == tag, "REQUEST_CONFLICT: request_id was used with other video arguments");
+                    prepared.clone()
+                }
+                None => {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (cache, worker_stop, link) = (self.host.cache_dir.clone(), stop.clone(), args.link.clone());
+                    // The lookup runs here too, so a Stop while YouTube is slow to answer returns at once.
+                    std::thread::Builder::new().name("youtube-video-download".into()).spawn(move || {
+                        let asset = crate::videos::link(&link, &worker_stop).and_then(|video| {
+                            // Stopped while looking up: nothing more to download.
+                            ensure!(!worker_stop.load(Ordering::Relaxed), "CANCELLED: the download stopped");
+                            crate::videos::asset(&video, part, &cache, &worker_stop, |_| {})
+                        });
+                        tx.send(asset).ok();
+                    })?;
+                    let asset = loop {
+                        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(result) => break result?,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if self.closed.load(Ordering::Acquire)
+                                    || self.host.session.check_run(&args.run_id).is_err()
+                                {
+                                    stop.store(true, Ordering::Relaxed);
+                                    anyhow::bail!("CANCELLED: the download stopped");
+                                }
+                                // A long download is work of the run, not idleness that ends it.
+                                self.host.session.touch_run(|run| run == args.run_id)?;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                anyhow::bail!("SOURCE_FAILED: the download stopped unexpectedly");
+                            }
+                        }
+                    };
+                    let asset_id = asset.id.clone();
+                    let mut edits = vec![EditCmd::AddAssets { assets: vec![asset] }];
+                    if let Some(at_us) = args.at_us {
+                        edits.push(EditCmd::AddClip {
+                            asset_id: asset_id.clone(),
+                            start_us: Some(at_us),
+                            track_id: None,
+                        });
+                    }
+                    let prepared = (
+                        tag,
+                        asset_id,
+                        edits,
+                        Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+                    );
+                    requests.insert(key, prepared.clone());
+                    prepared
+                }
+            }
+        };
+        let result = self.host.session.apply_edits(&args.run_id, &request_id, edits, expect)?;
+        let snapshot = self.host.session.state()?.project;
+        let asset = snapshot.asset(&asset_id).context("Added video is missing")?;
+        let clip = result.clips.iter().find(|c| matches!(&c.clip.content, nuzky_engine::model::ClipContent::Media { asset_id: a, .. } if a == &asset_id));
+        Ok(json!({
+            "revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch,
+            "asset_id": asset_id, "asset_duration_us": asset.duration_us, "part": asset.part,
+            "clip_id": clip.map(|c| &c.clip.id), "track_id": clip.map(|c| &c.track_id),
+            "start_us": clip.map(|c| c.clip.start_us),
+            "duration_us": clip.map_or(asset.duration_us, |c| c.clip.duration_us),
+        }))
+    }
+
+    /// A picture the project has already goes through the edit as well, which changes nothing but saves, so a save
+    /// that failed the first time is retried.
+    fn import_web_image(&self, args: ImportWebImage, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        // Stop in the app ends the run, and with it the download.
+        let stopped = || self.closed.load(Ordering::Acquire) || self.host.session.check_run(&args.run_id).is_err();
+        let (asset, url) = match crate::web_image::fetch(&args.url, stopped)? {
+            crate::web_image::Found::Picture(asset, url) => (*asset, url),
+            crate::web_image::Found::Page(pictures) => return Ok(json!({"asset_id": null, "pictures": pictures})),
+        };
+        let asset = match state.project.assets.iter().find(|a| Path::new(&a.path) == Path::new(&asset.path)) {
+            Some(existing) => existing.clone(),
+            None => asset,
+        };
+        let result = self.host.session.apply_edits(
+            &args.run_id,
+            &new_id(),
+            vec![EditCmd::AddAssets { assets: vec![asset.clone()] }],
+            Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+        )?;
+        Ok(json!({
+            "revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch, "asset_id": asset.id,
+            "name": asset.name, "width": asset.width, "height": asset.height, "url": url,
+        }))
+    }
+
+    fn add_sticker(&self, args: AddSticker, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        ensure!(args.at_us >= 0, "INVALID_ARGUMENTS: at_us must not be negative");
+        ensure!(args.duration_us.is_none_or(|d| d > 0), "INVALID_ARGUMENTS: duration_us must be positive");
+        let pick = crate::stickers::find(&args.sticker)?;
+        let request_id = args.request_id.unwrap_or_else(new_id);
+        let tag = json!([pick.key, args.at_us, args.duration_us, args.transform]);
+        let (prepared, expect) = {
+            let mut requests = self.sticker_requests.lock().unwrap();
+            requests.retain(|(run, _), _| run == &args.run_id);
+            let key = (args.run_id.clone(), request_id.clone());
+            match requests.get(&key) {
+                Some((previous, prepared, expect)) => {
+                    ensure!(previous == &tag, "REQUEST_CONFLICT: request_id was used with other sticker arguments");
+                    (prepared.clone(), expect.clone())
+                }
+                None => {
+                    let prepared = crate::stickers::prepare(
+                        pick,
+                        &state.project.assets,
+                        args.at_us,
+                        args.duration_us,
+                        args.transform,
+                    )?;
+                    let expect = Expect { revision: Some(state.stamp.revision), speech_layout_key: None };
+                    requests.insert(key, (tag, prepared.clone(), expect.clone()));
+                    (prepared, expect)
+                }
+            }
+        };
+        let result = self.host.session.apply_edits(&args.run_id, &request_id, prepared.edits, expect)?;
+        let clip = result.clips.iter().find(|c| matches!(&c.clip.content, nuzky_engine::model::ClipContent::Media { asset_id, .. } if asset_id == &prepared.asset_id)).context("Added sticker is missing")?;
+        let nuzky_engine::model::ClipContent::Media { transform, .. } = &clip.clip.content else { unreachable!() };
+        Ok(json!({
+            "revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch,
+            "asset_id": prepared.asset_id, "clip_id": clip.clip.id, "track_id": clip.track_id,
+            "start_us": clip.clip.start_us, "duration_us": clip.clip.duration_us, "transform": transform,
+            "sticker": {"key": pick.key, "emoji": pick.emoji, "name": pick.name},
+        }))
+    }
+
+    fn analyze(&self, args: Analyze, state: &SessionState) -> Result<Value> {
+        if matches!(args.kind, AnalysisKind::Retakes) {
+            // Pure computation over stored words, so it answers at once instead of as a job.
+            ensure!(args.asset_id.is_none(), "INVALID_ARGUMENTS: retakes reads the whole timeline; omit asset_id");
+            let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+            ensure!(
+                derived.untranscribed.is_empty(),
+                "TRANSCRIPT_MISSING: transcribe every heard asset first, untranscribed: {}",
+                derived.untranscribed.join(", ")
+            );
+            let mut result = serde_json::to_value(nuzky_analysis::retakes(&derived.words, &derived.languages))?;
+            result["time_basis"] = json!("timeline");
+            result["transcript_key"] = json!(transcript::word_key(&state.project, &derived.words));
+            return Ok(result);
+        }
+        if matches!(args.kind, AnalysisKind::Emphasis) {
+            // Reads stored words and the prepared sound of their files, so it answers at once too.
+            ensure!(args.asset_id.is_none(), "INVALID_ARGUMENTS: emphasis reads the whole timeline; omit asset_id");
+            let project = self.media_project(&state.project);
+            let derived = transcript::derive(&project, &self.host.transcripts)?;
+            if derived.untranscribed.is_empty() {
+                self.prepare_sound(&project, state, "analyze")?;
+            }
+            let zooms = crate::zooms::suggest(&project, &derived, &self.host.cache_dir)?;
+            return Ok(json!({"zooms": zooms, "time_basis": "timeline",
+                "transcript_key": transcript::word_key(&state.project, &derived.words)}));
+        }
+        if matches!(args.kind, AnalysisKind::Fillers) && args.asset_id.is_none() {
+            // Stored words and the prepared sound of their files, so it answers at once too.
+            let project = self.media_project(&state.project);
+            let derived = transcript::derive(&project, &self.host.transcripts)?;
+            ensure!(
+                derived.untranscribed.is_empty(),
+                "TRANSCRIPT_MISSING: transcribe every heard asset first, untranscribed: {}",
+                derived.untranscribed.join(", ")
+            );
+            self.prepare_sound(&project, state, "analyze")?;
+            let hesitations: Vec<_> = transcript::hesitations(&project, &derived, &self.host.cache_dir)
+                .into_iter()
+                .map(|h| json!({"after_word": h.after_word, "start_us": h.start_us, "end_us": h.end_us}))
+                .collect();
+            return Ok(json!({"fillers": nuzky_analysis::retakes(&derived.words, &derived.languages).fillers,
+                "hesitations": hesitations, "time_basis": "timeline",
+                "transcript_key": transcript::word_key(&state.project, &derived.words)}));
+        }
+        if matches!(args.kind, AnalysisKind::ThumbnailFrames) {
+            return self.thumbnail_frames(args, state);
+        }
+        let asset_id = args.asset_id.context("INVALID_ARGUMENTS: asset_id is required for this kind")?;
+        let mut asset = state.project.asset(&asset_id).with_context(|| format!("UNKNOWN_ASSET: {asset_id}"))?.clone();
+        asset.path = self.resolve(&asset.path).to_string_lossy().into_owned();
+        ensure!(Path::new(&asset.path).is_file(), "MEDIA_MISSING: {}", asset.path);
+        let window = matches!(args.kind, AnalysisKind::Loudness)
+            .then(|| loudness_window(asset.duration_us, args.params.window_us))
+            .transpose()?
+            .unwrap_or_default();
+        let transcript = if matches!(args.kind, AnalysisKind::Fillers) {
+            let record =
+                self.host.transcripts.get(&asset)?.context("TRANSCRIPT_MISSING: transcribe this asset first")?;
+            Some(nuzky_analysis::Transcript { language: record.language, words: record.words, segments: vec![] })
+        } else {
+            None
+        };
+        let cache = self.host.cache_dir.clone();
+        self.host.start_job(&self.client.id, state.open_run.as_ref().map(|run| run.run_id.as_str()), "analysis", state.stamp.clone(), move |cancel, progress| {
+            check_cancel(&cancel)?;
+            progress.set("analyzing", None);
+            let p = args.params;
+            let result = match args.kind {
+                AnalysisKind::Silences => json!({"ranges": nuzky_analysis::silences_cancellable(&asset, &cache, SilenceParams { threshold_db: p.threshold_db, min_silence_us: p.min_silence_us.unwrap_or(400_000), pad_us: p.pad_us.unwrap_or(120_000) }, || cancel.load(Ordering::Relaxed))?}),
+                AnalysisKind::Loudness => {
+                    let cancelled = || cancel.load(Ordering::Relaxed);
+                    let program = nuzky_analysis::program_loudness_cancellable(&asset, &cache, cancelled)?;
+                    json!({"window_us": window, "dbfs": nuzky_analysis::loudness_cancellable(&asset, &cache, window, cancelled)?,
+                        "integrated_lufs": program.integrated_lufs, "true_peak_dbtp": program.true_peak_dbtp})
+                }
+                AnalysisKind::Scenes => json!({"cuts": nuzky_analysis::scene_cuts_cancellable(&asset, SceneParams { threshold: p.threshold.unwrap_or(0.18), min_gap_us: p.min_gap_us.unwrap_or(300_000) }, || cancel.load(Ordering::Relaxed))?}),
+                AnalysisKind::Fillers => {
+                    let t = transcript.context("Missing filler transcript")?;
+                    nuzky_engine::audio::ensure_pcm(&cache, &asset, |_| check_cancel(&cancel))?;
+                    let peaks = nuzky_engine::audio::prepared_peaks(&cache, &asset).unwrap_or_default();
+                    let gaps: Vec<_> = t.words.windows(2).map(|w| nuzky_analysis::Range { start_us: w[0].end_us, end_us: w[1].start_us })
+                        .filter(|g| g.end_us - g.start_us >= nuzky_analysis::HESITATION_US).collect();
+                    let hesitations: Vec<_> = nuzky_analysis::hesitations(&peaks, &gaps).into_iter().flatten().collect();
+                    json!({"ranges": nuzky_analysis::filler_words(&t, &t.language), "hesitations": hesitations})
+                }
+                AnalysisKind::Beats => serde_json::to_value(nuzky_analysis::beats_cancellable(&asset, &cache, || cancel.load(Ordering::Relaxed))?)?,
+                AnalysisKind::Retakes | AnalysisKind::Emphasis | AnalysisKind::ThumbnailFrames => {
+                    anyhow::bail!("This kind is not an asset analysis")
+                }
+            };
+            check_cancel(&cancel)?;
+            Ok(json!({"asset_id": asset.id, "time_basis": "source", "analysis": result}))
+        })
+    }
+
+    /// Renders the timeline without text and scores frames for a cover, as a job.
+    fn thumbnail_frames(&self, args: Analyze, state: &SessionState) -> Result<Value> {
+        ensure!(args.asset_id.is_none(), "INVALID_ARGUMENTS: thumbnail_frames reads the whole timeline; omit asset_id");
+        let format = match args.params.format.as_deref() {
+            None => None,
+            Some("9:16") => Some(nuzky_vision::Format::Vertical),
+            Some("16:9") => Some(nuzky_vision::Format::Wide),
+            Some(other) => anyhow::bail!("INVALID_ARGUMENTS: format is \"9:16\" or \"16:9\", not {other:?}"),
+        };
+        let project = self.media_project(&state.project);
+        activity::timeline_range(&project, None)?;
+        media::check_media(&project)?;
+        let models = nuzky_analysis::models_dir();
+        vision_models::check(nuzky_vision::models::FRAMES, &self.vision_refused)?;
+        let refused = self.vision_refused.clone();
+        let format = format.unwrap_or(nuzky_vision::Format::of(&project.canvas));
+        // Which frame suits a cover does not depend on what is behind the person.
+        let project = nuzky_engine::matte::without_backgrounds(&project);
+        self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "analysis",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                vision_models::ensure(nuzky_vision::models::FRAMES, &refused, &cancel, &progress)?;
+                let candidates = nuzky_vision::thumbnail_frames(&project, &models, Some(format), &cancel, &mut |phase, done| {
+                    let phase = match phase {
+                        nuzky_vision::thumbnails::Phase::Looking => "looking",
+                        nuzky_vision::thumbnails::Phase::Scoring => "scoring",
+                    };
+                    progress.set(phase, Some(done))
+                })?;
+                Ok(json!({"kind": "thumbnail_frames", "time_basis": "timeline", "format": format, "candidates": candidates}))
+            },
+        )
+    }
+
+    fn reframe(&self, args: Reframe, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let (width, height) = match args.format.as_str() {
+            "9:16" => (1080, 1920),
+            "4:5" => (1080, 1350),
+            "1:1" => (1080, 1080),
+            _ => anyhow::bail!("INVALID_ARGUMENTS: format is \"9:16\", \"4:5\" or \"1:1\""),
+        };
+        let project = self.media_project(&state.project);
+        let models = nuzky_analysis::models_dir();
+        vision_models::check(nuzky_vision::models::REFRAME, &self.vision_refused)?;
+        let refused = self.vision_refused.clone();
+        let host = Arc::downgrade(&self.host);
+        let revision = state.stamp.revision;
+        let run_id = args.run_id.clone();
+        self.host.start_job(
+            &self.client.id,
+            Some(&args.run_id),
+            "reframe",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                vision_models::ensure(nuzky_vision::models::REFRAME, &refused, &cancel, &progress)?;
+                let result = nuzky_vision::reframe::reframe(
+                    &project,
+                    &models,
+                    (width, height),
+                    args.clip_ids.as_deref(),
+                    &cancel,
+                    &mut |p| progress.set("following_the_face", Some(p)),
+                )?;
+                check_cancel(&cancel)?;
+                let host = host.upgrade().context("APP_CLOSED: project is closed")?;
+                let applied = host
+                    .session
+                    .apply_edits(
+                        &run_id,
+                        &new_id(),
+                        result.commands,
+                        Expect { revision: Some(revision), ..Expect::default() },
+                    )
+                    .map_err(|error| {
+                        if error.to_string().starts_with("STALE_REVISION") {
+                            anyhow!("STALE_REVISION: The project changed while following the face. Call reframe again.")
+                        } else {
+                            error
+                        }
+                    })?;
+                Ok(json!({"format":args.format, "width":width, "height":height,
+                "followed":result.followed, "centred":result.centred, "revision":applied.stamp.revision}))
+            },
+        )
+    }
+
+    /// Masks the subject of one timeline frame as a job and keeps the mask in the cache.
+    fn segment_subject(&self, args: SegmentSubject, state: &SessionState) -> Result<Value> {
+        let project = self.media_project(&state.project);
+        let (t, image) = match (args.time_us, args.format) {
+            (Some(t), None) => (t, None),
+            (None, Some(format)) => {
+                let cover = thumbnail(&project, format)?;
+                (cover.time_us, cover.image.clone())
+            }
+            _ => anyhow::bail!("INVALID_ARGUMENTS: pass time_us or format, not both"),
+        };
+        match image.as_deref().and_then(|id| project.asset(id)) {
+            Some(image) => ensure!(Path::new(&image.path).is_file(), "MEDIA_MISSING: {}", image.path),
+            None => {
+                let (start, end) = activity::timeline_range(&project, None)?;
+                ensure!((start..end).contains(&t), "INVALID_RANGE: time_us must be inside 0..{end}");
+                media::check_media(&project)?;
+            }
+        }
+        let models = nuzky_analysis::models_dir();
+        vision_models::check(nuzky_vision::models::MASK, &self.vision_refused)?;
+        let cache = self.host.cache_dir.clone();
+        let refused = self.vision_refused.clone();
+        self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "segment",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                vision_models::ensure(nuzky_vision::models::MASK, &refused, &cancel, &progress)?;
+                let mut phases = |phase| {
+                    progress.set(
+                        match phase {
+                            nuzky_vision::mask::Phase::Rendering => "rendering",
+                            nuzky_vision::mask::Phase::Waiting => "waiting_for_other_mask",
+                            nuzky_vision::mask::Phase::Loading => "loading_model",
+                            nuzky_vision::mask::Phase::Segmenting => "segmenting",
+                        },
+                        None,
+                    )
+                };
+                let mask = match &image {
+                    Some(id) => {
+                        phases(nuzky_vision::mask::Phase::Rendering);
+                        let still = Renderer::new().context("Starting frame renderer")?.still(&project, id)?;
+                        let rgba = std::sync::Arc::unwrap_or_clone(still.data);
+                        nuzky_vision::segment_picture(rgba, (still.width, still.height), &models, &cache, &cancel, &mut phases)?
+                    }
+                    None => {
+                        vision_models::prepare_mattes(&project, &cache, &refused, &cancel, &progress)?;
+                        nuzky_vision::segment_subject(&project, t, &models, &cache, &cancel, &mut phases)?
+                    }
+                };
+                Ok(json!({"time_us": t, "image": image, "mask_path": mask.path, "width": mask.width, "height": mask.height,
+                    "subject_box": mask.subject_box, "subject_share": mask.subject_share, "person": mask.person,
+                    "cached": mask.cached}))
+            },
+        )
+    }
+
+    /// Without the app nothing prepares the sound of files whose words were stored earlier, and
+    /// decoding a whole file inside a tool call could not be stopped, so it becomes a job.
+    fn prepare_sound(&self, project: &Project, state: &SessionState, tool: &str) -> Result<()> {
+        let heard = transcript::heard_assets(project);
+        self.prepare_assets(project.assets.iter().filter(|a| heard.contains(&a.id)).cloned().collect(), state, tool)
+    }
+
+    /// Prepares the sound of those `assets` that have sound and no prepared sound yet, as one job.
+    fn prepare_assets(&self, assets: Vec<nuzky_engine::model::Asset>, state: &SessionState, tool: &str) -> Result<()> {
+        let cache = self.host.cache_dir.clone();
+        let missing: Vec<_> = assets
+            .into_iter()
+            .filter(|a| nuzky_engine::audio::has_audio(a) && !nuzky_engine::audio::pcm_path(&cache, a).exists())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let names = missing.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+        let job = self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "analysis",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                for (i, asset) in missing.iter().enumerate() {
+                    progress.set("preparing_audio", Some(i as f32 / missing.len() as f32));
+                    nuzky_engine::audio::ensure_pcm(&cache, asset, |_| check_cancel(&cancel))?;
+                }
+                Ok(json!({"prepared": missing.iter().map(|a| &a.id).collect::<Vec<_>>()}))
+            },
+        )?;
+        anyhow::bail!(
+            "AUDIO_NOT_READY: preparing the sound of {names} as job {}; wait with job action wait until done, then call {tool} again",
+            job["job_id"].as_str().unwrap_or_default()
+        )
+    }
+
+    fn transcribe(&self, args: Transcribe, state: &SessionState) -> Result<Value> {
+        let project = self.media_project(&state.project);
+        let mut assets = Vec::new();
+        if let Some(ids) = args.asset_ids {
+            for id in ids {
+                let asset = project.asset(&id).with_context(|| format!("UNKNOWN_ASSET: {id}"))?;
+                if !assets.iter().any(|a: &nuzky_engine::model::Asset| a.id == id) {
+                    assets.push(asset.clone());
+                }
+            }
+        } else {
+            let heard = transcript::heard_assets(&project);
+            for asset in project.assets.iter().filter(|a| heard.contains(&a.id)) {
+                if self.host.transcripts.get(asset)?.is_none() {
+                    assets.push(asset.clone());
+                }
+            }
+        }
+        let ask = args.model.is_none().then(transcript::ask_for_model).flatten();
+        let mut name = args.model.unwrap_or_else(|| transcript::best_model().into());
+        let (mut model_paths, mut asking) = (None, None);
+        if !assets.is_empty() {
+            match (transcript::models(&name), ask) {
+                (Ok(paths), _) => model_paths = Some(paths),
+                // The app asks the user inside the job, so the agent waits for the answer instead of retrying.
+                (Err(error), Some(ask)) if error.to_string().starts_with("MODEL_MISSING") => {
+                    if let Some(reason) = self.model_refused.lock().unwrap().clone() {
+                        anyhow::bail!(reason);
+                    }
+                    asking = Some(ask);
+                }
+                (Err(error), _) => return Err(error),
+            }
+        }
+        let refused = self.model_refused.clone();
+        let language = args.language.unwrap_or_else(|| "auto".into());
+        let store = self.host.transcripts.clone();
+        let cache = self.host.cache_dir.clone();
+        self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "transcription",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                if let Some(ask) = asking.take() {
+                    if let Err(error) = ask(&cancel, &progress) {
+                        // Declined, stopped or failed: this agent's next call says so at once instead of asking again.
+                        if error.to_string().starts_with("MODEL_") {
+                            *refused.lock().unwrap() = Some(format!("{error:#}"));
+                        }
+                        return Err(error);
+                    }
+                    name = transcript::best_model().into();
+                    model_paths = Some(transcript::models(&name)?);
+                }
+                let mut recognised = Vec::new();
+                let total = assets.iter().map(|asset| asset.duration_us.max(1) as f64).sum::<f64>();
+                let mut done = 0.0;
+                let mut recognised_files = std::collections::HashSet::new();
+                for asset in assets {
+                    check_cancel(&cancel)?;
+                    let weight = asset.duration_us.max(1) as f64;
+                    let fraction = |part: f32| Some(((done + weight * f64::from(part)) / total) as f32);
+                    progress.set("transcribing", fraction(0.0));
+                    let fingerprint = store.fingerprint(&asset)?;
+                    if !recognised_files.insert(fingerprint.clone()) {
+                        recognised.push(json!({"asset_id":asset.id,"reused":true}));
+                        done += weight;
+                        continue;
+                    }
+                    let models = model_paths.as_ref().context("MODEL_MISSING: transcription model")?;
+                    let stage = |stage| match stage {
+                        transcript::Stage::Waiting => progress.set("waiting_for_other_transcription", fraction(0.0)),
+                        transcript::Stage::Recognising(part) => progress.set("transcribing", fraction(part * 0.5)),
+                        transcript::Stage::DownloadingAligner(_) => {
+                            progress.set("downloading_word_timing_model", fraction(0.5))
+                        }
+                        transcript::Stage::Aligning(part) => {
+                            progress.set("measuring_word_times", fraction(0.5 + part * 0.5))
+                        }
+                    };
+                    let record =
+                        transcript::recognise(&store, &asset, &cache, &name, models, &language, &cancel, stage)?;
+                    done += weight;
+                    recognised.push(json!({
+                        "asset_id": asset.id,
+                        "words": record.words.len(),
+                        "language": record.language,
+                        "word_times": if record.alignment.is_some() { "measured" } else { "estimated" },
+                    }));
+                }
+                Ok(json!({"assets":recognised}))
+            },
+        )
+    }
+
+    fn get_transcript(&self, args: GetTranscript, state: &SessionState) -> Result<Value> {
+        let limit = args.limit.unwrap_or(100);
+        ensure!((1..=500).contains(&limit), "INVALID_ARGUMENTS: limit is 1 to 500");
+        let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+        let key = transcript::word_key(&state.project, &derived.words);
+        let mut result = transcript::summary(&derived, args.range_us)?;
+        if args.limit.is_some() || args.cursor.is_some() {
+            let from = if let Some(cursor) = &args.cursor {
+                let (word, cursor_key) = cursor
+                    .split_once('.')
+                    .and_then(|(word, key)| word.parse::<usize>().ok().map(|word| (word, key)))
+                    .context("INVALID_ARGUMENTS: cursor is not a next_cursor from get_transcript")?;
+                ensure!(
+                    cursor_key == key,
+                    "SPEECH_CHANGED: the transcript changed since this cursor; start again without cursor"
+                );
+                word
+            } else {
+                0
+            };
+            let sentences = result["sentences"].as_array_mut().unwrap();
+            sentences.retain(|sentence| sentence["from"].as_u64().unwrap() >= from as u64);
+            let next = sentences.get(limit).map(|sentence| format!("{}.{}", sentence["from"], key));
+            sentences.truncate(limit);
+            let span = sentences
+                .first()
+                .zip(sentences.last())
+                .map(|(first, last)| (first["from"].as_u64().unwrap(), last["to"].as_u64().unwrap()));
+            for (field, index) in [("words", "i"), ("pauses", "after_word")] {
+                result[field]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|entry| span.is_some_and(|(a, b)| (a..=b).contains(&entry[index].as_u64().unwrap())));
+            }
+            result["next_cursor"] = json!(next);
+        }
+        if matches!(args.detail, Some(TranscriptDetail::Sentences)) {
+            let object = result.as_object_mut().unwrap();
+            object.remove("words");
+            object.remove("pauses");
+        }
+        result["transcript_key"] = json!(key);
+        Ok(result)
+    }
+
+    fn edit_transcript(&self, args: EditTranscript, state: &SessionState) -> Result<Value> {
+        // A dry run plans the cut before a run is open and changes nothing.
+        if args.dry_run {
+            return Ok(self.prepare_transcript_edit(&args, state)?.response);
+        }
+        let run_id = args.run_id.clone().context("INVALID_ARGUMENTS: run_id is required unless dry_run is true")?;
+        owns_run(state, &run_id)?;
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (run_id.clone(), request_id.clone());
+        let mut requests = self.transcript_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &run_id);
+        if let Some(prepared) = requests.get(&key) {
+            ensure!(
+                prepared.arguments == serde_json::to_value(&args)?,
+                "REQUEST_CONFLICT: request_id was used with different transcript arguments"
+            );
+            return self.apply_transcript_edit(&run_id, &request_id, prepared);
+        }
+        let prepared = self.prepare_transcript_edit(&args, state)?;
+        // Retain the original ranges and expectations even if the live edit's save fails.
+        let prepared = requests.entry(key).or_insert(prepared);
+        self.apply_transcript_edit(&run_id, &request_id, prepared)
+    }
+
+    fn apply_transcript_edit(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        prepared: &PreparedTranscriptEdit,
+    ) -> Result<Value> {
+        let applied =
+            self.host.session.apply_edits(run_id, request_id, prepared.edits.clone(), prepared.expect.clone())?;
+        let mut response = prepared.response.clone();
+        response["revision"] = json!(applied.stamp.revision);
+        response["session_epoch"] = json!(applied.stamp.session_epoch);
+        Ok(response)
+    }
+
+    fn prepare_transcript_edit(&self, args: &EditTranscript, state: &SessionState) -> Result<PreparedTranscriptEdit> {
+        let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+        transcript::check_key(&state.project, &derived, &args.transcript_key)?;
+        let before = state.project.duration_us();
+        let hesitations = match args.delete_hesitations.as_deref() {
+            Some(after) if !after.is_empty() => {
+                let project = self.media_project(&state.project);
+                transcript::pick_hesitations(&transcript::hesitations(&project, &derived, &self.host.cache_dir), after)?
+            }
+            _ => Vec::new(),
+        };
+        let mut from = crate::style::Defaults::read();
+        let pause = args.shorten_pauses_us.or_else(|| from.pause_us()).unwrap_or(transcript::DEFAULT_PAUSE_US);
+        let keep_before = args.keep_before_word_us.or_else(|| from.keep_before_word_us());
+        let keep_after = args.keep_after_word_us.or_else(|| from.keep_after_word_us());
+        ensure!(
+            keep_before.into_iter().chain(keep_after).all(|us| (0..=1_000_000).contains(&us)),
+            "INVALID_ARGUMENTS: keep_before_word_us and keep_after_word_us must be from 0 to 1000000"
+        );
+        let (ranges, _) = transcript::speech_cut(
+            &state.project,
+            &derived,
+            args.delete.as_deref(),
+            args.keep.as_deref(),
+            Some(pause),
+            &hesitations,
+            [keep_before, keep_after],
+        )?;
+        let cut = transcript::plan_cut(&state.project, &derived, ranges)?;
+        let after = cut.preview.duration_us();
+        let preview_text: String =
+            cut.words.iter().map(|w| w.text.trim()).collect::<Vec<_>>().join(" ").chars().take(PREVIEW_CHARS).collect();
+        Ok(PreparedTranscriptEdit {
+            arguments: serde_json::to_value(args)?,
+            expect: Expect {
+                revision: Some(state.stamp.revision),
+                speech_layout_key: Some(state.speech_layout_key.clone()),
+            },
+            response: from.note(json!({"duration_us":{"before":before,"after":after},
+                "removed_us":before-after,"ranges":cut.ranges,"preview_text":preview_text,
+                "transcript_key":transcript::word_key(&cut.preview, &cut.words),"revision":state.stamp.revision,"dry_run":args.dry_run})),
+            edits: vec![cut.edit],
+        })
+    }
+
+    fn correct_words(&self, args: CorrectWords, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let arguments = json!({"correct_words": args});
+        let mut requests = self.transcript_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &args.run_id);
+        // A retry after a failed save applies what was planned then: the key no longer matches.
+        if let Some(prepared) = requests.get(&key) {
+            ensure!(
+                prepared.arguments == arguments,
+                "REQUEST_CONFLICT: request_id was used with different transcript arguments"
+            );
+            return self.apply_transcript_edit(&args.run_id, &request_id, prepared);
+        }
+        let project = self.media_project(&state.project);
+        let derived = transcript::derive(&project, &self.host.transcripts)?;
+        transcript::check_word_key(&state.project, &derived, &args.transcript_key)?;
+        let fixes: Vec<_> = args.corrections.iter().map(|c| (c.i, c.text.clone(), c.expected.clone())).collect();
+        let plan = transcript::plan_correction(&state.project, &derived, &fixes)?;
+        let mut preview = project;
+        for edit in plan.edits.clone() {
+            preview.apply(edit).context("EDIT_REJECTED: preview failed")?;
+        }
+        nuzky_session::validate(&preview)?;
+        let after = transcript::derive(&preview, &self.host.transcripts)?;
+        let words: Vec<_> =
+            plan.words.iter().map(|(i, from, to)| json!({"i": i, "before": from, "after": to})).collect();
+        let mut response = json!({"words": words, "captions_changed": plan.captions,
+            "transcript_key": transcript::word_key(&preview, &after.words)});
+        if !plan.captions_kept.is_empty() {
+            response["captions_kept"] = json!(plan.captions_kept);
+            response["note"] = json!(
+                "captions_kept show a part of a corrected word whose other part was deleted, moved or edited by hand, so they were left as they are; build_captions makes them again from the corrected words"
+            );
+        }
+        let prepared = PreparedTranscriptEdit {
+            arguments,
+            expect: Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+            response,
+            edits: plan.edits,
+        };
+        let prepared = requests.entry(key).or_insert(prepared);
+        self.apply_transcript_edit(&args.run_id, &request_id, prepared)
+    }
+
+    fn captions(&self, args: Captions, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let media = self.media_project(&state.project);
+        let (edit, from) =
+            caption_plan(&args, &state.project, &media, (&self.host.transcripts, &self.host.cache_dir), &|| false)?;
+        let warnings = crate::fonts::warnings(crate::fonts::edit_families(&edit));
+        let result = self.host.session.apply_edits(
+            &args.run_id,
+            &new_id(),
+            vec![edit],
+            Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+        )?;
+        Ok(from.note(with_warnings(
+            json!({"revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch, "caption_count": result.outcome.created.len(), "created": result.outcome.created, "removed": result.outcome.removed}),
+            warnings,
+        )))
+    }
+
+    /// Punch-ins on word ranges as one edit of the run. Splitting clips moves the speech layout and
+    /// so the transcript key; a retry with the same request_id applies the zoom planned the first
+    /// time instead of planning it again.
+    fn apply_zooms(&self, args: ApplyZooms, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let arguments = json!({ "apply_zooms": &args });
+        let mut requests = self.transcript_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &args.run_id);
+        if let Some(prepared) = requests.get(&key) {
+            ensure!(prepared.arguments == arguments, "REQUEST_CONFLICT: request_id was used with different arguments");
+            return self.apply_transcript_edit(&args.run_id, &request_id, prepared);
+        }
+        let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+        transcript::check_key(&state.project, &derived, &args.transcript_key)?;
+        let ranges = crate::zooms::ranges(&state.project, &derived.words, &args.zooms)?;
+        let edit = EditCmd::ZoomRanges { ranges: ranges.clone() };
+        let mut preview = state.project.clone();
+        let outcome = preview.apply(edit.clone()).map_err(|e| anyhow!("EDIT_REJECTED: {e:#}"))?;
+        let words = nuzky_engine::speech::map_words(&preview, &derived.sources);
+        let prepared = requests.entry(key).or_insert(PreparedTranscriptEdit {
+            arguments,
+            edits: vec![edit],
+            expect: Expect {
+                revision: Some(state.stamp.revision),
+                speech_layout_key: Some(state.speech_layout_key.clone()),
+            },
+            response: json!({"ranges": ranges, "skipped": outcome.skipped,
+                "transcript_key": transcript::word_key(&preview, &words)}),
+        });
+        self.apply_transcript_edit(&args.run_id, &request_id, prepared)
+    }
+
+    /// Recuts the main track to the song's beat as one edit of the run. The beat is found again from the prepared
+    /// sound on every call, so a dry run and the cut it shows read the same song.
+    fn cut_to_beats(&self, args: CutToBeats, state: &SessionState) -> Result<Value> {
+        let run_id = match (&args.run_id, args.dry_run) {
+            (_, true) => None,
+            (Some(run_id), false) => Some(run_id.clone()),
+            (None, false) => anyhow::bail!("INVALID_ARGUMENTS: run_id is required unless dry_run is true"),
+        };
+        let arguments = json!({ "cut_to_beats": &args });
+        let mut requests = self.transcript_requests.lock().unwrap();
+        let key = run_id.as_ref().map(|run_id| (run_id.clone(), args.request_id.clone().unwrap_or_else(new_id)));
+        if let Some((run_id, request_id)) = &key {
+            owns_run(state, run_id)?;
+            requests.retain(|(run, _), _| run == run_id);
+            if let Some(prepared) = requests.get(&(run_id.clone(), request_id.clone())) {
+                ensure!(
+                    prepared.arguments == arguments,
+                    "REQUEST_CONFLICT: request_id was used with different arguments"
+                );
+                return self.apply_transcript_edit(run_id, request_id, prepared);
+            }
+        }
+        let project = self.media_project(&state.project);
+        let options = args.options();
+        let (_, music) = crate::beats::music_clip(&project, options.music_clip_id.as_deref())?;
+        let ClipContent::Media { asset_id, .. } = &music.content else { unreachable!("music_clip returns media") };
+        let asset = project.asset(asset_id).with_context(|| format!("UNKNOWN_ASSET: {asset_id}"))?.clone();
+        ensure!(Path::new(&asset.path).is_file(), "MEDIA_MISSING: {}", asset.path);
+        self.prepare_assets(vec![asset.clone()], state, "cut_to_beats")?;
+        // Stop in the app ends the run, and with it the analysis.
+        let run = args
+            .run_id
+            .as_deref()
+            .filter(|run_id| owns_run(state, run_id).is_ok())
+            .or(state.open_run.as_ref().map(|run| run.run_id.as_str()));
+        let stopped = || {
+            self.closed.load(Ordering::Acquire)
+                || run.is_some_and(|run_id| self.host.session.check_run(run_id).is_err())
+        };
+        let beats = nuzky_analysis::beats_cancellable(&asset, &self.host.cache_dir, stopped)?;
+        ensure!(
+            beats.confidence >= crate::beats::MIN_CONFIDENCE,
+            "NO_STEADY_BEAT: this sound has no steady beat to cut to (confidence {}); choose another song",
+            beats.confidence
+        );
+        let plan = crate::beats::plan(&state.project, &beats, &options)?;
+        let mut preview = state.project.clone();
+        for edit in plan.edits.clone() {
+            preview.apply(edit).map_err(|e| anyhow!("EDIT_REJECTED: {e:#}"))?;
+        }
+        nuzky_session::validate(&preview)?;
+        let mut response = crate::beats::report(&state.project, &preview, &plan)?;
+        response["dry_run"] = json!(args.dry_run);
+        let Some((run_id, request_id)) = key else {
+            return Ok(response);
+        };
+        let prepared = requests.entry((run_id.clone(), request_id.clone())).or_insert(PreparedTranscriptEdit {
+            arguments,
+            edits: plan.edits,
+            expect: Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+            response,
+        });
+        self.apply_transcript_edit(&run_id, &request_id, prepared)
+    }
+
+    fn apply_motion(&self, args: ApplyMotion, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let range = args.range_us.map(|[start_us, end_us]| TimeRange { start_us, end_us });
+        let edit = EditCmd::ApplyMotion { clip_id: args.clip_id, range, kind: args.kind, strength: args.strength };
+        // The engine plans the motion from the project as it is, so a retry needs no revision.
+        let request_id = args.request_id.unwrap_or_else(new_id);
+        let result = self.host.session.apply_edits(&args.run_id, &request_id, vec![edit], Expect::default())?;
+        Ok(json!({"revision": result.stamp.revision, "session_epoch": result.stamp.session_epoch,
+            "changed": result.changed, "skipped": result.outcome.skipped}))
+    }
+
+    /// The candidates replace those not made yet, as one edit of the run. A retry with the same request_id after a
+    /// failed save applies what was planned the first time.
+    fn propose_reels(&self, args: ProposeReels, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let arguments = json!({ "propose_reels": &args });
+        let mut requests = self.transcript_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &args.run_id);
+        if let Some(prepared) = requests.get(&key) {
+            ensure!(prepared.arguments == arguments, "REQUEST_CONFLICT: request_id was used with different arguments");
+            return self.apply_transcript_edit(&args.run_id, &request_id, prepared);
+        }
+        let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+        transcript::check_key(&state.project, &derived, &args.transcript_key)?;
+        let made: Vec<_> =
+            state.project.reel_candidates.iter().filter(|c| c.status == ReelStatus::Made).cloned().collect();
+        let max = args.max_duration_us.unwrap_or(reels::DEFAULT_MAX_DURATION_US);
+        let mut from = crate::style::Defaults::read();
+        let pause = args.shorten_pauses_us.or_else(|| from.pause_us()).unwrap_or(transcript::DEFAULT_PAUSE_US);
+        let proposed = reels::plan(&state.project, &derived, &args.candidates, max, pause)?;
+        let prepared = requests.entry(key).or_insert(PreparedTranscriptEdit {
+            arguments,
+            edits: vec![EditCmd::SetReelCandidates { candidates: made.into_iter().chain(proposed.clone()).collect() }],
+            expect: Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+            response: from.note(json!({ "candidates": proposed })),
+        });
+        self.apply_transcript_edit(&args.run_id, &request_id, prepared)
+    }
+
+    /// Writes the reels' projects, then marks them made as one edit of the run. A retry with the same request_id
+    /// after a failed save marks the projects written the first time instead of writing new ones.
+    fn make_reels(&self, args: MakeReels, state: &SessionState) -> Result<Value> {
+        owns_run(state, &args.run_id)?;
+        let request_id = args.request_id.clone().unwrap_or_else(new_id);
+        let key = (args.run_id.clone(), request_id.clone());
+        let arguments = json!({ "make_reels": &args });
+        let mut requests = self.transcript_requests.lock().unwrap();
+        requests.retain(|(run, _), _| run == &args.run_id);
+        if let Some(prepared) = requests.get(&key) {
+            ensure!(prepared.arguments == arguments, "REQUEST_CONFLICT: request_id was used with different arguments");
+            return self.apply_transcript_edit(&args.run_id, &request_id, prepared);
+        }
+        let derived = transcript::derive(&self.media_project(&state.project), &self.host.transcripts)?;
+        let framing = args.canvas.unwrap_or_default();
+        let (made, edits) =
+            reels::make(&self.project_path, &state.project, &derived, &args.ids, framing, &mut |_| Ok(()), &|| false)?;
+        let prepared = requests.entry(key.clone()).or_insert(PreparedTranscriptEdit {
+            arguments,
+            edits,
+            expect: Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+            response: with_warnings(
+                json!({ "reels": made }),
+                crate::fonts::warnings(made.iter().flat_map(|reel| reel.fonts.iter().map(String::as_str))),
+            ),
+        });
+        let applied = self.apply_transcript_edit(&args.run_id, &request_id, prepared);
+        if applied.is_err() && reels::forget(&made, &self.host.session.state()?.project) {
+            requests.remove(&key);
+        }
+        applied
+    }
+
+    fn export(&self, args: Export, state: &SessionState) -> Result<Value> {
+        ensure!(!state.read_only, "READ_ONLY: --allow-write is required to write an export");
+        ensure!(
+            args.preset.is_some() || (args.resolution.is_some() && args.fps.is_some()),
+            "INVALID_ARGUMENTS: give resolution and fps, or a preset"
+        );
+        ensure!(
+            args.resolution.is_none_or(|r| (2..=7680).contains(&r)) && args.fps.is_none_or(|f| (1..=240).contains(&f)),
+            "Invalid export resolution or fps"
+        );
+        let out = self.resolve(&args.path);
+        ensure!(!out.exists(), "OUTPUT_EXISTS: choose a new export path");
+        let parent = dunce::canonicalize(out.parent().context("Output has no parent")?)
+            .context("Export directory must exist")?;
+        let out = parent.join(out.file_name().context("Output needs a filename")?);
+        ensure!(
+            out != self.project_path
+                && !out.as_os_str().to_string_lossy().starts_with(&format!("{}.", self.project_path.display())),
+            "Export cannot overwrite the project or its sidecars"
+        );
+        let project = self.media_project(&state.project);
+        let options = ExportOptions {
+            resolution: args.resolution,
+            fps: args.fps,
+            crf: args.quality.unwrap_or(Quality::Recommended).crf(),
+            replace_existing: false,
+            delivery: args.preset,
+            ..ExportOptions::default()
+        };
+        check_options(&project, &options).map_err(|e| anyhow!("INVALID_ARGUMENTS: {e}"))?;
+        media::check_media(&project)?;
+        let cache = self.host.cache_dir.clone();
+        let queue = self.export_queue.clone();
+        let refused = self.vision_refused.clone();
+        // What the creator's cut teaches, checked against the project as exported. This state may
+        // hide another client's open run, so the session is asked too.
+        let run_open = state.open_run.is_some() || self.host.session.state()?.open_run.is_some();
+        let moment = crate::style::moment(&self.host.session, state.project.clone(), run_open, false);
+        let transcripts = self.host.transcripts.clone();
+        self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "export",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                progress.set("waiting_for_export", None);
+                let exporting = queue.lock().unwrap();
+                check_cancel(&cancel)?;
+                vision_models::prepare_mattes(&project, &cache, &refused, &cancel, &progress)?;
+                let measured = export(&project, &cache, &out, &options, &cancel, |p| {
+                    let phase = match p.phase {
+                        ExportPhase::Loudness => "measuring_loudness",
+                        ExportPhase::Rendering => "exporting",
+                    };
+                    progress.set(phase, Some(p.fraction * EXPORT_SHARE))
+                })?;
+                // The next export need not wait for this one's check.
+                drop(exporting);
+                // Learned on its own thread once the export is done, so no export waits for it.
+                std::thread::spawn(move || {
+                    let learned = moment.and_then(|m| match m {
+                        Some(m) => {
+                            m.lesson(&transcripts)?.map(|e| crate::style::Store::default().keep_evidence(e)).transpose()
+                        }
+                        None => Ok(None),
+                    });
+                    if let Err(error) = learned {
+                        log::error!("Learning the style from this export failed: {error:#}");
+                    }
+                });
+                let check = check_export(&project, &measured, &cancel, &progress);
+                let mut done =
+                    json!({"path": out, "duration_us": project.duration_us(), "preset": options.delivery, "check": check});
+                if !measured.drawn_without.is_empty() {
+                    let issues = nuzky_engine::plugin_effects::issues(&project);
+                    done["warning"] = json!(nuzky_engine::plugin_effects::exported_without(&measured.drawn_without, &issues));
+                }
+                Ok(done)
+            },
+        )
+    }
+
+    /// Draws the thumbnail at once from the cached mask. Without one it starts the mask as a job and
+    /// says so, since making a mask takes seconds and a read cannot be stopped halfway.
+    fn inspect_thumbnail(&self, args: InspectThumbnail, state: &SessionState) -> Result<CallToolResult> {
+        let project = self.media_project(&state.project);
+        let thumbnail = thumbnail(&project, args.format)?;
+        let full = args.format.size().0;
+        let width = args.width.unwrap_or(full / 2);
+        ensure!((96..=full).contains(&width), "INVALID_ARGUMENTS: width must be 96..={full}");
+        cover_media(&project, thumbnail)?;
+        if thumbnail.image.is_none() {
+            self.require_mattes(&project, state)?;
+        }
+        let mut renderer = Renderer::new().context("Starting frame renderer")?;
+        renderer.use_mattes(self.host.cache_dir.clone(), Pending::Fail);
+        let frame = renderer.thumbnail_frame(&project, thumbnail)?;
+        let mask = match thumbnail.needs_mask() {
+            false => None,
+            true => {
+                vision_models::check(nuzky_vision::models::MASK, &self.vision_refused)?;
+                let size = (frame.width, frame.height);
+                match nuzky_vision::cached_alpha(&frame.data, size, &self.host.cache_dir) {
+                    Some(alpha) => Some(alpha),
+                    None => {
+                        drop(renderer);
+                        let job =
+                            self.segment_subject(SegmentSubject { time_us: None, format: Some(args.format) }, state)?;
+                        anyhow::bail!(
+                            "MASK_NOT_READY: making the person's mask as job {}; wait with job action wait until done, then inspect_thumbnail again",
+                            job["job_id"].as_str().unwrap_or_default()
+                        )
+                    }
+                }
+            }
+        };
+        let mut rendered = renderer.render_thumbnail(&project, thumbnail, &frame, mask.as_deref(), width)?;
+        if args.safe_zones {
+            media::shade_thumbnail_zones(&mut rendered.rgba, rendered.width, rendered.height, args.format);
+        }
+        let png = nuzky_engine::thumbnail::encode(&rendered, ImageKind::Png)?;
+        let info = json!({"revision": state.stamp.revision, "session_epoch": state.stamp.session_epoch,
+            "format": args.format, "time_us": thumbnail.time_us, "image": thumbnail.image, "width": rendered.width, "height": rendered.height,
+            "texts": texts(thumbnail, &rendered.hidden)});
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(info.to_string()),
+            ContentBlock::image(BASE64_STANDARD.encode(png), "image/png"),
+        ]))
+    }
+
+    /// A project image as Nuzky draws it, such as a logo, so an agent can look at it or hand it to an image generator.
+    fn inspect_image(&self, args: InspectImage, state: &SessionState) -> Result<CallToolResult> {
+        let size = args.size.unwrap_or(768);
+        ensure!((96..=1536).contains(&size), "INVALID_ARGUMENTS: size must be 96..=1536");
+        let project = self.media_project(&state.project);
+        let asset = project
+            .asset(&args.asset_id)
+            .filter(|a| a.kind == nuzky_engine::model::AssetKind::Image)
+            .with_context(|| format!("UNKNOWN_ASSET: {} is not an image of this project", args.asset_id))?;
+        ensure!(Path::new(&asset.path).is_file(), "MEDIA_MISSING: {}", asset.path);
+        let still = Renderer::new().context("Starting frame renderer")?.still_within(&project, &asset.id, size)?;
+        let (width, height) = (still.width, still.height);
+        let rendered = nuzky_engine::thumbnail::RenderedThumbnail {
+            width,
+            height,
+            rgba: std::sync::Arc::unwrap_or_clone(still.data),
+            hidden: Vec::new(),
+            bounds: Vec::new(),
+            frame_bounds: [[[0.0; 2]; 4]; 2],
+            overlay_bounds: Vec::new(),
+        };
+        let png = nuzky_engine::thumbnail::encode(&rendered, ImageKind::Png)?;
+        let (visible, colors) = media::image_colors(Path::new(&asset.path))?;
+        let info = json!({"asset_id": asset.id, "name": asset.name, "width": width, "height": height,
+            "visible": visible, "colors": colors});
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(info.to_string()),
+            ContentBlock::image(BASE64_STANDARD.encode(png), "image/png"),
+        ]))
+    }
+
+    /// Renders the thumbnail at its full size into a new file as a job, making the mask first when needed.
+    fn export_thumbnail(&self, args: ExportThumbnail, state: &SessionState) -> Result<Value> {
+        ensure!(!state.read_only, "READ_ONLY: --allow-write is required to write an export");
+        let out = self.resolve(&args.path);
+        let kind = ImageKind::of(&out).context("INVALID_ARGUMENTS: the path must end in .png, .jpg or .jpeg")?;
+        ensure!(!out.exists(), "OUTPUT_EXISTS: choose a new export path");
+        let parent = dunce::canonicalize(out.parent().context("Output has no parent")?)
+            .context("Export directory must exist")?;
+        let out = parent.join(out.file_name().context("Output needs a filename")?);
+        let project = self.media_project(&state.project);
+        nuzky_engine::export::check_source_path(&project, &out)?;
+        let thumbnail = thumbnail(&project, args.format)?.clone();
+        cover_media(&project, &thumbnail)?;
+        let models = nuzky_analysis::models_dir();
+        if thumbnail.needs_mask() {
+            vision_models::check(nuzky_vision::models::MASK, &self.vision_refused)?;
+        }
+        let cache = self.host.cache_dir.clone();
+        let refused = self.vision_refused.clone();
+        self.host.start_job(
+            &self.client.id,
+            state.open_run.as_ref().map(|run| run.run_id.as_str()),
+            "export",
+            state.stamp.clone(),
+            move |cancel, progress| {
+                if thumbnail.needs_mask() {
+                    vision_models::ensure(nuzky_vision::models::MASK, &refused, &cancel, &progress)?;
+                }
+                if thumbnail.image.is_none() {
+                    vision_models::prepare_mattes(&project, &cache, &refused, &cancel, &progress)?;
+                }
+                progress.set("rendering", None);
+                let mut renderer = Renderer::new().context("Starting frame renderer")?;
+                renderer.use_mattes(cache.clone(), Pending::Fail);
+                let frame = renderer.thumbnail_frame(&project, &thumbnail)?;
+                let mask = match thumbnail.needs_mask() {
+                    false => None,
+                    true => Some(
+                        nuzky_vision::subject_alpha(
+                            &frame.data,
+                            (frame.width, frame.height),
+                            &models,
+                            &cache,
+                            &cancel,
+                            &mut |phase| {
+                                progress.set(
+                                    match phase {
+                                        nuzky_vision::mask::Phase::Rendering => "rendering",
+                                        nuzky_vision::mask::Phase::Waiting => "waiting_for_other_mask",
+                                        nuzky_vision::mask::Phase::Loading => "loading_model",
+                                        nuzky_vision::mask::Phase::Segmenting => "segmenting",
+                                    },
+                                    None,
+                                )
+                            },
+                        )?
+                        .0,
+                    ),
+                };
+                check_cancel(&cancel)?;
+                progress.set("rendering", None);
+                let rendered =
+                    renderer.render_thumbnail(&project, &thumbnail, &frame, mask.as_deref(), args.format.size().0)?;
+                let bytes = nuzky_engine::thumbnail::encode(&rendered, kind)?;
+                nuzky_engine::thumbnail::save(&out, &bytes, false, &cancel)?;
+                Ok(json!({"path": out, "format": args.format, "width": rendered.width, "height": rendered.height,
+                    "bytes": bytes.len(), "texts": texts(&thumbnail, &rendered.hidden)}))
+            },
+        )
+    }
+
+    /// Fails with `MATTE_NOT_READY` naming a job that finds the person in the frames the project's backgrounds
+    /// show, when some are not found yet; a running one is named again instead of starting the work twice.
+    fn require_mattes(&self, project: &Project, state: &SessionState) -> Result<()> {
+        let cache = self.host.cache_dir.clone();
+        if nuzky_engine::matte::missing(&cache, project).is_empty() {
+            return Ok(());
+        }
+        vision_models::check(nuzky_vision::models::BACKGROUND, &self.vision_refused)?;
+        let job = match self.host.jobs.running_id("matte") {
+            Some(job) => job,
+            None => {
+                let project = project.clone();
+                let refused = self.vision_refused.clone();
+                let started = self.host.start_job(
+                    &self.client.id,
+                    state.open_run.as_ref().map(|run| run.run_id.as_str()),
+                    "matte",
+                    state.stamp.clone(),
+                    move |cancel, progress| {
+                        vision_models::prepare_mattes(&project, &cache, &refused, &cancel, &progress)?;
+                        Ok(json!({"prepared": true}))
+                    },
+                )?;
+                started["job_id"].as_str().unwrap_or_default().to_owned()
+            }
+        };
+        anyhow::bail!(
+            "MATTE_NOT_READY: finding the person behind whom the clips' backgrounds go, as job {job}; wait with job action wait until done, then try again"
+        )
+    }
+
+    fn resolve(&self, path: &str) -> PathBuf {
+        let path = PathBuf::from(path);
+        if path.is_absolute() { path } else { self.project_dir.join(path) }
+    }
+
+    fn media_project(&self, project: &Project) -> Project {
+        let mut project = project.clone();
+        for asset in &mut project.assets {
+            asset.path = self.resolve(&asset.path).to_string_lossy().into_owned();
+        }
+        project
+    }
+}
+
+/// The captions build_captions makes from the stored words of `project` (`media` is the same with full paths), and
+/// the creator's style it read. It never transcribes and never waits for sound: it reads only the stored transcripts,
+/// the prepared sound, the creator's style and the saved caption styles, so a plugin may ask for it too.
+pub(crate) fn caption_plan(
+    args: &Captions,
+    project: &Project,
+    media: &Project,
+    (transcripts, cache): (&nuzky_session::transcripts::TranscriptStore, &Path),
+    stopped: &dyn Fn() -> bool,
+) -> Result<(EditCmd, crate::style::Defaults)> {
+    let derived = transcript::derive(media, transcripts)?;
+    ensure!(derived.untranscribed.is_empty(), "TRANSCRIPT_MISSING: transcribe all heard assets before captions");
+    ensure!(!stopped(), "CANCELLED: job cancelled");
+    let mut from = crate::style::Defaults::read();
+    let grouping = args.grouping(&mut from);
+    let look = args.look(&mut from, (project.canvas.width, project.canvas.height))?;
+    let energy = nuzky_analysis::prepared_word_energy(media, &derived.words, &derived.sources, cache)?;
+    ensure!(!stopped(), "CANCELLED: job cancelled");
+    let keys = nuzky_analysis::key_words(&derived.words, &energy);
+    let (mut edit, _) = transcript::caption_edit(&derived.words, &keys, project, look, grouping)?;
+    // Without a place of their own, captions made again stay where the ones they replace were.
+    if let EditCmd::AddCaptions { transform, .. } | EditCmd::ReplaceCaptions { transform, .. } = &mut edit {
+        *transform = args.transform.or(*transform);
+    }
+    Ok((edit, from))
+}
+
+/// get_state's answer, which is also the project a plugin reads.
+pub(crate) fn state_value(state: &SessionState, args: State) -> Result<Value> {
+    if let Some(range) = args.range {
+        ensure!(
+            range.start_us >= 0 && range.end_us > range.start_us,
+            "INVALID_RANGE: invalid half-open timeline range"
+        );
+    }
+    let mut project = state.project.clone();
+    for track in &mut project.tracks {
+        track.clips.retain(|clip| {
+            args.range.is_none_or(|r| clip.start_us < r.end_us && clip.end_us() > r.start_us)
+                && args.clip_ids.as_ref().is_none_or(|ids| ids.contains(&clip.id))
+        });
+    }
+    let mut value = serde_json::to_value(state)?;
+    let object = value.as_object_mut().context("Invalid state")?;
+    object.remove("project");
+    object.insert("name".into(), json!(project.name));
+    object.insert("canvas".into(), json!(project.canvas));
+    object.insert("assets".into(), json!(project.assets));
+    object.insert("tracks".into(), json!(project.tracks));
+    object.insert("thumbnails".into(), json!(project.thumbnails));
+    object.insert("reel_candidates".into(), json!(project.reel_candidates));
+    object.insert("imported".into(), json!(project.imported));
+    object.insert("duration_us".into(), json!(state.project.duration_us()));
+    object.insert("caption_stats".into(), caption_stats(&state.project));
+    object.insert("missing_fonts".into(), json!(crate::fonts::missing(crate::fonts::families(&state.project))));
+    let effects = nuzky_engine::plugin_effects::issues(&state.project);
+    if !effects.is_empty() {
+        let issues: Vec<Value> = effects
+            .iter()
+            .map(|i| json!({"plugin": i.plugin, "effect": i.effect, "clip_ids": i.clip_ids, "message": i.sentence()}))
+            .collect();
+        object.insert("effect_issues".into(), json!(issues));
+    }
+    object.insert("filtered".into(), json!(args.range.is_some() || args.clip_ids.is_some()));
+    Ok(value)
+}
+
+/// Unfiltered state of a reel with karaoke captions overflows an agent's tool result, mostly through the same style
+/// and transform on every caption and their word times: each text track gives its most common style and transform
+/// once, and its clips keep theirs only where they differ and leave out their words.
+fn share_text_defaults(value: &mut Value) {
+    let Some(tracks) = value["tracks"].as_array_mut() else { return };
+    for track in tracks.iter_mut().filter(|t| t["kind"] == "text") {
+        for field in ["style", "transform"] {
+            let mut counts = std::collections::BTreeMap::new();
+            for clip in track["clips"].as_array().into_iter().flatten() {
+                let value = &clip["content"][field];
+                counts.entry(value.to_string()).or_insert_with(|| (0, value.clone())).0 += 1;
+            }
+            if let Some((count, shared)) = counts.into_values().max_by_key(|(count, _)| *count)
+                && count > 1
+            {
+                for content in
+                    track["clips"].as_array_mut().into_iter().flatten().filter_map(|c| c["content"].as_object_mut())
+                {
+                    if content.get(field) == Some(&shared) {
+                        content.remove(field);
+                    }
+                }
+                track[format!("shared_{field}")] = shared;
+            }
+        }
+        for content in track["clips"].as_array_mut().into_iter().flatten().filter_map(|c| c["content"].as_object_mut())
+        {
+            content.remove("words");
+        }
+        track["words_omitted"] = json!(true);
+    }
+}
+
+/// An hour in 10 ms windows; longer media needs wider windows so results stay bounded.
+const MAX_LOUDNESS_VALUES: i64 = 360_000;
+const MAX_LOUDNESS_WINDOW_US: i64 = 3_600_000_000;
+
+pub(crate) fn loudness_window(duration_us: i64, window_us: Option<i64>) -> Result<i64> {
+    let min = (duration_us / MAX_LOUDNESS_VALUES + 1).max(10_000);
+    let window = window_us.unwrap_or(min.max(100_000));
+    ensure!(
+        (min..=MAX_LOUDNESS_WINDOW_US).contains(&window),
+        "INVALID_ARGUMENTS: loudness window_us must be {min}..={MAX_LOUDNESS_WINDOW_US} for this asset"
+    );
+    Ok(window)
+}
+
+/// An image Codex generated, copied into Nuzky's own folder, since a project should not depend on Codex's home;
+/// any other file as it is. Codex saves them as `<its home>/generated_images/<thread>/<call>.png`, and the agent
+/// that imports one may use another home than this process knows, so the path's shape tells.
+fn kept(path: PathBuf) -> Result<PathBuf> {
+    let (Some(file), Some(thread)) = (path.file_name(), path.parent().and_then(Path::file_name)) else {
+        return Ok(path);
+    };
+    let generated =
+        path.parent().and_then(Path::parent).and_then(Path::file_name).is_some_and(|n| n == "generated_images");
+    if !generated || path.extension().is_none_or(|e| e != "png") {
+        return Ok(path);
+    }
+    let bytes = std::fs::read(&path).context("Reading the generated image")?;
+    let mut copy = crate::sounds::data_dir().join("generated-images").join(thread).join(file);
+    // Another image under the same names keeps the copy a project may already use.
+    if copy.is_file() && std::fs::read(&copy).ok().as_deref() != Some(bytes.as_slice()) {
+        copy.set_file_name(format!("{}-{}", new_id(), file.to_string_lossy()));
+    }
+    if !copy.is_file() {
+        crate::sounds::publish(&copy, |out| Ok(std::io::Write::write_all(out, &bytes)?))?;
+    }
+    dunce::canonicalize(&copy).context("Resolving media path")
+}
+
+/// Agents add media as existing local files, as import_media does; projects may keep missing ones.
+fn check_new_assets(edits: &[EditCmd]) -> Result<()> {
+    for edit in edits {
+        if let EditCmd::AddAssets { assets } = edit {
+            for asset in assets {
+                nuzky_session::local_media_path(&asset.path)?;
+                ensure!(Path::new(&asset.path).is_file(), "MEDIA_MISSING: {}", asset.path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The files a cover is drawn from are there: its image, or the timeline's media, and the images on it.
+fn cover_media(project: &Project, thumbnail: &Thumbnail) -> Result<()> {
+    match thumbnail.image.as_deref().and_then(|id| project.asset(id)) {
+        Some(image) => ensure!(Path::new(&image.path).is_file(), "MEDIA_MISSING: {}", image.path),
+        None => media::check_media(project)?,
+    }
+    for image in thumbnail.overlays.iter().filter_map(|o| project.asset(&o.asset_id)) {
+        ensure!(Path::new(&image.path).is_file(), "MEDIA_MISSING: {}", image.path);
+    }
+    Ok(())
+}
+
+fn thumbnail(project: &Project, format: ThumbnailFormat) -> Result<&Thumbnail> {
+    project.thumbnail(format).with_context(|| {
+        format!("THUMBNAIL_MISSING: the project has no {} thumbnail; apply_edits setThumbnail first", json!(format))
+    })
+}
+
+/// Each text with the share of it the person covers.
+fn texts(thumbnail: &Thumbnail, hidden: &[f32]) -> Value {
+    let round = |share: f32| (share * 1000.0).round() / 1000.0;
+    json!(
+        thumbnail
+            .texts
+            .iter()
+            .zip(hidden)
+            .map(|(t, &h)| json!({"text": t.text, "behind": t.behind, "hidden": round(h)}))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Built-in sounds of the kind, and music already added from YouTube, first, then a page from online; offline
+/// those still come back.
+fn search_sounds(args: SearchSounds) -> Result<Value> {
+    use crate::sounds::{Kind, built_in, search};
+    if crate::youtube::is_link(&args.query) {
+        let sound = crate::sounds::link(&args.query)?;
+        let rights_confirmed = crate::sounds::settings().youtube_rights;
+        return Ok(
+            json!({"sounds": [sound], "more": false, "online": "YouTube", "rights_confirmed": rights_confirmed}),
+        );
+    }
+    let page = args.page.unwrap_or(1);
+    let mut sounds = Vec::new();
+    if page == 1 && args.license != Some(nuzky_engine::model::License::CcBy) {
+        sounds.extend(built_in(&args.query).into_iter().filter(|s| s.kind == args.kind));
+    }
+    if args.kind == Kind::Music && page == 1 && args.license.is_none() {
+        let query = args.query.trim().to_lowercase();
+        sounds.extend(
+            crate::sounds::downloaded()
+                .into_iter()
+                .filter(|s| s.title.to_lowercase().contains(&query) || s.author.to_lowercase().contains(&query)),
+        );
+    }
+    if args.query.trim().is_empty() {
+        return Ok(json!({"sounds": sounds, "more": false}));
+    }
+    match search(&args.query, args.kind, args.license, page) {
+        Ok(found) => {
+            sounds.extend(found.sounds);
+            Ok(json!({"sounds": sounds, "more": found.more, "online": found.service}))
+        }
+        Err(error) if !sounds.is_empty() => {
+            Ok(json!({"sounds": sounds, "more": false, "online_error": format!("{error:#}")}))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn owns_run(state: &SessionState, id: &str) -> Result<()> {
+    ensure!(!state.read_only, "READ_ONLY: restart with --allow-write");
+    ensure!(state.open_run.as_ref().is_some_and(|r| r.run_id == id), "INVALID_RUN: begin a run first");
+    Ok(())
+}
+
+/// A tool's answer with `warnings` when there are any.
+fn with_warnings(mut value: Value, warnings: Vec<String>) -> Value {
+    if !warnings.is_empty() {
+        value["warnings"] = json!(warnings);
+    }
+    value
+}
+
+fn parse<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).context("INVALID_ARGUMENTS")
+}
+
+pub async fn call(backend: Arc<Backend>, name: String, arguments: Value) -> CallToolResult {
+    let errors = backend.clone();
+    match tokio::task::spawn_blocking(move || backend.call(&name, arguments)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => tool_error(&errors, format!("{error:#}")),
+        Err(error) => tool_error(&errors, format!("TOOL_FAILED: worker failed: {error}")),
+    }
+}
+
+pub(crate) fn error_message(message: String) -> String {
+    if message
+        .split_once(": ")
+        .is_some_and(|(code, _)| !code.is_empty() && code.bytes().all(|c| c.is_ascii_uppercase() || c == b'_'))
+    {
+        message
+    } else {
+        format!("TOOL_FAILED: {message}")
+    }
+}
+
+pub(crate) fn tool_error(backend: &Backend, message: String) -> CallToolResult {
+    let message = error_message(message);
+    let stamp = backend.host.session.stamp();
+    CallToolResult::structured_error(json!({
+        "error": message, "revision": stamp.revision, "session_epoch": stamp.session_epoch,
+    }))
+}
+
+fn caption_stats(project: &Project) -> Value {
+    let captions =
+        project.tracks.iter().filter(|track| track.is_captions()).flat_map(|track| &track.clips).filter_map(|clip| {
+            match &clip.content {
+                nuzky_engine::model::ClipContent::Text { text, .. } => Some(text),
+                _ => None,
+            }
+        });
+    let (count, max_chars, max_words) = captions.fold((0, 0, 0), |(count, chars, words), text| {
+        (count + 1, chars.max(text.chars().count()), words.max(text.split_whitespace().count()))
+    });
+    json!({"count": count, "max_chars": max_chars, "max_words": max_words})
+}
+
+/// The share of an export job's progress the file takes; checking it takes the rest.
+const EXPORT_SHARE: f32 = 0.98;
+
+/// What `check::review` found in a published export, or why it did not finish. The video is finished either way, so
+/// neither an error nor a stop turns the job into a failed or cancelled one.
+fn check_export(project: &Project, measured: &check::Measured, cancel: &AtomicBool, progress: &Progress) -> Value {
+    progress.set("checking_export", Some(EXPORT_SHARE));
+    let cancelled = || cancel.load(Ordering::Relaxed);
+    let mut report =
+        |fraction: f32| progress.set("checking_export", Some(EXPORT_SHARE + (1.0 - EXPORT_SHARE) * fraction));
+    let reviewed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check::review(project, measured, &cancelled, &mut report)
+    }));
+    let why = match reviewed {
+        Ok(Ok(review)) => return json!(review),
+        _ if cancelled() => "the check was stopped".to_owned(),
+        Ok(Err(error)) => format!("the check failed: {error:#}"),
+        Err(_) => "the check failed".to_owned(),
+    };
+    log::warn!("Export check skipped: {why}");
+    json!({"skipped": why})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn inspect_frames_reports_deleted_image_name() {
+        let dir = std::env::temp_dir().join(format!("inspect-missing-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("deleted.ppm");
+        std::fs::write(&image, b"P6\n2 2\n255\nabcdefghijkl").unwrap();
+        let mut project = Project::new("missing image");
+        project.apply(EditCmd::AddAssets { assets: vec![probe(&image, "image".into()).unwrap()] }).unwrap();
+        project.apply(EditCmd::AddClip { asset_id: "image".into(), start_us: None, track_id: None }).unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&project).unwrap()).unwrap();
+        std::fs::remove_file(image).unwrap();
+        let backend = Backend::open(&path, false, dir.join("cache")).unwrap();
+        let error = backend.call("inspect_frames", json!({"times_us": [0], "width": 64})).unwrap_err();
+        assert!(format!("{error:#}").contains("deleted.ppm"), "{error:#}");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_assets_must_be_existing_local_files() {
+        let dir = std::env::temp_dir().join(format!("add-assets-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("still.ppm");
+        std::fs::write(&image, b"P6\n2 2\n255\nabcdefghijkl").unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&Project::new("assets")).unwrap()).unwrap();
+        let backend = Backend::open(&path, true, dir.join("cache")).unwrap();
+        let run = backend.call("begin_run", json!({"label":"assets"})).unwrap().structured_content.unwrap();
+        let mut asset = probe(&image, "still".into()).unwrap();
+        let add = |asset: &nuzky_engine::model::Asset, request: &str| {
+            backend.call(
+                "apply_edits",
+                json!({"run_id":run["run_id"],"request_id":request,"edits":[{"type":"addAssets","assets":[asset]}]}),
+            )
+        };
+        let missing = dir.join("missing.mp4").to_string_lossy().into_owned();
+        for (path, code) in [
+            ("http://127.0.0.1:9/x.mp4", "INVALID_ASSET_PATH"),
+            ("concat:/a.mp4|/b.mp4", "INVALID_ASSET_PATH"),
+            ("still.ppm", "INVALID_ASSET_PATH"),
+            (missing.as_str(), "MEDIA_MISSING"),
+        ] {
+            let mut bad = asset.clone();
+            bad.path = path.into();
+            let error = format!("{:#}", add(&bad, path).unwrap_err());
+            assert!(error.starts_with(code), "{path}: {error}");
+        }
+        assert!(backend.host.session.state().unwrap().project.assets.is_empty());
+        asset.path = image.to_string_lossy().into();
+        add(&asset, "ok").unwrap();
+        assert_eq!(backend.host.session.state().unwrap().project.assets.len(), 1);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn other_clients_reads_do_not_keep_an_idle_run_open() {
+        let dir = std::env::temp_dir().join(format!("idle-clients-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&Project::new("idle")).unwrap()).unwrap();
+        let timeout = std::time::Duration::from_millis(300);
+        let session = ProjectSession::open_with_idle_timeout(&path, Mode::Write, timeout, None).unwrap();
+        let host = Arc::new(Host::new(session, dir.join("cache")).unwrap());
+        let client = |access| Backend::shared(host.clone(), &path, Client { id: new_id(), access }).unwrap();
+        let (agent, viewer) = (client(Access::Write), client(Access::ReadOnly));
+        agent.call("begin_run", json!({"label":"abandoned"})).unwrap();
+        let began = std::time::Instant::now();
+        while host.session.state().unwrap().open_run.is_some() {
+            assert!(began.elapsed() < timeout * 5, "another client's reads kept the run open");
+            viewer.call("get_state", json!({})).unwrap();
+            let _ = viewer.call("job", json!({"job_id":"missing","action":"get"}));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        agent.call("begin_run", json!({"label":"active"})).unwrap();
+        let began = std::time::Instant::now();
+        while began.elapsed() < timeout * 3 {
+            agent.call("get_state", json!({})).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(host.session.state().unwrap().open_run.is_some());
+        drop((agent, viewer, host));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_clients_cancel_their_own_jobs_only() {
+        let dir = std::env::temp_dir().join(format!("job-owners-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&Project::new("jobs")).unwrap()).unwrap();
+        let session = ProjectSession::open(&path, Mode::Write, None).unwrap();
+        let host = Arc::new(Host::new(session, dir.join("cache")).unwrap());
+        let client = |access| Backend::shared(host.clone(), &path, Client { id: new_id(), access }).unwrap();
+        let (writer, reader) = (client(Access::Write), client(Access::ReadOnly));
+        let stamp = host.session.stamp();
+        let job = |owner: &Backend| {
+            let started = host.start_job(&owner.client.id, None, "analysis", stamp.clone(), |cancel, _| {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                anyhow::bail!("CANCELLED: test")
+            });
+            started.unwrap()["job_id"].as_str().unwrap().to_owned()
+        };
+        let (theirs, mine) = (job(&writer), job(&reader));
+        let refused = format!("{:#}", reader.call("job", json!({"job_id": theirs, "action": "cancel"})).unwrap_err());
+        assert!(refused.starts_with("UNAUTHORIZED"), "{refused}");
+        let cancel =
+            reader.call("job", json!({"job_id": mine, "action": "cancel"})).unwrap().structured_content.unwrap();
+        assert_eq!(cancel["cancel_requested"], true);
+        host.jobs.get(&theirs, true).unwrap();
+        drop((writer, reader));
+        // Closing the project waits for its writer, which may still be saving the version it opened as.
+        drop(host);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn import_request_id_retries_a_failed_save_without_adding_assets_twice() {
+        let dir = std::env::temp_dir().join(format!("import-retry-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("still.ppm");
+        std::fs::write(&image, b"P6\n2 2\n255\nabcdefghijkl").unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&Project::new("import")).unwrap()).unwrap();
+        let backend = Backend::open(&path, true, dir.join("cache")).unwrap();
+        let run = backend.call("begin_run", json!({"label":"import"})).unwrap().structured_content.unwrap();
+        let args = json!({"run_id":run["run_id"],"paths":["still.ppm"],"request_id":"import-once"});
+        let backup = dir.join("backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = format!("{:#}", backend.call("import_media", args.clone()).unwrap_err());
+        assert!(error.contains("SAVE_FAILED"), "{error}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&backup, &path).unwrap();
+        let first = backend.call("import_media", args.clone()).unwrap().structured_content.unwrap();
+        let again = backend.call("import_media", args.clone()).unwrap().structured_content.unwrap();
+        assert_eq!(first["asset_ids"], again["asset_ids"]);
+        let disk: Project = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.assets.len(), 1);
+        assert_eq!(backend.host.session.state().unwrap().project.assets.len(), 1);
+        let mut other = args;
+        other["paths"] = json!(["still.ppm", "still.ppm"]);
+        let conflict = format!("{:#}", backend.call("import_media", other).unwrap_err());
+        assert!(conflict.starts_with("REQUEST_CONFLICT"), "{conflict}");
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_video_takes_the_reels_preset_or_explicit_settings() {
+        let dir = std::env::temp_dir().join(format!("export-args-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("project.nuzky");
+        let mut wide = Project::new("wide");
+        (wide.canvas.width, wide.canvas.height) = (1920, 1080);
+        std::fs::write(&path, serde_json::to_vec(&wide).unwrap()).unwrap();
+        let backend = Backend::open(&path, true, dir.join("cache")).unwrap();
+        let error = |args: Value| format!("{:#}", backend.call("export_video", args).unwrap_err());
+        let missing = error(json!({"path": "out.mp4", "quality": "high"}));
+        assert!(missing.starts_with("INVALID_ARGUMENTS"), "{missing}");
+        let wrong_format = error(json!({"path": "out.mp4", "preset": "reels"}));
+        assert!(
+            wrong_format.starts_with("INVALID_ARGUMENTS: Reels & TikTok needs a 9:16 video and this one is 16:9"),
+            "{wrong_format}"
+        );
+        let shorts = error(json!({"path": "out.mp4", "preset": "shorts"}));
+        assert!(shorts.starts_with("INVALID_ARGUMENTS: YouTube Shorts needs a 9:16 video"), "{shorts}");
+        let small = error(json!({"path": "out.mp4", "preset": "youtube_4k", "resolution": 1080}));
+        assert!(small.starts_with("INVALID_ARGUMENTS: YouTube 4K exports at resolution 2160"), "{small}");
+        let fast = error(json!({"path": "out.mp4", "preset": "youtube_1080p", "fps": 120}));
+        assert!(fast.starts_with("INVALID_ARGUMENTS") && fast.contains("at most 60"), "{fast}");
+        assert!(error(json!({"path": "out.mp4", "preset": "youtube"})).contains("unknown variant"));
+        drop(backend);
+        std::fs::write(&path, serde_json::to_vec(&Project::new("tall")).unwrap()).unwrap();
+        let backend = Backend::open(&path, true, dir.join("cache")).unwrap();
+        let other = format!(
+            "{:#}",
+            backend.call("export_video", json!({"path": "out.mp4", "preset": "reels", "fps": 60})).unwrap_err()
+        );
+        assert!(other.starts_with("INVALID_ARGUMENTS: Reels & TikTok exports at fps 30"), "{other}");
+        assert!(!dir.join("out.mp4").exists());
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loudness_windows_stay_bounded_for_long_media() {
+        let hour = 3_600_000_000;
+        assert_eq!(loudness_window(hour, None).unwrap(), 100_000);
+        assert_eq!(loudness_window(hour, Some(10_001)).unwrap(), 10_001);
+        assert!(loudness_window(hour, Some(1)).unwrap_err().to_string().starts_with("INVALID_ARGUMENTS"));
+        assert!(loudness_window(hour, Some(MAX_LOUDNESS_WINDOW_US + 1)).is_err());
+        let day = 24 * hour;
+        let wide = loudness_window(day, None).unwrap();
+        assert!(wide > 100_000 && day / wide <= MAX_LOUDNESS_VALUES);
+        assert!(loudness_window(day, Some(100_000)).is_err());
+    }
+
+    #[test]
+    fn caption_stats_count_unicode_characters_and_exclude_titles() {
+        let mut project = Project::new("stats");
+        let style = nuzky_engine::model::TextStyle {
+            font_family: None,
+            font_size: 64.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: nuzky_engine::model::TextAlign::Center,
+            box_radius: nuzky_engine::model::BOX_RADIUS,
+        };
+        project
+            .apply(EditCmd::AddText { start_us: 0, text: "A very long unrelated title".into(), style: style.clone() })
+            .unwrap();
+        project
+            .apply(EditCmd::AddCaptions {
+                segments: vec![nuzky_engine::edit::CaptionSegment {
+                    start_us: 0,
+                    end_us: 1_000_000,
+                    text: "Příliš žluťoučký".into(),
+                    words: Vec::new(),
+                }],
+                style,
+                anim_in: None,
+                anim_out: None,
+                transform: None,
+            })
+            .unwrap();
+        assert_eq!(caption_stats(&project), json!({"count":1,"max_chars":16,"max_words":2}));
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use nuzky_session::transcripts::{Record, VERSION};
+
+    fn fixture() -> (PathBuf, Backend, Project) {
+        let dir = std::env::temp_dir().join(format!("transcript-tools-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut project, sources) = transcript::tests::fixture();
+        let asset_path = dir.join("talk.mov");
+        std::fs::write(&asset_path, b"fixture content").unwrap();
+        project.assets[0].path = asset_path.to_string_lossy().into();
+        let clip = project.tracks[0].clips[0].id.clone();
+        project.apply(EditCmd::SplitClip { clip_id: clip, at_us: 5_000_000 }).unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&project).unwrap()).unwrap();
+        let store = nuzky_session::transcripts::TranscriptStore::at(dir.join("transcripts")).unwrap();
+        store
+            .put(
+                &project.assets[0],
+                &Record {
+                    version: VERSION,
+                    duration_us: project.assets[0].duration_us,
+                    fingerprint: store.fingerprint(&project.assets[0]).unwrap(),
+                    model: "fixture".into(),
+                    language: "en".into(),
+                    words: sources["talk"].clone(),
+                    segments: vec![],
+                    alignment: None,
+                },
+            )
+            .unwrap();
+        let backend = Backend {
+            host: Arc::new(Host {
+                session: ProjectSession::open(&path, Mode::Write, None).unwrap(),
+                jobs: Default::default(),
+                transcripts: store,
+                cache_dir: dir.join("cache"),
+            }),
+            client: Client { id: "test".into(), access: Access::Write },
+            runs: Mutex::default(),
+            closed: AtomicBool::new(false),
+            project_dir: dir.clone(),
+            project_path: path,
+            export_queue: Arc::default(),
+            transcript_requests: Mutex::default(),
+            import_requests: Mutex::default(),
+            sound_requests: Mutex::default(),
+            video_requests: Mutex::default(),
+            sticker_requests: Mutex::default(),
+            model_refused: Arc::default(),
+            vision_refused: Arc::default(),
+        };
+        (dir, backend, project)
+    }
+
+    #[test]
+    fn dry_run_stale_key_and_multiple_clip_slips_are_one_undo() {
+        let (dir, backend, project) = fixture();
+        let run = backend.host.session.begin_run("remove slips".into()).unwrap();
+        let state = backend.host.session.state().unwrap();
+        let initial = backend.get_transcript(GetTranscript::default(), &state).unwrap();
+        let args = json!({"run_id":run.run_id,"transcript_key":initial["transcript_key"],"delete":[[1,2],[6,6]],"dry_run":true});
+        let preview = backend.dispatch("edit_transcript", args.clone(), &state).unwrap();
+        assert_eq!(backend.host.session.state().unwrap().project, project);
+        assert_eq!(backend.host.session.state().unwrap().stamp.revision, state.stamp.revision);
+        let mut apply = args;
+        apply["dry_run"] = json!(false);
+        let result = backend.dispatch("edit_transcript", apply.clone(), &state).unwrap();
+        assert_eq!(preview["duration_us"], result["duration_us"]);
+        assert_eq!(preview["preview_text"], result["preview_text"]);
+        let changed = backend.host.session.state().unwrap();
+        assert_eq!(
+            result["transcript_key"],
+            backend.get_transcript(GetTranscript::default(), &changed).unwrap()["transcript_key"]
+        );
+        assert!(
+            backend.dispatch("edit_transcript", apply, &changed).unwrap_err().to_string().contains("SPEECH_CHANGED")
+        );
+        let transcript = backend.get_transcript(GetTranscript::default(), &changed).unwrap();
+        assert_eq!(transcript["words"].as_array().unwrap().len(), 5);
+        backend.host.session.end_run(&run.run_id, nuzky_session::EndAction::Keep).unwrap();
+        backend.host.session.undo_run(&run.run_id).unwrap();
+        assert_eq!(backend.host.session.state().unwrap().project, project);
+        let mut record = backend.host.transcripts.get(&project.assets[0]).unwrap().unwrap();
+        record.words.remove(0);
+        backend.host.transcripts.put(&project.assets[0], &record).unwrap();
+        let new_run = backend.host.session.begin_run("stale recognition".into()).unwrap();
+        let current = backend.host.session.state().unwrap();
+        let stale =
+            json!({"run_id":new_run.run_id,"transcript_key":initial["transcript_key"],"delete":[[0,0]],"dry_run":true});
+        assert!(
+            backend.dispatch("edit_transcript", stale, &current).unwrap_err().to_string().contains("SPEECH_CHANGED")
+        );
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn transcript_request_id_retries_failed_save_without_cutting_again() {
+        let (dir, backend, before) = fixture();
+        let run = backend.host.session.begin_run("retry transcript".into()).unwrap();
+        let initial = backend.host.session.state().unwrap();
+        let transcript = backend.get_transcript(GetTranscript::default(), &initial).unwrap();
+        let args = json!({"run_id":run.run_id,"request_id":"cut-once","transcript_key":transcript["transcript_key"],"delete":[[1,2]]});
+        std::fs::remove_file(&backend.project_path).unwrap();
+        std::fs::create_dir(&backend.project_path).unwrap();
+        let error = backend.dispatch("edit_transcript", args.clone(), &initial).unwrap_err();
+        assert!(format!("{error:#}").contains("SAVE_FAILED"));
+        let live = backend.host.session.state().unwrap();
+        assert_ne!(live.project, before);
+        assert_eq!(live.stamp.revision, initial.stamp.revision + 1);
+        std::fs::remove_dir(&backend.project_path).unwrap();
+        let saved = backend.dispatch("edit_transcript", args.clone(), &live).unwrap();
+        let disk: Project = serde_json::from_slice(&std::fs::read(&backend.project_path).unwrap()).unwrap();
+        assert_eq!(disk, live.project);
+        assert_eq!(backend.host.session.state().unwrap().project, live.project);
+        assert_eq!(saved["revision"], live.stamp.revision);
+        assert_eq!(backend.dispatch("edit_transcript", args.clone(), &live).unwrap(), saved);
+        let mut conflict = args;
+        conflict["delete"] = json!([[0, 0]]);
+        assert!(
+            backend.dispatch("edit_transcript", conflict, &live).unwrap_err().to_string().contains("REQUEST_CONFLICT")
+        );
+        backend.host.session.end_run(&run.run_id, nuzky_session::EndAction::Keep).unwrap();
+        backend.host.session.undo_run(&run.run_id).unwrap();
+        assert_eq!(backend.host.session.state().unwrap().project, before);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dry_run_plans_before_a_run_even_for_read_only_clients() {
+        let (dir, backend, before) = fixture();
+        let state = backend.host.session.state().unwrap();
+        let key = backend.get_transcript(GetTranscript::default(), &state).unwrap()["transcript_key"].clone();
+        let plan_args = json!({"transcript_key":key,"delete":[[1,2]],"dry_run":true});
+        let plan = backend.call("edit_transcript", plan_args.clone()).unwrap().structured_content.unwrap();
+        assert_eq!(plan["dry_run"], true);
+        let viewer = Backend::shared(
+            backend.host.clone(),
+            &backend.project_path,
+            Client { id: "viewer".into(), access: Access::ReadOnly },
+        )
+        .unwrap();
+        let viewed = viewer.call("edit_transcript", plan_args).unwrap().structured_content.unwrap();
+        assert_eq!(viewed["duration_us"], plan["duration_us"]);
+        assert_eq!(backend.host.session.state().unwrap().project, before);
+        let missing_run = format!(
+            "{:#}",
+            backend.call("edit_transcript", json!({"transcript_key":key,"delete":[[1,2]]})).unwrap_err()
+        );
+        assert!(missing_run.starts_with("INVALID_ARGUMENTS"), "{missing_run}");
+        let run = backend.call("begin_run", json!({"label":"cut"})).unwrap().structured_content.unwrap();
+        let applied = backend
+            .call("edit_transcript", json!({"run_id":run["run_id"],"transcript_key":key,"delete":[[1,2]]}))
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(applied["duration_us"], plan["duration_us"]);
+        assert_ne!(backend.host.session.state().unwrap().project, before);
+        drop((viewer, backend));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn correct_words_changes_captions_survives_rebuilding_retries_and_undoes() {
+        let (dir, backend, before) = fixture();
+        let run = backend.call("begin_run", json!({"label":"fix words"})).unwrap().structured_content.unwrap();
+        let run_id = run["run_id"].as_str().unwrap().to_owned();
+        let call = |name: &str, args: Value| backend.call(name, args).map(|r| r.structured_content.unwrap());
+        call("build_captions", json!({"run_id": run_id, "max_words": 3, "max_chars": 100})).unwrap();
+        let transcript = call("get_transcript", json!({})).unwrap();
+        let key = transcript["transcript_key"].clone();
+        let caption = |backend: &Backend| {
+            let project = backend.host.session.state().unwrap().project;
+            project
+                .tracks
+                .iter()
+                .filter(|t| t.is_captions())
+                .flat_map(|t| &t.clips)
+                .map(|c| match &c.content {
+                    nuzky_engine::model::ClipContent::Text { text, .. } => text.clone(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        assert!(caption(&backend).contains("word3"));
+        let args = json!({"run_id": run_id, "request_id": "fix-once", "transcript_key": key,
+            "corrections": [{"i": 3, "text": "fixed"}]});
+        // A failed save keeps the live edit; the retry finishes it without correcting twice.
+        std::fs::remove_file(&backend.project_path).unwrap();
+        std::fs::create_dir(&backend.project_path).unwrap();
+        let error = format!("{:#}", backend.call("correct_words", args.clone()).unwrap_err());
+        assert!(error.contains("SAVE_FAILED"), "{error}");
+        std::fs::remove_dir(&backend.project_path).unwrap();
+        let fixed = call("correct_words", args.clone()).unwrap();
+        assert_eq!(fixed["words"], json!([{"i": 3, "before": "word3", "after": "fixed"}]));
+        assert_eq!(fixed["captions_changed"].as_array().unwrap().len(), 1);
+        assert_eq!(call("correct_words", args.clone()).unwrap(), fixed);
+        let mut conflict = args.clone();
+        conflict["corrections"] = json!([{"i": 3, "text": "other"}]);
+        assert!(format!("{:#}", backend.call("correct_words", conflict).unwrap_err()).starts_with("REQUEST_CONFLICT"));
+        let disk: Project = serde_json::from_slice(&std::fs::read(&backend.project_path).unwrap()).unwrap();
+        assert_eq!(disk.word_corrections.len(), 1);
+        let shown = caption(&backend);
+        assert!(shown.contains("fixed") && !shown.contains("word3"), "{shown}");
+        let after = call("get_transcript", json!({})).unwrap();
+        assert_eq!(after["words"][3]["text"], "fixed");
+        assert_eq!(after["transcript_key"], fixed["transcript_key"]);
+        // The old key numbers words that read differently now.
+        let stale = json!({"run_id": run_id, "transcript_key": key, "corrections": [{"i": 4, "text": "x"}]});
+        assert!(format!("{:#}", backend.call("correct_words", stale).unwrap_err()).starts_with("SPEECH_CHANGED"));
+        // Rebuilding the captions keeps the correction, and retakes read it too.
+        call("build_captions", json!({"run_id": run_id, "max_words": 3, "max_chars": 100})).unwrap();
+        assert_eq!(caption(&backend), shown);
+        let retakes = call("analyze", json!({"kind": "retakes"})).unwrap();
+        assert_eq!(retakes["transcript_key"], fixed["transcript_key"]);
+        call("end_run", json!({"run_id": run_id, "action": "keep"})).unwrap();
+        call("undo_run", json!({"run_id": run_id})).unwrap();
+        assert_eq!(backend.host.session.state().unwrap().project, before);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wrong_transcript_key_explains_which_tool_to_use() {
+        let (dir, backend, before) = fixture();
+        let run = backend.host.session.begin_run("wrong key".into()).unwrap();
+        let state = backend.host.session.state().unwrap();
+        let args = json!({"run_id":run.run_id,"transcript_key":state.speech_layout_key,"dry_run":true});
+        let error = backend.dispatch("edit_transcript", args, &state).unwrap_err().to_string();
+        assert!(error.contains("SPEECH_CHANGED"));
+        assert!(error.contains("use get_transcript's transcript_key"));
+        assert_eq!(backend.host.session.state().unwrap().project, before);
+        drop(backend);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

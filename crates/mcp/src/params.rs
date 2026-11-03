@@ -1,0 +1,644 @@
+use nuzky_engine::{
+    edit::{CaptionPreset, EditCmd, MotionKind, TimeRange, TransformPatch},
+    export::{Delivery, Quality},
+    model::{TextStyle, ThumbnailFormat, Transform},
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    pub range: Option<TimeRange>,
+    pub clip_ids: Option<Vec<String>>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Begin {
+    pub label: String,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Apply {
+    pub run_id: String,
+    pub request_id: String,
+    #[serde(deserialize_with = "deserialize_edits")]
+    #[schemars(with = "Vec<EditCmd>")]
+    pub edits: Vec<EditCmd>,
+    pub expected_revision: Option<u64>,
+    pub expected_speech_layout_key: Option<String>,
+}
+
+fn deserialize_edits<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<EditCmd>, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => serde_json::from_str(&text)
+            .map_err(|e| D::Error::custom(format!("edits must be a JSON array of edits: {e}"))),
+        value => serde_json::from_value(value).map_err(D::Error::custom),
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Reframe {
+    pub run_id: String,
+    /// Target canvas: "9:16", "4:5" or "1:1".
+    pub format: String,
+    pub clip_ids: Option<Vec<String>>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndAction {
+    Keep,
+    Discard,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct End {
+    pub run_id: String,
+    pub action: EndAction,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAction {
+    Keep,
+    Restore,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Recovery {
+    pub action: RecoveryAction,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Undo {
+    pub run_id: String,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListHistory {
+    /// How many versions to list, newest first: 1 to 200, default 20.
+    pub limit: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetStyle {}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeStyle {
+    /// The change, by its type: setOwn {text, index?}, accept {titles}, reject {title}, remove {title},
+    /// revert {title}, learnAgain {title}, setText {text, baseVersion} or restore {index}.
+    pub action: crate::style::StyleAction,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListPlugins {
+    /// Also return the guide to writing plugins (nuzky://plugin-guide).
+    pub guide: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SavePlugin {
+    /// plugin.json: {nuzkyPlugin: 2, id, name, description, version, action? or actions?, needs?, inputs?, sections?,
+    /// files?, effects?}.
+    pub manifest: serde_json::Value,
+    /// plugin.js, which defines function run(ctx); left out keeps the plugin's own, and a plugin that only adds
+    /// effects needs none.
+    pub script: Option<String>,
+    /// WGSL of the manifest's effects by effect id, each defining fn effect(p: Pixel) -> vec4<f32>; one left out
+    /// keeps its file.
+    #[serde(default)]
+    pub effects: std::collections::BTreeMap<String, String>,
+    /// README.md; left out keeps the plugin's README.
+    pub readme: Option<String>,
+    /// Pictures and sounds to copy into the plugin's folder: a name from the manifest's files, such as "logo.png",
+    /// to the absolute path of a file you have. A file the folder already has can be left out.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunPlugin {
+    pub id: String,
+    /// Values by input id; inputs left out take their default.
+    #[serde(default)]
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    /// Required unless dry_run is true.
+    pub run_id: Option<String>,
+    /// Clip ids for ctx.selection; the app's selection by default.
+    pub selection: Option<Vec<String>>,
+    /// ctx.playheadUs; the app's playhead by default.
+    pub playhead_us: Option<i64>,
+    /// The id of the manifest's action to run, which the plugin reads as ctx.action; its first action by default.
+    pub action: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UndoTo {
+    /// The version's index from list_history. Give index or hash.
+    pub index: Option<u64>,
+    /// 4 or more hex digits from the start of the version's hash.
+    pub hash: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Import {
+    pub run_id: String,
+    pub paths: Vec<String>,
+    /// Reuse this id with the same paths to retry a failed save without importing twice.
+    pub request_id: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchSounds {
+    /// What to look for, in English: "whoosh", "upbeat", "cinematic piano". Empty lists the built-in sounds of the kind, for music also the songs already added from YouTube links.
+    pub query: String,
+    pub kind: crate::sounds::Kind,
+    /// Only this licence: "cc0" (no credit needed) or "by" (credit needed). Both by default, with music from YouTube links (no licence) too.
+    pub license: Option<nuzky_engine::model::License>,
+    /// 1 to 12; online results only.
+    pub page: Option<u32>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddSound {
+    pub run_id: String,
+    /// A sound id from search_sounds.
+    pub id: String,
+    /// Where the clip starts on the timeline.
+    pub at_us: i64,
+    /// Reuse this id with the same sound to retry a failed save without adding it twice.
+    pub request_id: Option<String>,
+    /// true only after the user agreed that the rights to music from YouTube links are theirs to check.
+    pub rights_confirmed: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddYoutubeVideo {
+    pub run_id: String,
+    /// The YouTube link the user gave.
+    pub link: String,
+    /// The part in the video's own microseconds. Set both start_us and end_us, or neither for the whole video.
+    pub start_us: Option<i64>,
+    pub end_us: Option<i64>,
+    /// When set, also place a clip at this timeline time.
+    pub at_us: Option<i64>,
+    /// true only after the user agreed that the rights to the video are theirs to check.
+    pub rights_confirmed: Option<bool>,
+    /// Reuse with the same link, part and placement after a failed save to avoid adding it twice.
+    pub request_id: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportWebImage {
+    pub run_id: String,
+    /// The https address of a PNG, JPEG, WebP or SVG picture, or of a page that shows it. Never put the transcript or other project content into it.
+    pub url: String,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddSticker {
+    pub run_id: String,
+    /// One emoji, an English emoji name, :shortcode: or Nuzky sticker id.
+    pub sticker: String,
+    pub at_us: i64,
+    /// Defaults to 3 seconds for an image.
+    pub duration_us: Option<i64>,
+    /// Defaults to centred, longer side 30% of the canvas's shorter side.
+    pub transform: Option<Transform>,
+    /// Reuse with the same arguments to retry without adding a second clip.
+    pub request_id: Option<String>,
+}
+/// Choices offered to the user; the Nuzky AI panel shows them as buttons.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestOptions {
+    /// The question, short, in the user's language.
+    pub question: Option<String>,
+    /// 2 to 6 choices. The label the user picks comes back as their next message.
+    pub options: Vec<Choice>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Choice {
+    /// What the button says, at most 80 characters.
+    pub label: String,
+    /// One short line on what happens with this choice.
+    pub detail: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Inspect {
+    /// 1 to 16 timeline times. Leave out with sample "changes".
+    pub times_us: Option<Vec<i64>>,
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub safe_area: bool,
+    /// "changes": pick the frames that look different within range_us instead of given times.
+    pub sample: Option<Sample>,
+    /// With sample "changes": half-open timeline range, the whole timeline when left out.
+    pub range_us: Option<[i64; 2]>,
+    /// With sample "changes": the next value of the previous page; it carries the range.
+    pub cursor: Option<String>,
+    /// With sample "changes": frames per page, 1 to 16, default 16.
+    pub max_frames: Option<usize>,
+    /// With sample "changes": how many of 64 hash bits a frame must differ in from each of the
+    /// last four kept frames, default 16. Gestures within one shot mostly stay below it, a cut to
+    /// other footage differs in 30 or more.
+    pub min_change: Option<u32>,
+    /// The job_id of a finished export_video you started: shows times_us of the exported
+    /// file itself instead of the timeline. Only times_us and width go with it.
+    pub export_job_id: Option<String>,
+}
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sample {
+    Changes,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Activity {
+    /// Half-open timeline range, the whole timeline when left out.
+    pub range_us: Option<[i64; 2]>,
+    /// Points of each curve, 8 to 200, default 60.
+    pub points: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Waveform {
+    /// Half-open timeline range, at most 60 s.
+    pub range_us: [i64; 2],
+    /// Picture width in pixels, 400 to 2400, default 1200.
+    pub width: Option<u32>,
+}
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisKind {
+    Silences,
+    Loudness,
+    Scenes,
+    /// Filler words and hesitations: over the whole timeline at once, or of one asset as a job.
+    Fillers,
+    /// Restarted sentences and filler words over the whole timeline, returned at once.
+    Retakes,
+    /// Sentences said with emphasis, for a punch-in, over the whole timeline, returned at once.
+    Emphasis,
+    /// Frames of the whole timeline worth a cover or thumbnail, as a job.
+    ThumbnailFrames,
+    /// Tempo, beats, bars, drops and sections of a song, as a job.
+    Beats,
+}
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisParams {
+    pub threshold_db: Option<f32>,
+    pub min_silence_us: Option<i64>,
+    pub pad_us: Option<i64>,
+    pub window_us: Option<i64>,
+    pub threshold: Option<f32>,
+    pub min_gap_us: Option<i64>,
+    /// thumbnail_frames: "9:16" (Reels, TikTok) or "16:9" (YouTube) framing counts in the score;
+    /// the canvas's own shape by default.
+    pub format: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Analyze {
+    pub kind: AnalysisKind,
+    /// Required for silences, loudness, scenes and beats; with fillers it reads that asset only. Omit for retakes, emphasis and thumbnail_frames.
+    pub asset_id: Option<String>,
+    #[serde(default)]
+    pub params: AnalysisParams,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentSubject {
+    /// Timeline time of the frame, integer microseconds.
+    pub time_us: Option<i64>,
+    /// Instead of time_us: the picture of this cover, its image or its frame.
+    pub format: Option<ThumbnailFormat>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Transcribe {
+    pub asset_ids: Option<Vec<String>>,
+    pub language: Option<String>,
+    /// Installed model name or absolute local .bin path. Defaults to best installed.
+    pub model: Option<String>,
+}
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetTranscript {
+    /// Half-open timeline interval; word indices remain global.
+    pub range_us: Option<[i64; 2]>,
+    /// sentences leaves out words and pauses, to read a long video cheaply.
+    pub detail: Option<TranscriptDetail>,
+    /// Sentences per page, 1-500; with limit or cursor the result is a page with next_cursor.
+    pub limit: Option<usize>,
+    /// next_cursor of the page before.
+    pub cursor: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptDetail {
+    Full,
+    Sentences,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditTranscript {
+    /// Required unless dry_run is true.
+    pub run_id: Option<String>,
+    /// Reuse this id with identical arguments to retry a failed save without cutting twice.
+    pub request_id: Option<String>,
+    pub transcript_key: String,
+    /// Inclusive zero-based word indices [from,to].
+    pub delete: Option<Vec<[usize; 2]>>,
+    /// Inclusive zero-based word indices [from,to]. Mutually exclusive with delete.
+    pub keep: Option<Vec<[usize; 2]>>,
+    /// after_word of hesitations from analyze fillers, cut as deleted words would be.
+    pub delete_hesitations: Option<Vec<usize>>,
+    pub shorten_pauses_us: Option<i64>,
+    /// Maximum silence before a kept word at a cut, 0-1000000 us; overrides EDIT.md Settings.
+    pub keep_before_word_us: Option<i64>,
+    /// Maximum silence after a kept word at a cut, 0-1000000 us; overrides EDIT.md Settings.
+    pub keep_after_word_us: Option<i64>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrectWords {
+    pub run_id: String,
+    /// Reuse this id with identical arguments to retry a failed save without correcting twice.
+    pub request_id: Option<String>,
+    pub transcript_key: String,
+    pub corrections: Vec<WordFix>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WordFix {
+    /// get_transcript word index.
+    pub i: usize,
+    /// What the word should read, punctuation included: one line, at most 100 characters.
+    pub text: String,
+    /// The word's text as get_transcript shows it now. If it reads otherwise, the whole call is
+    /// refused with WORD_MISMATCH and nothing changes.
+    pub expected: Option<String>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyZooms {
+    pub run_id: String,
+    /// Reuse this id with identical arguments to retry a failed save without zooming twice.
+    pub request_id: Option<String>,
+    /// get_transcript's transcript_key, also returned by analyze(kind: "emphasis").
+    pub transcript_key: String,
+    /// Punch-ins on INCLUSIVE word ranges, such as analyze(kind: "emphasis").zooms.
+    pub zooms: Vec<crate::zooms::WordZoom>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CutToBeats {
+    /// Required unless dry_run is true.
+    pub run_id: Option<String>,
+    /// Reuse this id with identical arguments to retry a failed save without cutting twice.
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The song's clip; by default the only clip on an audio track that keeps its place.
+    pub music_clip_id: Option<String>,
+    /// How often the picture changes from where the beat is steady; the intro before it stays one piece.
+    pub every: Option<crate::beats::Every>,
+    /// Later changes of rhythm, each from a beat on: {from: "drop" or a beat index, every}.
+    pub changes: Option<Vec<crate::beats::Change>>,
+    /// The footage, used in turn; the main track's clips in order when left out.
+    pub shots: Option<Vec<crate::beats::Shot>>,
+    /// Where the video ends, timeline microseconds; by default the last bar line before the song or the footage ends.
+    pub end_us: Option<i64>,
+    /// The footage's own sound: mute (the default) or keep.
+    pub video_sound: Option<VideoSound>,
+}
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSound {
+    Mute,
+    Keep,
+}
+impl CutToBeats {
+    pub fn options(&self) -> crate::beats::Options {
+        crate::beats::Options {
+            music_clip_id: self.music_clip_id.clone(),
+            every: self.every,
+            changes: self.changes.clone().unwrap_or_default(),
+            shots: self.shots.clone(),
+            end_us: self.end_us,
+            keep_video_sound: self.video_sound == Some(VideoSound::Keep),
+        }
+    }
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeReels {
+    pub run_id: String,
+    /// Reuse this id with identical arguments to retry a failed save without proposing twice.
+    pub request_id: Option<String>,
+    pub transcript_key: String,
+    /// Replace every reel proposed before; reels already made stay.
+    pub candidates: Vec<crate::reels::ReelProposal>,
+    /// Longest reel once made, 60 s by default.
+    pub max_duration_us: Option<i64>,
+    /// Pauses longer than this are shortened to it when the reels are measured, trimmed and made; left out, the
+    /// creator's style's edit_transcript shorten_pauses_us, else 300000.
+    pub shorten_pauses_us: Option<i64>,
+}
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MakeReels {
+    pub run_id: String,
+    /// Reuse this id with identical arguments to retry a failed save without making the reels twice.
+    pub request_id: Option<String>,
+    /// Ids from get_state's reel_candidates.
+    pub ids: Vec<String>,
+    /// crop (default) fills the 9:16 frame with the middle of the picture; blur fits the whole picture with a
+    /// blurred copy behind.
+    pub canvas: Option<crate::reels::Framing>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyMotion {
+    pub run_id: String,
+    /// Reuse this id with identical arguments to retry a failed save without applying twice.
+    pub request_id: Option<String>,
+    /// A video or image clip on any track. Leave out to move every main-track clip under range_us.
+    pub clip_id: Option<String>,
+    /// Half-open timeline range the motion runs over, such as one sentence from get_transcript
+    /// word times; with clip_id, the clip's whole length when left out.
+    pub range_us: Option<[i64; 2]>,
+    pub kind: MotionKind,
+    /// How far it zooms, as a fraction: 0.06 subtle, 0.1, 0.15 strong; 0.02 to 0.5.
+    pub strength: f64,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    Get,
+    Wait,
+    Cancel,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Job {
+    pub job_id: String,
+    pub action: JobAction,
+    pub timeout_s: Option<u64>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Captions {
+    pub run_id: String,
+    /// A full caption style, including optional keywords {color, pick}; leave it out to use style_preset, the
+    /// creator's learned look or Reel.
+    pub style: Option<TextStyle>,
+    /// A built-in style package: reel, outline, yellow, box, clean, karaoke, green_box, hormozi,
+    /// hormozi_green, spotlight, impact, headline, punchline, neon, neon_blue, yellow_box,
+    /// white_box, minimal or typewriter; or a saved style from My styles by name.
+    /// A package brings its font when it has one, entry/exit animations for every caption
+    /// and its key word colour. Karaoke and green_box highlight the word being spoken.
+    pub style_preset: Option<String>,
+    pub max_words: Option<usize>,
+    pub max_chars: Option<usize>,
+    /// Where the captions go, only the fields to change, e.g. {"y": 0.3}: x and y offset the centre from the
+    /// canvas centre as a fraction of its width and height. Captions start at x 0, y 0.15, scale 1; rebuilt
+    /// captions start where the captions they replace were.
+    pub transform: Option<TransformPatch>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Export {
+    pub path: String,
+    /// "reels": 1080x1920, 30 fps, 9:16; "shorts": 1080x1920, project fps, 9:16;
+    /// "youtube_1080p": 1920x1080, project fps, 16:9; "youtube_4k": 3840x2160, project fps, 16:9;
+    /// "instagram_feed": 1080x1350, 30 fps, 4:5; "square": 1080x1080, 30 fps, 1:1.
+    /// Each needs the listed canvas ratio and levels sound to -14 LUFS with true peak <= -1 dBTP.
+    /// YouTube and Shorts keep project fps or the given fps, max 60; the others fix 30.
+    pub preset: Option<Delivery>,
+    /// Short side in pixels, e.g. 1080 for a 1080x1920 reel. Required without preset; with a
+    /// preset leave it out or give the preset's own value.
+    pub resolution: Option<u32>,
+    /// Required without preset. YouTube and Shorts keep project fps when omitted, or accept up to
+    /// 60; the other presets require 30 when given.
+    pub fps: Option<u32>,
+    /// Defaults to recommended.
+    pub quality: Option<Quality>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InspectImage {
+    pub asset_id: String,
+    /// Pixels on the long side, 96 to 1536; 768 by default.
+    pub size: Option<u32>,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InspectThumbnail {
+    pub format: ThumbnailFormat,
+    /// Pixels, 96 to the thumbnail's own width; half of it by default.
+    pub width: Option<u32>,
+    /// Shades what the apps cover: outside the Reels safe area and the 3:4 profile grid on a cover, the
+    /// duration badge on a YouTube thumbnail.
+    #[serde(default)]
+    pub safe_zones: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportThumbnail {
+    pub format: ThumbnailFormat,
+    /// A new .png, .jpg or .jpeg file; relative paths resolve beside the project.
+    pub path: String,
+}
+
+impl Captions {
+    /// The style asked for: a full style or a preset with its animations; when neither is given, the
+    /// creator's learned look on a canvas of this size, else Reel.
+    pub fn look(&self, from: &mut crate::style::Defaults, canvas: (u32, u32)) -> anyhow::Result<CaptionPreset> {
+        let plain = |style| CaptionPreset { name: String::new(), style, anim_in: None, anim_out: None };
+        match (&self.style, &self.style_preset) {
+            (Some(_), Some(_)) => anyhow::bail!("INVALID_ARGUMENTS: give style or style_preset, not both"),
+            (Some(style), None) => Ok(plain(style.clone())),
+            (None, Some(name)) => crate::caption_styles::find(name),
+            (None, None) => Ok(from.caption_style(canvas).map_or_else(reel, plain)),
+        }
+    }
+
+    /// The limits given, else the creator's, else Reel's.
+    pub fn grouping(&self, from: &mut crate::style::Defaults) -> nuzky_analysis::CaptionGrouping {
+        let defaults = nuzky_analysis::CaptionGrouping::default();
+        nuzky_analysis::CaptionGrouping {
+            max_words: self.max_words.or_else(|| from.max_words()).unwrap_or(defaults.max_words),
+            max_chars: self.max_chars.or_else(|| from.max_chars()).unwrap_or(defaults.max_chars),
+            ..defaults
+        }
+    }
+}
+
+pub fn reel() -> CaptionPreset {
+    nuzky_engine::edit::caption_presets()[0].clone()
+}
+
+#[cfg(test)]
+pub fn reel_style() -> nuzky_engine::model::TextStyle {
+    reel().style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captions_omit_style_and_grouping_for_reel_defaults() {
+        let args: Captions = serde_json::from_value(serde_json::json!({
+            "run_id": "run"
+        }))
+        .unwrap();
+        let defaults = nuzky_analysis::CaptionGrouping::default();
+        let mut none = crate::style::Defaults::default();
+        assert_eq!(args.grouping(&mut none).max_words, defaults.max_words);
+        assert_eq!(args.grouping(&mut none).max_chars, defaults.max_chars);
+        let style = args.look(&mut none, (1080, 1920)).unwrap().style;
+        assert_eq!(
+            serde_json::to_value(style).unwrap(),
+            serde_json::json!({
+                "fontFamily": null, "fontSize": 95.0, "color": "#ffffff", "bold": false,
+                "strokeWidth": 7.5, "strokeColor": "#000000", "background": null
+            })
+        );
+    }
+
+    #[test]
+    fn captions_pick_a_preset_by_name() {
+        let captions = |value: serde_json::Value| {
+            let mut args = serde_json::json!({"run_id": "run"});
+            args.as_object_mut().unwrap().extend(value.as_object().unwrap().clone());
+            serde_json::from_value::<Captions>(args)
+                .unwrap()
+                .look(&mut crate::style::Defaults::default(), (1080, 1920))
+                .map(|look| look.style)
+        };
+        let karaoke = captions(serde_json::json!({"style_preset": "karaoke"})).unwrap();
+        assert_eq!(karaoke.highlight.as_deref(), Some("#ffe14d"));
+        assert_eq!(karaoke.font_size, reel_style().font_size);
+        let boxed = captions(serde_json::json!({"style_preset": "Green_Box"})).unwrap();
+        assert_eq!((boxed.highlight.as_deref(), boxed.background.is_some()), (Some("#4ade80"), true));
+        let unknown = captions(serde_json::json!({"style_preset": "unknown_caption_package"})).unwrap_err().to_string();
+        assert!(unknown.starts_with("INVALID_ARGUMENTS") && unknown.contains("karaoke, green_box"), "{unknown}");
+        let both = captions(
+            serde_json::json!({"style_preset": "karaoke", "style": serde_json::to_value(reel_style()).unwrap()}),
+        );
+        assert!(both.unwrap_err().to_string().starts_with("INVALID_ARGUMENTS"));
+    }
+}

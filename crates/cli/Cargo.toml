@@ -1,0 +1,31 @@
+[package]
+name = "nuzky-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nuzky"
+path = "src/main.rs"
+
+[dependencies]
+nuzky-analysis.workspace = true
+nuzky-engine.workspace = true
+nuzky-mcp.workspace = true
+nuzky-session.workspace = true
+nuzky-vision.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+png = "0.18"
+dirs = "6"
+dunce = "1.0.5"
+
+# Speech recognition on the GPU through Vulkan.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+nuzky-analysis = { workspace = true, features = ["gpu"] }
+
+[dev-dependencies]
+base64 = "0.23.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+uds_windows = "1.2.1"

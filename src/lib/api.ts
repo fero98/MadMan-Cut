@@ -1,0 +1,375 @@
+import { invoke, type Channel } from "@tauri-apps/api/core";
+import { viralCall } from "./viral";
+import type { GalleryPlugin, GalleryState } from "./gallery";
+import type { EffectIssue, ListedPlugin, PluginRow, PluginValues } from "./plugins";
+import type { AgentAccess, AgentConnection, AgentKind, AgentSetup, AgentStatus, Animation, BeatCutDone, BeatPlans, Boot, CapCutDraft, CaptionPreset, ChatGptStatus, Collection, CoverView, DeletedCollection, SpeechModel, SpeechSetup, EditCmd, ExportRequest, Filmstrip, FontFamilies, HistoryPeek, LayerBounds, Library, Part, PreviewStarted, Project, ProjectPoster, ProjectSummary, ProjectVersion, RecapInfo, ReelCandidate, ReelFraming, Rhythm, Said, SampleRun, Snapshot, Sound, SoundKind, SoundPage, SoundSettings, StickerCatalog, StyleAction, StylePair, StyleView, TextStyle, Thumbnail, ThumbnailFormat, TimelinePlan, TranscriptCut, TranscriptView, VideoPreview, VisionModels, WordsCorrected, YoutubeVideo, ZoomSuggestions, ZoomsApplied } from "./types";
+
+/**
+ * The session a change was made for. Mutating commands carry it, so a change still in flight when
+ * another project opens is refused instead of landing in the wrong project.
+ */
+type Epoch = string | undefined;
+
+export type FeedbackKind = "idea" | "message";
+
+export const api = {
+  viralLab: viralCall,
+  setUiContext: (selection: string[], playheadUs: number) => invoke<void>("set_ui_context", { selection, playheadUs: Math.round(playheadUs) }),
+  resolveRecovery: (action: "keep" | "restore", epoch: Epoch) => invoke<Snapshot>("resolve_recovery", { action, expectedEpoch: epoch }),
+  /** Ends the agent's run, keeping its changes as one undo step; `discard` takes them back instead. */
+  stopRun: (epoch: Epoch, discard = false) => invoke<Snapshot>("stop_run", { expectedEpoch: epoch, discard }),
+  boot: () => invoke<Boot>("boot"),
+  applyEdit: (cmd: EditCmd, coalesce: string | null, epoch: Epoch) => invoke<Snapshot>("apply_edit", { cmd, coalesce, expectedEpoch: epoch }),
+  /** All or nothing, as one undo step. */
+  applyEdits: (cmds: EditCmd[], coalesce: string | null, epoch: Epoch) => invoke<Snapshot>("apply_edits", { cmds, coalesce, expectedEpoch: epoch }),
+  undo: (epoch: Epoch) => invoke<Snapshot>("undo", { expectedEpoch: epoch }),
+  /** The project undo (or redo) would restore and the step's name, without changing anything. */
+  peekHistory: (epoch: Epoch, redo: boolean) => invoke<HistoryPeek | null>("peek_history", { expectedEpoch: epoch, redo }),
+  redo: (epoch: Epoch) => invoke<Snapshot>("redo", { expectedEpoch: epoch }),
+  /** The newest kept versions of the open project, newest first. */
+  listVersions: (limit: number) => invoke<ProjectVersion[]>("list_versions", { limit }),
+  /** Restores a kept version as one undo step. */
+  restoreVersion: (index: number, epoch: Epoch) => invoke<Snapshot>("restore_version", { index, expectedEpoch: epoch }),
+  /** Paths of files whose clips with a background still wait for the person to be found. */
+  mattesMissing: () => invoke<string[]>("mattes_missing"),
+  importMedia: (paths: string[], epoch: Epoch) =>
+    invoke<{ snapshot: Snapshot; added: string[]; failed: { path: string; error: string }[] }>("import_media", { paths, expectedEpoch: epoch }),
+  thumbnail: (assetId: string) => invoke<string | null>("thumbnail", { assetId }),
+  /** Waveform peaks `from..to`; while the sound is still being prepared, only the part decoded so far and `complete: false`. */
+  waveform: (assetId: string, from: number, to: number) => invoke<{ peaks: number[]; complete: boolean } | null>("waveform", { assetId, from, to }),
+  /** The gain Match loudness gives the clip in dB, or null until its file's loudness is measured. */
+  matchGain: (clipId: string) => invoke<number | null>("match_gain", { clipId }),
+  play: () => invoke<void>("play"),
+  pause: () => invoke<void>("pause"),
+  seek: (tUs: number) => invoke<void>("seek", { tUs: Math.round(tUs) }),
+  setPreviewBox: (width: number, height: number) => invoke<void>("set_preview_box", { width, height }),
+  setPreviewMuted: (muted: boolean) => invoke<void>("set_preview_muted", { muted }),
+  listProjects: () => invoke<ProjectSummary[]>("list_projects"),
+  agentConnections: () => invoke<AgentConnection[]>("agent_connections"),
+  connectAgent: (agent: AgentKind) => invoke<AgentConnection>("connect_agent", { agent }),
+  /** Whether the agent is installed, signed in and has MadMan Cut in its settings. */
+  agentStatus: (agent: AgentKind) => invoke<AgentStatus>("agent_status", { agent }),
+  /** Rejects with why the agent's own settings do not reach this MadMan Cut, and what to do. */
+  verifyAgent: (agent: AgentKind) => invoke<void>("verify_agent", { agent }),
+  /** The `nuzky` server and a first message to paste into an agent MadMan Cut does not connect itself. */
+  agentSetup: (setup: AgentSetup) => invoke<string>("agent_setup", { setup }),
+  agentAccess: () => invoke<AgentAccess>("agent_access"),
+  setAgentAccess: (on: boolean, atLaunch: boolean) => invoke<AgentAccess>("set_agent_access", { on, atLaunch }),
+  /** `renew`: renews the sign-in first when it is about to expire. */
+  chatgptStatus: (renew: boolean) => invoke<ChatGptStatus>("chatgpt_status", { renew }),
+  /** Opens the browser and answers once it came back, was cancelled or waited 5 minutes. */
+  chatgptSignIn: (anotherAccount: boolean) => invoke<ChatGptStatus>("chatgpt_sign_in", { anotherAccount }),
+  chatgptCancelSignIn: () => invoke<void>("chatgpt_cancel_sign_in"),
+  chatgptSignOut: () => invoke<ChatGptStatus>("chatgpt_sign_out"),
+  newProject: (width: number, height: number) => invoke<Snapshot>("new_project", { width, height }),
+  maximizeWindow: () => invoke<void>("maximize_window"),
+  /** While the editor is shown, closing the window goes back to the projects (`close-to-home`). */
+  setEditorShown: (shown: boolean) => invoke<void>("set_editor_shown", { shown }),
+  openProject: (path: string) => invoke<Snapshot>("open_project", { path }),
+  /** A new project with the media on its timeline, in the format of the first picture. */
+  newProjectFromMedia: (paths: string[]) =>
+    invoke<{ snapshot: Snapshot; added: string[]; failed: { path: string; error: string }[] }>("new_project_from_media", { paths }),
+  /** A new, uncut project of the tour's sample video, opened at once. */
+  openSample: () => invoke<{ snapshot: Snapshot; added: string[]; failed: { path: string; error: string }[] }>("open_sample"),
+  /** The tour's AI edit of the open sample, as one run; CANCELLED when Stop ended it. */
+  sampleRun: (epoch: Epoch) => invoke<SampleRun>("sample_run", { expectedEpoch: epoch }),
+  /** The CapCut draft in that folder as a new project, opened at once; the draft stays as it was. */
+  openCapCutDraft: (path: string) => invoke<Snapshot>("open_capcut_draft", { path }),
+  /** A PNG data URL of the picture CapCut keeps of a draft, or null. */
+  capCutDraftCover: (path: string) => invoke<string | null>("capcut_draft_cover", { path }),
+  library: () => invoke<Library>("library"),
+  /** The project's picture, or null when it has none. */
+  projectPoster: (path: string) => invoke<ProjectPoster | null>("project_poster", { path }),
+  searchSaid: (query: string, collection: string | null = null) => invoke<Said>("search_said", { query, collection }),
+  /** For a project that is not open; the open one is renamed with an edit. */
+  renameProject: (path: string, name: string) => invoke<void>("rename_project", { path, name }),
+  /** Returns the copy's path. */
+  duplicateProject: (path: string) => invoke<string>("duplicate_project", { path }),
+  trashProjects: (paths: string[]) => invoke<void>("trash_projects", { paths }),
+  restoreProjects: (paths: string[]) => invoke<void>("restore_projects", { paths }),
+  createCollection: (name: string) => invoke<Collection>("create_collection", { name }),
+  renameCollection: (id: string, name: string) => invoke<void>("rename_collection", { id, name }),
+  deleteCollection: (id: string) => invoke<DeletedCollection>("delete_collection", { id }),
+  restoreCollection: (deleted: DeletedCollection) => invoke<void>("restore_collection", { deleted }),
+  /** null takes the projects out of their collection. */
+  setCollection: (paths: string[], collection: string | null) => invoke<void>("set_collection", { paths, collection }),
+  /** The sound effects built into MadMan Cut. */
+  soundLibrary: () => invoke<Sound[]>("sound_library"),
+  /** One page of online results; only the query leaves the computer. */
+  soundSearch: (query: string, kind: SoundKind, page: number) => invoke<SoundPage>("sound_search", { query, kind, page }),
+  /** The video of a YouTube or YouTube Music link as a sound, looked up through the user's yt-dlp. */
+  soundLink: (url: string) => invoke<Sound>("sound_link", { url }),
+  /** Songs from YouTube links that any project added, newest first; they play and add without the network. */
+  soundDownloaded: () => invoke<Sound[]>("sound_downloaded"),
+  /** Downloads yt-dlp from its GitHub releases; progress comes as `sound-progress` for "yt-dlp", `soundCancel("yt-dlp")` stops it. */
+  installYtdlp: () => invoke<void>("install_ytdlp"),
+  ytdlpDownloaded: () => invoke<boolean>("ytdlp_downloaded"),
+  /** The user read that the rights to music from YouTube links are theirs; asked only once. */
+  confirmYoutubeRights: () => invoke<SoundSettings>("confirm_youtube_rights"),
+  /** Plays a sound, downloading it first when needed; `sound-preview-ended` names it when it is over. */
+  soundPreview: (id: string) => invoke<PreviewStarted>("sound_preview", { id }),
+  soundStop: () => invoke<void>("sound_stop"),
+  /** Stops downloading a sound being added. */
+  soundCancel: (id: string) => invoke<void>("sound_cancel", { id }),
+  /** Adds the sound at `startUs` on an audio track, as one undo step. */
+  soundAdd: (id: string, startUs: number, epoch: Epoch) => invoke<Snapshot>("sound_add", { id, startUs: Math.round(startUs), expectedEpoch: epoch }),
+  /** MadMan Cut's own stickers and the emoji, in the order the Text tab shows them. */
+  stickerCatalog: () => invoke<StickerCatalog>("sticker_catalog"),
+  /** Keys of the emoji and stickers that match, best first. */
+  stickerSearch: (query: string) => invoke<string[]>("sticker_search", { query }),
+  /** PNG data URLs of `keys` drawn `px` wide, in the same order; "" for an unknown key. */
+  stickerThumbs: (keys: string[], px: number) => invoke<string[]>("sticker_thumbs", { keys, px }),
+  stickerAdd: (key: string, startUs: number, epoch: Epoch) => invoke<Snapshot>("sticker_add", { key, startUs: Math.round(startUs), expectedEpoch: epoch }),
+  /** The credits the video's description needs; null when no CC BY sound is heard in it. */
+  soundCredits: (epoch: Epoch) => invoke<string | null>("sound_credits", { expectedEpoch: epoch }),
+  soundSettings: () => invoke<SoundSettings>("sound_settings"),
+  /** The video a YouTube link points at. */
+  youtubeVideoLink: (url: string) => invoke<YoutubeVideo>("youtube_video_link", { url }),
+  /** Downloads the whole video, with `youtube-video-progress`, and starts its own preview. */
+  youtubeVideoFetch: (id: string) => invoke<VideoPreview>("youtube_video_fetch", { id }),
+  youtubeVideoCancel: () => invoke<void>("youtube_video_cancel"),
+  /** Adds the video, or its part with up to 3 s hidden around it, to the media as one undo step. */
+  youtubeVideoAdd: (video: YoutubeVideo, part: Part | null, addId: string, epoch: Epoch) =>
+    invoke<Snapshot>("youtube_video_add", { video, part, addId, expectedEpoch: epoch }),
+  youtubeVideoStopAdd: (addId: string) => invoke<void>("youtube_video_stop_add", { addId }),
+  youtubePreviewClose: () => invoke<void>("youtube_preview_close"),
+  youtubePreviewPlay: () => invoke<void>("youtube_preview_play"),
+  /** Why the dialog's preview cannot draw; later changes come as `youtube-preview-error`. */
+  youtubePreviewError: () => invoke<string | null>("youtube_preview_error"),
+  youtubePreviewPause: () => invoke<void>("youtube_preview_pause"),
+  youtubePreviewSeek: (tUs: number) => invoke<void>("youtube_preview_seek", { tUs: Math.round(tUs) }),
+  youtubePreviewResize: (width: number, height: number) => invoke<void>("youtube_preview_resize", { width, height }),
+  youtubeFilmstrip: (fromUs: number, intervalUs: number, count: number) =>
+    invoke<Filmstrip>("youtube_filmstrip", { fromUs: Math.round(fromUs), intervalUs: Math.max(1, Math.round(intervalUs)), count }),
+  /** `key`: a new Freesound key, "" to remove it, undefined to keep it. */
+  setSoundSettings: (freesound: boolean, key?: string) => invoke<SoundSettings>("set_sound_settings", { freesound, key: key ?? null }),
+  openSoundPage: (url: string) => invoke<void>("open_sound_page", { url }),
+  /** Without `replaceExisting` an existing file is kept and the export fails with DESTINATION_EXISTS. */
+  /** CC BY sounds and footage bring `<name>.credits.txt`; without `replaceCredits` an existing one fails with CREDITS_EXIST. */
+  startExport: (path: string, options: ExportRequest, epoch: Epoch, replaceExisting: boolean, replaceCredits = false) =>
+    invoke<string>("start_export", { path, options, expectedEpoch: epoch, replaceExisting, replaceCredits }),
+  filmstrip: (assetId: string) => invoke<Filmstrip | null>("filmstrip", { assetId }),
+  layerBounds: (tUs: number) => invoke<LayerBounds[]>("layer_bounds", { tUs: Math.round(tUs) }),
+  /** What a recap of an AI run, or with null of everything cut since the import, would count and how long it is. */
+  recapInfo: (runId: string | null, epoch: Epoch) => invoke<RecapInfo>("recap_info", { runId, expectedEpoch: epoch }),
+  startRecap: (out: string, runId: string | null, endCard: boolean, epoch: Epoch, replaceExisting: boolean) =>
+    invoke<string>("start_recap", { out, runId, endCard, replaceExisting, expectedEpoch: epoch }),
+  cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
+  speechModels: () => invoke<SpeechModel[]>("speech_models"),
+  /** What Get set up needs to know to offer the models for `language`: the GPU, the word timing model, what is missing and the free space. */
+  speechSetup: (language: string) => invoke<SpeechSetup>("speech_setup", { language }),
+  /** Downloads everything the first transcript of `language` with `model` needs, as the `speech-model:setup` job; refused with NO_SPACE when it does not fit. */
+  startSpeechSetup: (model: string, language: string) => invoke<string>("start_speech_setup", { model, language }),
+  /** Download starts the speech model download an agent waits for; false tells the agent the user said not now. */
+  answerModelQuestion: (id: string, download: boolean) => invoke<void>("answer_model_question", { id, download }),
+  /** Whether the face and person models covers need, or with "background" the person model of clip backgrounds,
+   * can run here, are installed and what is left to download. */
+  visionModels: (set?: "background") => invoke<VisionModels>("vision_models", { set }),
+  /** Downloads the missing cover models (or the "background" set) as a `vision-models` job; `repair` downloads damaged ones again too. */
+  startVisionModels: (repair = false, set?: "background") => invoke<string>("start_vision_models", { repair, set }),
+  /** The cover of `format` `width` pixels wide, drawn as the export draws it, or `draft` in its place; `refreshMask` looks for a mask a job just made. */
+  coverView: async (format: ThumbnailFormat, width: number, refreshMask: boolean, draft: Thumbnail | null) => {
+    const buffer = await invoke<ArrayBuffer>("cover_view", { format, width: Math.round(width), refreshMask, draft });
+    const length = new DataView(buffer).getUint32(0, true);
+    const view = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, length))) as CoverView;
+    return { view, rgba: new Uint8ClampedArray(buffer, 4 + length, view.width * view.height * 4) };
+  },
+  /** Frees the cover renderer once the cover editor closes. */
+  coverClose: () => invoke<void>("cover_close"),
+  /** Pick for me: downloads the models on first use, picks frames for `format` and masks the person in the best, as a `cover` job. */
+  startCoverPick: (format: ThumbnailFormat, epoch: Epoch) => invoke<string>("start_cover_pick", { format, expectedEpoch: epoch }),
+  startReframe: (width: number, height: number, clipIds: string[] | null, epoch: Epoch) =>
+    invoke<string>("start_reframe", { width, height, clipIds, expectedEpoch: epoch }),
+  /** Masks the person in the frame at `timeUs`, downloading the mask model on first use. */
+  startCoverMask: (timeUs: number, image: string | null, epoch: Epoch) =>
+    invoke<string>("start_cover_mask", { timeUs: Math.round(timeUs), image, expectedEpoch: epoch }),
+  /** Without `replaceExisting` an existing file is kept and the export fails with DESTINATION_EXISTS. */
+  startCoverExport: (format: ThumbnailFormat, path: string, replaceExisting: boolean, epoch: Epoch) =>
+    invoke<string>("start_cover_export", { format, path, replaceExisting, expectedEpoch: epoch }),
+  /** `maxWords`/`maxChars` null group by phrase, capped at 12 words and 42 characters. */
+  startCaptions: (model: string, language: string, look: { style: TextStyle; animIn: Animation | null; animOut: Animation | null }, maxWords: number | null, maxChars: number | null, epoch: Epoch) =>
+    invoke<string>("start_captions", { request: { model, language, ...look, maxWords, maxChars }, expectedEpoch: epoch }),
+  /** The user's own caption styles, kept beside the projects; each change returns the list. */
+  captionStyles: () => invoke<CaptionPreset[]>("caption_styles"),
+  saveCaptionStyle: (style: CaptionPreset) => invoke<CaptionPreset[]>("save_caption_style", { style }),
+  renameCaptionStyle: (from: string, to: string) => invoke<CaptionPreset[]>("rename_caption_style", { from, to }),
+  deleteCaptionStyle: (name: string) => invoke<CaptionPreset[]>("delete_caption_style", { name }),
+  /** Recognises the heard media without a transcript, or all of it with `refresh`. */
+  startTranscript: (model: string, language: string, refresh: boolean, epoch: Epoch) => invoke<string>("start_transcript", { model, language, refresh, expectedEpoch: epoch }),
+  transcriptView: (pauseUs: number) => invoke<TranscriptView>("transcript_view", { pauseUs: Math.round(pauseUs) }),
+  /** Inclusive word index ranges and the hesitations after these words, as one undo step. */
+  cutWords: (key: string, ranges: [number, number][], hesitations: number[], epoch: Epoch) =>
+    invoke<TranscriptCut>("cut_words", { key, delete: ranges, hesitations, expectedEpoch: epoch }),
+  /** The view's pauses at `pauseUs`, by index, or all of them, and the hesitations after these words. */
+  removePauses: (key: string, pauseUs: number, only: number[] | null, hesitations: number[], epoch: Epoch) =>
+    invoke<TranscriptCut>("remove_pauses", { key, pauseUs: Math.round(pauseUs), only, hesitations, expectedEpoch: epoch }),
+  /** What the retake analysis suggests deleting, every hesitation and every pause longer than `pauseUs`, as one undo step. */
+  removeRetakes: (key: string, pauseUs: number, epoch: Epoch) => invoke<TranscriptCut>("remove_retakes", { key, pauseUs: Math.round(pauseUs), expectedEpoch: epoch }),
+  /** Words by view index, the text they should read and the text the view shows, with the captions that show them, as one undo step. */
+  correctWords: (key: string, corrections: { i: number; text: string; expected: string }[], epoch: Epoch) =>
+    invoke<WordsCorrected>("correct_words", { key, corrections, expectedEpoch: epoch }),
+  listFonts: () => invoke<FontFamilies>("list_fonts"),
+  /** Sentences of the timeline said with emphasis, for a punch-in. */
+  suggestZooms: () => invoke<ZoomSuggestions>("suggest_zooms"),
+  /** Punch-ins on inclusive word ranges of the view with `key`, as one undo step. */
+  applyZooms: (key: string, zooms: { from: number; to: number; scale: number }[], epoch: Epoch) =>
+    invoke<ZoomsApplied>("apply_zooms", { key, zooms, expectedEpoch: epoch }),
+  /** Finds the beat of the song under `clipId` as a `beats` job; null when it is known already. */
+  findBeats: (clipId: string, epoch: Epoch) => invoke<string | null>("find_beats", { clipId, expectedEpoch: epoch }),
+  /** What each rhythm would cut; null while the song's beat is not known. Nothing changes. */
+  beatPlans: (clipId: string, epoch: Epoch) => invoke<BeatPlans | null>("beat_plans", { clipId, expectedEpoch: epoch }),
+  /** The main track cut to the song's beat as one undo step, replacing this clip's last cut while that is the newest step. */
+  cutToBeat: (clipId: string, rhythm: Rhythm, keepVideoSound: boolean, epoch: Epoch) =>
+    invoke<BeatCutDone>("cut_to_beat", { clipId, rhythm, keepVideoSound, expectedEpoch: epoch }),
+  /** The reel candidate with the words `from` to `to`, measured as making it would cut it; nothing changes. */
+  reelBounds: (id: string, from: number, to: number) => invoke<ReelCandidate>("reel_bounds", { id, from, to }),
+  /** A project of its own beside this one for each reel candidate, as a `reels` job; marked made here as one undo step. */
+  startMakeReels: (ids: string[], canvas: ReelFraming, epoch: Epoch) => invoke<string>("start_make_reels", { ids, canvas, expectedEpoch: epoch }),
+  /** A newer released version and whether this copy can install it itself, or null when this one is the latest. */
+  checkForUpdate: () => invoke<{ version: string; canInstall: boolean } | null>("check_for_update"),
+  /** Downloads the newer version and checks its signature; the backend keeps it for `restartToUpdate`. `progress` gets the percentage downloaded. */
+  downloadUpdate: (progress: Channel<number>) => invoke<string>("download_update", { progress }),
+  /** Saves the project, installs the downloaded update and restarts MadMan Cut; `note` goes to the restarted UI. True when work started meanwhile, which postpones the restart. */
+  restartToUpdate: (note: string) => invoke<boolean>("restart_to_update", { note }),
+  /** Stops the download; `downloadUpdate` then fails with CANCELLED. */
+  cancelUpdate: () => invoke<void>("cancel_update"),
+  openReleasePage: () => invoke<void>("open_release_page"),
+  /** The idea form with this version filled in, or the author's X profile, in the browser. */
+  openFeedback: (kind: FeedbackKind) => invoke<void>("open_feedback", { kind }),
+  /** The bug report: version, system, graphics, the project's files, the last actions and the end of the log, without file names, folders, typed text or secrets. */
+  diagnostics: () => invoke<string>("diagnostics"),
+  /** Saves the report in the logs folder and opens the bug report form with `description` and a summary filled in; the saved file's name, and why the browser did not open. */
+  reportBug: (description: string) => invoke<{ name: string; openError: string | null }>("report_bug", { description }),
+  /** Shows the saved report in the file manager. */
+  showBugReport: () => invoke<void>("show_bug_report"),
+  openLogs: () => invoke<void>("open_logs"),
+  /** Writes an error of the interface into the log. */
+  logUiError: (message: string) => invoke<void>("log_ui_error", { message }),
+  styleView: () => invoke<StyleView>("style_view"),
+  styleAct: (action: StyleAction) => invoke<StyleView>("style_act", { action }),
+  /** Learns from 1 to 3 recordings, each with the video cut from it, as a `style` job. */
+  startStyleLearning: (pairs: StylePair[]) => invoke<string>("start_style_learning", { pairs }),
+  /** What each timeline file from another editor offers to learn from, read at once. */
+  styleReadTimelines: (paths: string[]) => invoke<TimelinePlan[]>("style_read_timelines", { paths }),
+  /** CapCut's drafts, newest first: where CapCut keeps them on this computer, or in `folder`, which may be one draft. */
+  styleCapCutDrafts: (folder: string | null) => invoke<CapCutDraft[]>("style_capcut_drafts", { folder }),
+  /** Learns from timelines cut in another editor as a `style` job, which ends with EDIT.md as it would be. */
+  startTimelineLearning: (paths: string[]) => invoke<string>("start_timeline_learning", { paths }),
+  /** Makes what that job learned the style, as it showed it; STYLE_CHANGED when the style changed since. */
+  styleUseLearned: (jobId: string) => invoke<StyleView>("style_use_learned", { jobId }),
+  listPlugins: () => invoke<ListedPlugin[]>("list_plugins"),
+  /** The plugin effects of the open project this computer draws without, and why. */
+  effectIssues: () => invoke<EffectIssue[]>("effect_issues"),
+  /** The project as the plugin's primary action's own edits would leave it, without changing it, or why it cannot; with the rows of its dynamic inputs and the tools it would run after its edits either way. */
+  previewPlugin: (id: string, values: PluginValues, selection: string[], playheadUs: number) =>
+    invoke<{ project: Project | null; error: string | null; items: Record<string, PluginRow[]>; tools: string[] }>("preview_plugin", { id, values, selection, playheadUs: Math.round(playheadUs) }),
+  cancelPluginPreview: () => invoke<void>("cancel_plugin_preview"),
+  /** One undo step; `snapshot` is null when the plugin changed nothing. `action` is the button pressed, the primary one when null. */
+  runPlugin: (id: string, values: PluginValues, selection: string[], playheadUs: number, epoch: Epoch, action: string | null = null) =>
+    invoke<{ snapshot: Snapshot | null; message: string | null }>("run_plugin", { id, values, action, selection, playheadUs: Math.round(playheadUs), expectedEpoch: epoch }),
+  /** Moves the plugin's folder to the Trash. */
+  removePlugin: (id: string) => invoke<void>("remove_plugin", { id }),
+  /** Shows the plugin's folder, or the plugins folder, in the file manager. */
+  showPluginFolder: (id: string | null) => invoke<void>("show_plugin_folder", { id }),
+  /** The plugin gallery's plugins and what installing each would do here; `refresh` reads its list from GitHub again. */
+  galleryPlugins: (refresh: boolean) => invoke<GalleryPlugin[]>("gallery_plugins", { refresh }),
+  /** Installs it without running it; `replacing` is the state the user agreed to replace, whose folder goes to the Trash. */
+  installGalleryPlugin: (id: string, key: string, replacing: GalleryState | null, progress: Channel<number>) =>
+    invoke<GalleryPlugin[]>("install_gallery_plugin", { id, key, replacing, progress }),
+  cancelGalleryInstall: () => invoke<void>("cancel_gallery_install"),
+};
+
+/** The error as the backend sent it, "CODE: detail" included; code checks use this. */
+export function errorText(e: unknown): string {
+  return typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
+}
+
+const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** What the backend's error codes mean for someone editing, with what to do next. */
+const PLAIN: Record<string, string | ((detail: string) => string)> = {
+  READ_ONLY: "This project cannot be changed in this window. Open it again from Projects.",
+  RECOVERY_PENDING: "Choose what happens to the unfinished AI edit first.",
+  RUN_ACTIVE: "AI is editing. Stop it to edit yourself.",
+  RUN_BUSY: "An AI edit is still open. Stop it first.",
+  EPOCH_CHANGED: "Another project was opened meanwhile, so this did not happen.",
+  EDIT_REJECTED: (detail) => {
+    const what = detail.replace(/; project unchanged$/, "").replace(/\.$/, "");
+    // A clip, track or media item that went away meanwhile, e.g. through Undo or an AI edit.
+    const gone = /^unknown (clip|track|asset|media)\b/i.exec(what);
+    if (gone) return `That ${gone[1] === "asset" ? "media item" : gone[1].toLowerCase()} was removed meanwhile, so nothing changed.`;
+    return `${sentence(what)}. The project is unchanged.`;
+  },
+  INVALID_PROJECT: (detail) => `That change would break the project (${detail}), so it was not made.`,
+  SPEECH_CHANGED: "The speech on the timeline changed meanwhile. Select the words again and retry.",
+  TRANSCRIPT_MISSING: "Transcribe the timeline first, then try again.",
+  AUDIO_NOT_READY: "The sound of the clips is still being prepared. Try again in a moment.",
+  NO_WORDS: "Transcribe the timeline first, then try again.",
+  OUTPUT_EXISTS: "A file with that name appeared while exporting. Export again to replace it or choose another name.",
+  DESTINATION_EXISTS: "A file with that name already exists.",
+  NOT_WRITABLE: "MadMan Cut isn't allowed to save in that folder. Export to another folder.",
+  UNKNOWN_VERSION: "That version is no longer kept. Open the list of versions again.",
+  RUN_UNAVAILABLE: "The project as it was before or after this AI run is no longer kept, so its recap can't be made.",
+  HISTORY_CORRUPT: "That version could not be read, so the project is unchanged.",
+  CANCELLED: "Cancelled.",
+  AGENT_BUSY: (detail) => detail,
+  NOT_INSTALLED: (detail) => sentence(detail.replace(/\.$/, "")) + ". Install it and sign in from a terminal.",
+  APP_CLOSED: "MadMan Cut is closing, so this stopped.",
+  JOB_FAILED: "The task stopped unexpectedly. Try again.",
+  CRASHED: "MadMan Cut hit a bug and stopped. Try again, and if it happens again, report it with Send feedback, the speech bubble next to Projects.",
+  DOWNLOAD_FAILED: (detail) => `The ${detail.split(":")[0]} could not be downloaded. Check the internet connection and free disk space, then try again.`,
+  MODEL_INVALID: "The model did not download completely. Try again to download it anew.",
+  NO_SPACE: (detail) => `There isn't enough free space for the download. Free up ${detail} more on this computer, then try again.`,
+  MEDIA_MISSING: (detail) => `${detail.split(/[\\/]/).pop()} is missing. Put the file back where it was, then try again.`,
+  VISION_UNAVAILABLE:
+    "Faces and people can't be found on this computer. Covers still let you choose the frame and add text, and a clip's background stays None.",
+  MODEL_MISSING: (detail) =>
+    detail.startsWith("person outline (selfie-segmenter.onnx) not installed")
+      ? "The background needs the person model. Download it in the clip's Background section."
+      : "The face and person models are not installed. Pick for me downloads them.",
+  THUMBNAIL_MISSING: "This project has no cover in that format yet.",
+  INVALID_RANGE: "The cover's frame is past the end of the video now. Choose its frame again.",
+  STORE_UNREADABLE: "The saved transcripts could not be read. Transcribe the timeline again.",
+  NO_MATCH: (detail) => `${sentence(detail.replace(/, so it was not cut from it$/, ""))}. Skipped.`,
+  STYLE_CHANGED: "Your style changed in another window meanwhile. Copy your text, open the style again and redo your change.",
+  NOT_SUGGESTED: "That suggestion is gone; the style was learned again meanwhile.",
+  NOTHING_TO_REVERT: "That rule has not changed, so there is nothing to put back.",
+  UNKNOWN_RULE: "That rule is no longer in your style.",
+  TOO_LONG: (detail) => sentence(detail) + ".",
+  // The sound library's errors already say what happened; a technical reason in brackets is dropped.
+  OFFLINE: (detail) => detail.replace(/ \(.*\)$/, ""),
+  RATE_LIMITED: (detail) => detail,
+  SOURCE_REFUSED: (detail) => detail,
+  SOURCE_FAILED: (detail) => detail.replace(/ \(.*\)$/, ""),
+  SOUND_UNAVAILABLE: (detail) => detail.replace(/ \(.*\)$/, ""),
+  UNLICENSED: (detail) => sentence(detail) + ".",
+  KEY_REJECTED: (detail) => `${detail} Check it under Where to search, the sliders button beside the search field.`,
+  KEY_MISSING: "Add your Freesound API key under Where to search, the sliders button beside the search field.",
+  INVALID_KEY: "A Freesound API key has only letters and digits. Copy it again from Freesound.",
+  INVALID_LINK: "That isn't a link to a YouTube or YouTube Music video. Copy the link from the video's Share button.",
+  PLAYLIST: "That's a link to a playlist. Open one song and copy its link instead.",
+  YTDLP_MISSING: "Music from YouTube needs yt-dlp. Download it under the link field in the Music tab.",
+  YTDLP_UNSUPPORTED: (detail) => detail,
+  YTDLP_CORRUPT: (detail) => detail,
+  YTDLP_DOWNLOAD_FAILED: (detail) => detail.replace(/ \(.*\)$/, ""),
+  YTDLP_FAILED: "yt-dlp is installed but didn't start. Reinstall it, then try again.",
+  YTDLP_OUTDATED: "The yt-dlp on this computer is out of date. Download MadMan Cut's own under the link field in the Music tab.",
+  NOT_LEARNED: "What was learned is gone. Learn from the projects again.",
+  SIGN_IN_DENIED: "Signing in was cancelled in the browser. Continue with ChatGPT to try again.",
+  SIGN_IN_TIMEOUT: "MadMan Cut stopped waiting for the browser after 5 minutes. Continue with ChatGPT to try again.",
+  SIGN_IN_FAILED: (detail) => sentence(detail.replace(/\.$/, "")) + ".",
+  WRONG_ACCOUNT: (detail) => `That's another ChatGPT account. ${detail}`,
+  KEYCHAIN_UNAVAILABLE:
+    "MadMan Cut keeps your ChatGPT sign-in in the system keychain and couldn't use it. Allow MadMan Cut when the system asks. On Linux, start GNOME Keyring or KWallet, then restart MadMan Cut.",
+};
+
+/**
+ * Text for people: a known "CODE: detail" becomes plain words with a next step, wherever it sits in
+ * the message ("Export failed: CODE: …"); anything else is shown as it came.
+ */
+export function plainError(text: string): string {
+  return text.replace(/\b([A-Z][A-Z_]{3,}): ?([\s\S]*)$/, (all, code: string, detail: string) => {
+    const plain = PLAIN[code];
+    return plain === undefined ? all : typeof plain === "string" ? plain : plain(detail);
+  });
+}

@@ -1,0 +1,1401 @@
+import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react";
+import { createPortal } from "react-dom";
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Minus, Search, X } from "lucide-react";
+import { followPointer } from "../lib/drag";
+import { chose } from "../lib/exit";
+import { fontCss } from "../lib/fonts";
+import { AI_EDITING, useAiLocked } from "../lib/store";
+import type { TextShadow, TextStyle } from "../lib/types";
+
+type Variant = "primary" | "secondary" | "ghost" | "danger" | "bar";
+
+const variants: Record<Variant, string> = {
+  primary: "btn-prominent font-semibold",
+  secondary: "bg-white/[.09] text-fg shadow-[inset_0_1px_0_rgb(255_255_255/.07),inset_0_0_0_1px_rgb(255_255_255/.07)] hover:bg-white/[.14]",
+  ghost: "text-muted hover:bg-white/[.08] hover:text-fg",
+  danger: "bg-danger/15 text-danger shadow-[inset_0_0_0_1px_rgb(255_69_58/.4)] hover:bg-danger/25",
+  /** A floating toolbar capsule, e.g. in the top bar. */
+  bar: "bar text-fg hover:bg-white/[.13]",
+};
+
+/** Drops hover styles, so a disabled control does not react to the pointer. */
+const idle = (classes: string) => classes.split(" ").filter((c) => !c.startsWith("hover:")).join(" ");
+
+/** Why the controls inside an `AiLock` are locked, or null. */
+/** Why the controls inside cannot change anything now, or null. */
+export const LockReason = createContext<string | null>(null);
+export const useLockReason = () => useContext(LockReason);
+
+/** For a plain button inside an `AiLock`: focusable, inert to clicks, the reason as its tooltip. */
+export const lockedProps = (reason: string | null) => (reason ? { "aria-disabled": true as const, title: reason, onClick: undefined } : {});
+
+/**
+ * A disabled button here stays focusable (`aria-disabled` rather than `disabled`), so the keyboard
+ * and screen readers reach it and its reason: the tooltip, the description, and the hint shown on
+ * keyboard focus (`DisabledHint`). A click on it does nothing.
+ */
+function disabledProps(disabled: boolean | undefined, onClick: ButtonHTMLAttributes<HTMLButtonElement>["onClick"], reasonId?: string) {
+  return disabled ? { "aria-disabled": true, onClick: undefined, "aria-describedby": reasonId } : { onClick };
+}
+
+export function Button({
+  variant = "secondary",
+  pill = false,
+  className = "",
+  children,
+  disabled,
+  disabledReason,
+  title,
+  onClick,
+  ...rest
+}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; disabledReason?: string; /** Capsule shape, for toolbars. */ pill?: boolean }) {
+  const reasonId = useId();
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  const reason = lock ?? (disabled ? (disabledReason ?? title) : undefined);
+  return (
+    <>
+      <button
+        type="button"
+        title={disabled ? reason : title}
+        {...disabledProps(disabled, onClick, reason ? reasonId : undefined)}
+        className={`btn ${pill ? "btn-pill" : ""} transition-colors duration-[120ms] ease-out disabled:cursor-not-allowed disabled:opacity-40 ${
+          disabled ? `cursor-not-allowed opacity-40 ${idle(variants[variant])}` : `active:brightness-90 ${variants[variant]}`
+        } ${className}`}
+        {...rest}
+      >
+        {children}
+      </button>
+      {reason && (
+        <span id={reasonId} hidden>
+          {reason}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * Icon-only button. `label` is required: it becomes the tooltip and the accessible name, and says
+ * why when the button is disabled ("Split: move the playhead over a clip").
+ * Passing `active`, true or false, makes it a toggle button.
+ */
+export function IconButton({
+  label,
+  active,
+  round = false,
+  className = "",
+  children,
+  disabled,
+  onClick,
+  ...rest
+}: ComponentProps<"button"> & { label: string; active?: boolean; /** Round, for icons grouped in a toolbar capsule. */ round?: boolean }) {
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={lock ?? label}
+      aria-pressed={active}
+      {...disabledProps(disabled, onClick)}
+      className={`icon-btn ${round ? "icon-btn-round" : ""} transition-colors duration-[120ms] ease-out disabled:cursor-not-allowed disabled:opacity-40 ${
+        disabled ? "cursor-not-allowed opacity-40" : "active:brightness-75"
+      } ${active ? "bg-accent/[.18] text-accent" : disabled ? "text-muted" : "text-fg/80 hover:bg-white/[.08] hover:text-fg"} ${className}`}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * While a disabled control has keyboard focus, its reason (the tooltip text) shows just below it,
+ * as hovering shows the tooltip. Mount once.
+ */
+export function DisabledHint() {
+  const [hint, setHint] = useState<{ text: string; x: number; y: number; above: boolean } | null>(null);
+  const keyboard = useRef(false);
+  const show = (el: HTMLElement | null) => {
+    const text = el?.getAttribute("aria-disabled") === "true" ? el.getAttribute("title") : null;
+    if (!el || !text || !keyboard.current) return setHint(null);
+    const r = el.getBoundingClientRect();
+    const above = r.bottom + 40 > window.innerHeight;
+    setHint({ text, x: Math.max(138, Math.min(window.innerWidth - 138, r.left + r.width / 2)), y: above ? r.top - 6 : r.bottom + 6, above });
+  };
+  // A run that starts or ends locks or unlocks the focused control, so its hint follows.
+  const locked = useAiLocked();
+  useEffect(() => {
+    if (document.activeElement instanceof HTMLElement) show(document.activeElement);
+  }, [locked]);
+  useEffect(() => {
+    const onKey = () => (keyboard.current = true);
+    const onPointer = () => (keyboard.current = false);
+    // A focused control that becomes enabled, or gets another reason, while it has focus updates its hint.
+    const changes = new MutationObserver((records) => show(records[0].target as HTMLElement));
+    const onFocus = (e: FocusEvent) => {
+      const el = e.target instanceof HTMLElement ? e.target : null;
+      changes.disconnect();
+      if (el) changes.observe(el, { attributes: true, attributeFilter: ["aria-disabled", "title"] });
+      show(el);
+    };
+    const hide = () => {
+      changes.disconnect();
+      setHint(null);
+    };
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerdown", onPointer, true);
+    window.addEventListener("focusin", onFocus);
+    window.addEventListener("focusout", hide);
+    window.addEventListener("scroll", hide, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerdown", onPointer, true);
+      window.removeEventListener("focusin", onFocus);
+      window.removeEventListener("focusout", hide);
+      window.removeEventListener("scroll", hide, true);
+      changes.disconnect();
+    };
+  }, []);
+  if (!hint) return null;
+  return (
+    <div
+      aria-hidden
+      className={`overlay pointer-events-none fixed z-[130] max-w-[260px] -translate-x-1/2 rounded-lg px-2.5 py-1.5 text-[12px] text-fg ${hint.above ? "-translate-y-full" : ""}`}
+      style={{ left: hint.x, top: hint.y }}
+    >
+      {hint.text}
+    </div>
+  );
+}
+
+/** "Split at playhead (S)": the text and, drawn as a key, the shortcut. */
+const SHORTCUT = /^(.+?)\s+\(((?:(?:Ctrl|Cmd|Shift|Alt|Option)\+)*(?:[A-Z0-9+=,./[\]-]|F\d{1,2}|Esc|Delete|Del|Space|Enter|Tab|Home|End|Backspace|[←→↑↓]))\)$/;
+/** The wait before the first tooltip, and how long after one closes the next shows at once. */
+const TIP_DELAY_MS = 600;
+const TIP_WARM_MS = 800;
+
+/**
+ * Every `title` in the app shows as a tooltip of its own material, the same on every system, with its shortcut drawn
+ * as a key. While the pointer is over an element, its title is held here and the element's own is empty, which also
+ * keeps a parent's title from showing, so the system's own tooltip never shows; React's changes to it land here
+ * meanwhile, and leaving puts the current one back. A title React adds under a resting pointer is taken over too. The
+ * first tooltip waits 600 ms; moving on to a neighbour within 800 ms of one closing shows the neighbour's at once, as on
+ * macOS. A press, a key, the wheel or scrolling closes it until the pointer leaves. It is a popover, so it lies in the
+ * top layer over a modal dialog too. Mount once.
+ */
+export function Tooltip() {
+  const [tip, setTip] = useState<{ text: string; key: string | null; x: number; y: number; above: boolean; instant: boolean } | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  // Centred under its control, but inside the window by its real width.
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el || !tip) return;
+    // A webview without popovers, where `:popover-open` would throw, shows it as a plain fixed box instead.
+    if ("showPopover" in el && !el.matches(":popover-open")) el.showPopover();
+    const half = el.offsetWidth / 2 + 8;
+    el.style.left = `${Math.max(half, Math.min(window.innerWidth - half, tip.x))}px`;
+  }, [tip]);
+  useEffect(() => {
+    let target: HTMLElement | null = null;
+    /** The title React gave the target, and whether it gave one at all. */
+    let title = "";
+    let present = false;
+    let at: Element | null = null;
+    let timer = 0;
+    let cooling = 0;
+    let shown = false;
+    let warm = false;
+    let quiet = false;
+    let gone = 0;
+    /** The attribute hovering put on the target for screen readers, while its title is held here. */
+    let named: string | null = null;
+    const set = Element.prototype.setAttribute;
+    const remove = Element.prototype.removeAttribute;
+    const show = (instant: boolean) => {
+      // A disabled control with keyboard focus already says why in DisabledHint.
+      if (!target?.isConnected || !title || quiet || (target.matches(":focus-visible") && target.getAttribute("aria-disabled") === "true")) return;
+      const r = target.getBoundingClientRect();
+      const m = SHORTCUT.exec(title);
+      // Over controls whose tooltip would cover what they act on, such as the timeline's tools over the ruler and playhead.
+      const above = !!target.closest("[data-tips-above]") || r.bottom + 40 > window.innerHeight;
+      setTip({ text: m ? m[1] : title, key: m ? m[2] : null, x: r.left + r.width / 2, y: above ? r.top - 6 : r.bottom + 6, above, instant });
+      shown = true;
+      window.clearTimeout(cooling);
+      // An element that goes away under the pointer, as a button an edit removes, takes its tooltip with it.
+      window.clearInterval(gone);
+      gone = window.setInterval(() => !target?.isConnected && release(), 250);
+    };
+    const hide = () => {
+      window.clearTimeout(timer);
+      window.clearInterval(gone);
+      setTip(null);
+      if (shown) {
+        warm = true;
+        window.clearTimeout(cooling);
+        cooling = window.setTimeout(() => (warm = false), TIP_WARM_MS);
+      }
+      shown = false;
+    };
+    // Screen readers keep what the title told them: its name when it had no other, else its description.
+    const describe = (el: HTMLElement) => {
+      if (named) remove.call(el, named);
+      named = null;
+      if (!title) return;
+      const name = el.hasAttribute("aria-label") || el.hasAttribute("aria-labelledby") || el.textContent?.trim() ? "aria-description" : "aria-label";
+      if (el.hasAttribute(name) || (name === "aria-description" && el.hasAttribute("aria-describedby"))) return;
+      set.call(el, name, title);
+      named = name;
+    };
+    const release = () => {
+      hide();
+      quiet = false;
+      if (!target) return;
+      const el = target;
+      target = null;
+      for (const name of ["setAttribute", "removeAttribute", "getAttribute"] as const) Reflect.deleteProperty(el, name);
+      if (named) remove.call(el, named);
+      named = null;
+      if (present) set.call(el, "title", title);
+      else remove.call(el, "title");
+    };
+    const hold = (el: HTMLElement) => {
+      target = el;
+      title = el.getAttribute("title") ?? "";
+      present = true;
+      set.call(el, "title", "");
+      describe(el);
+      // React sets and removes the title through these; while the pointer is here they change the held one.
+      const retitle = (value: string | null) => {
+        title = value ?? "";
+        present = value !== null;
+        describe(el);
+        if (shown) (title ? show(true) : hide());
+      };
+      el.setAttribute = (name: string, value: string) => (name === "title" ? retitle(String(value)) : set.call(el, name, value));
+      el.removeAttribute = (name: string) => (name === "title" ? retitle(null) : remove.call(el, name));
+      el.getAttribute = (name: string) => (name === "title" ? (present ? title : null) : Element.prototype.getAttribute.call(el, name));
+    };
+    const enter = (pointerAt: Element | null, pressed: boolean) => {
+      at = pointerAt;
+      const el = at?.closest<HTMLElement>("[title]") ?? null;
+      // Still on the same element, unless a part of it has a title of its own, as a media tile's Remove has.
+      if (target && at && target.contains(at) && (!el || el === target || !target.contains(el))) return;
+      release();
+      if (!el || pressed) return;
+      hold(el);
+      if (warm) show(true);
+      else timer = window.setTimeout(() => show(false), TIP_DELAY_MS);
+    };
+    const over = (e: PointerEvent) => e.pointerType !== "touch" && enter(e.target instanceof Element ? e.target : null, e.buttons !== 0);
+    const out = (e: PointerEvent) => {
+      if (e.relatedTarget) return;
+      at = null;
+      release();
+    };
+    const close = (e: Event) => {
+      // Scrolling elsewhere, such as the AI panel following a run or the timeline following playback, leaves it.
+      if (e.type === "scroll" && !(e.target instanceof Node && target && (e.target === document || e.target.contains(target)))) return;
+      hide();
+      quiet = !!target;
+    };
+    // A title given to what the pointer rests on, as when the AI starts editing under it, is taken over at once.
+    const titled = new MutationObserver((records) => {
+      if (at?.isConnected && records.some((r) => r.target !== target && r.target.contains(at))) enter(at, false);
+    });
+    titled.observe(document.body, { subtree: true, attributes: true, attributeFilter: ["title"] });
+    window.addEventListener("pointerover", over, true);
+    window.addEventListener("pointerout", out, true);
+    window.addEventListener("blur", release);
+    for (const type of ["pointerdown", "keydown", "wheel", "scroll"]) window.addEventListener(type, close, true);
+    return () => {
+      release();
+      titled.disconnect();
+      window.removeEventListener("pointerover", over, true);
+      window.removeEventListener("pointerout", out, true);
+      window.removeEventListener("blur", release);
+      for (const type of ["pointerdown", "keydown", "wheel", "scroll"]) window.removeEventListener(type, close, true);
+    };
+  }, []);
+  if (!tip) return null;
+  return createPortal(
+    <div
+      ref={box}
+      data-tooltip
+      aria-hidden
+      popover="manual"
+      className={`overlay pointer-events-none fixed inset-auto z-[150] m-0 flex max-w-[280px] -translate-x-1/2 items-center gap-2 overflow-visible rounded-lg border-0 px-2 py-[5px] text-[12px] leading-4 text-fg ${tip.above ? "-translate-y-full" : ""} ${tip.instant ? "" : "tip-in"}`}
+      style={{ left: tip.x, top: tip.y }}
+    >
+      <span className="min-w-0">{tip.text}</span>
+      {tip.key && <kbd className="tabular shrink-0 rounded-[4px] bg-white/[.08] px-[5px] font-sans text-[11px] leading-4 font-medium text-muted shadow-[inset_0_0_0_1px_rgb(255_255_255/.1)]">{tip.key}</kbd>}
+    </div>,
+    document.body,
+  );
+}
+
+/**
+ * Locks the editing controls inside while an agent's run is open. Buttons stay focusable and give
+ * the reason; fields are disabled with the reason as their tooltip.
+ */
+export function AiLock({ children }: { children: ReactNode }) {
+  const locked = useAiLocked();
+  return <LockReason.Provider value={locked ? AI_EDITING : null}>{children}</LockReason.Provider>;
+}
+
+export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[12px] text-muted">{label}</span>
+      {children}
+      {hint && <span className="text-[11px] text-muted">{hint}</span>}
+    </label>
+  );
+}
+
+/** Accepts "12,5", "50 %" and "-3" alike. */
+export const parseNumber = (s: string) => Number(s.replace(",", ".").replace(/[^\d.+-]/g, "") || "x");
+
+/**
+ * The 32 px search field of the library panels. Typing never reaches the editor's shortcuts; Esc clears
+ * it, and on an empty field goes on to the editor.
+ */
+export function SearchField({
+  value,
+  onChange,
+  placeholder,
+  onEnter,
+  onDown,
+}: {
+  value: string;
+  onChange: (text: string) => void;
+  placeholder: string;
+  onEnter?: () => void;
+  /** ↓ leaves the field, e.g. for the first result. */
+  onDown?: () => void;
+}) {
+  return (
+    <label className="relative flex h-8 min-w-0 flex-1 items-center">
+      <Search size={14} className="pointer-events-none absolute left-2.5 text-muted" />
+      <input
+        type="search"
+        value={value}
+        placeholder={placeholder}
+        aria-label={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && !value) return;
+          e.stopPropagation();
+          if (e.key === "Enter") onEnter?.();
+          else if (e.key === "Escape") onChange("");
+          else if (e.key === "ArrowDown" && onDown) {
+            e.preventDefault();
+            onDown();
+          }
+        }}
+        className={`h-8 w-full text-ellipsis rounded-lg border border-white/[.08] bg-white/[.055] pl-8 text-[13px] text-fg outline-none placeholder:text-muted focus:border-accent [&::-webkit-search-cancel-button]:hidden ${value ? "pr-7" : "pr-2"}`}
+      />
+      {value && (
+        <button type="button" aria-label="Clear search" onClick={() => onChange("")} className="absolute right-1.5 flex h-5 w-5 items-center justify-center rounded-full text-muted hover:text-fg">
+          <X size={13} />
+        </button>
+      )}
+    </label>
+  );
+}
+
+/**
+ * Numeric field that keeps what you type until Enter or blur, so partial input like "-"
+ * or "1." is never rejected mid-typing. Esc restores the value; ↑/↓ step (Shift ×10).
+ * `mixed` shows "—" for a selection with different values; any typed value then applies to all.
+ */
+export function NumberInput({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  format,
+  parse = parseNumber,
+  disabled,
+  mixed = false,
+  className = "w-14",
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  format: (v: number) => string;
+  parse?: (s: string) => number;
+  disabled?: boolean;
+  mixed?: boolean;
+  className?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const cancel = useRef(false);
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  const clamp = (v: number) => Math.max(min, Math.min(max, v));
+  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") e.currentTarget.blur();
+    else if (e.key === "Escape") {
+      e.stopPropagation();
+      cancel.current = true;
+      e.currentTarget.blur();
+    } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      e.preventDefault();
+      const base = draft !== null && Number.isFinite(parse(draft)) ? parse(draft) : value;
+      const next = clamp(base + (e.key === "ArrowUp" ? 1 : -1) * step * (e.shiftKey ? 10 : 1));
+      onChange(next);
+      setDraft(format(next));
+    }
+  };
+  return (
+    <input
+      aria-label={label}
+      inputMode="decimal"
+      disabled={disabled}
+      className={`tabular h-6 rounded-md border px-1.5 text-right text-[12px] outline-offset-0 focus:border-accent ${
+        lock ? "border-transparent bg-transparent text-fg/80" : "border-white/[.08] bg-white/[.055] text-fg disabled:opacity-40"
+      } ${className}`}
+      value={draft ?? (mixed ? "—" : format(value))}
+      onFocus={(e) => {
+        setDraft(mixed ? "" : format(value));
+        e.currentTarget.select();
+      }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        const v = draft === null || draft.trim() === "" ? NaN : parse(draft);
+        // Only a typed change is written: leaving a value outside the range untouched must not clamp it.
+        if (!cancel.current && Number.isFinite(v) && (mixed || format(v) !== format(value))) onChange(clamp(v));
+        cancel.current = false;
+        setDraft(null);
+      }}
+      onKeyDown={onKeyDown}
+    />
+  );
+}
+
+const THUMB = 22;
+
+/**
+ * Range input with a filled track. One-sided ranges fill from the left; two-sided ones
+ * (min < 0 < max, e.g. temperature or rotation) fill from 0 to the thumb and mark 0 with a tick.
+ */
+export function RangeInput({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  disabled,
+  valueText,
+  className = "",
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+  /** What the value means to a person, for sliders whose position is not the value, such as logarithmic ones. */
+  valueText?: string;
+  className?: string;
+}) {
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  const frac = (v: number) => (max > min ? Math.max(0, Math.min(1, (v - min) / (max - min))) : 0);
+  const twoSided = min < 0 && max > 0;
+  const origin = twoSided ? frac(0) : 0;
+  const at = (f: number) => `calc(${THUMB / 2}px + ${f} * (100% - ${THUMB}px))`;
+  const [lo, hi] = [Math.min(origin, frac(value)), Math.max(origin, frac(value))];
+  return (
+    <span className={`relative flex h-4 items-center ${className}`}>
+      {twoSided && <span aria-hidden className={`pointer-events-none absolute top-1 h-2 w-0.5 -translate-x-1/2 rounded-full ${disabled ? "bg-white/15" : "bg-white/30"}`} style={{ left: at(origin) }} />}
+      <input
+        type="range"
+        aria-label={label}
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        aria-valuetext={valueText}
+        disabled={disabled}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className={`range relative w-full ${lock ? "range-locked" : ""}`}
+        style={{ "--fill-from": twoSided ? at(lo) : "0px", "--fill-to": at(hi) } as CSSProperties}
+      />
+    </span>
+  );
+}
+
+/** The label above, then the slider and a typeable value on one row, like CapCut's property rows. */
+export function Slider({
+  label,
+  name = label,
+  value,
+  min,
+  max,
+  step,
+  unit = "",
+  onChange,
+  format = (v) => String(Math.round(v * 100) / 100),
+  parse,
+  disabled,
+  mixed,
+  title,
+  narrow = false,
+}: {
+  label: string;
+  /** What screen readers call it, when the row it sits in names the rest ("Shadow blur" under Shadow). */
+  name?: string;
+  /** A narrower value field, for two property rows side by side. */
+  narrow?: boolean;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  unit?: string;
+  onChange: (v: number) => void;
+  format?: (v: number) => string;
+  parse?: (s: string) => number;
+  disabled?: boolean;
+  /** The selected clips differ; the thumb sits at the first clip's value. */
+  mixed?: boolean;
+  title?: string;
+}) {
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  return (
+    // 8 px between two sliders instead of the section's 12 px, so a column of them reads as one list.
+    <div className="flex flex-col gap-0.5 [&+&]:-mt-1" title={lock ?? title}>
+      <span className={`truncate text-[12px] leading-4 ${disabled && !lock ? "text-subtle" : "text-muted"}`}>{label}</span>
+      <div className="flex items-center gap-2">
+        <RangeInput
+          label={name}
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          onChange={onChange}
+          disabled={disabled}
+          valueText={mixed ? "Mixed" : `${format(value)}${unit && ` ${unit}`}`}
+          className="min-w-0 flex-1"
+        />
+        <span className="flex shrink-0 items-center gap-0.5">
+          <NumberInput label={`${name} value`} value={value} min={min} max={max} step={step} onChange={onChange} format={format} parse={parse} disabled={disabled} mixed={mixed} className={narrow ? "w-11" : undefined} />
+          <span className="w-3 text-[11px] text-muted">{unit}</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** The inset group a section's controls sit in, like a grouped list in macOS Settings. */
+export const GROUP = "flex flex-col gap-3 rounded-[10px] bg-white/[.035] p-2 shadow-[inset_0_0_0_1px_rgb(255_255_255/.05)]";
+
+/** The title above the group; without one, for a group the inspector's header already names. */
+export function Section({ title, children, actions, bare = false, ref }: { title?: string; children: ReactNode; actions?: ReactNode; /** One quiet control that needs no group around it, such as Format's menu. */ bare?: boolean; ref?: Ref<HTMLElement> }) {
+  return (
+    <section ref={ref} className="flex flex-col gap-2 px-2.5 py-2 first:pt-3 last:pb-4">
+      {title && (
+        <div className="flex min-h-6 items-center justify-between gap-2 px-2">
+          <h3 className="text-[13px] font-semibold text-fg">{title}</h3>
+          {actions && <div className="flex items-center gap-0.5">{actions}</div>}
+        </div>
+      )}
+      {bare ? <div className="flex flex-col gap-3 px-2">{children}</div> : <div className={GROUP}>{children}</div>}
+    </section>
+  );
+}
+
+const NOTICES = { warn: { box: "bg-warn/10", icon: <AlertTriangle size={16} className="mt-px shrink-0 text-warn" /> } };
+
+/** A tinted box with an icon for what a dialog reports, such as what an export was drawn without. `className` is for the text. */
+export function Notice({ kind, children, className = "" }: { kind: keyof typeof NOTICES; children: ReactNode; className?: string }) {
+  return (
+    <div className={`flex items-start gap-2 rounded-xl p-3 text-[13px] text-fg ${NOTICES[kind].box}`} role="alert">
+      {NOTICES[kind].icon}
+      <span className={className}>{children}</span>
+    </div>
+  );
+}
+
+/**
+ * A section folded to its title and a summary of what is inside, for settings that are seldom needed. `flush` drops
+ * the section's own padding and line, for a fold inside a padded column such as the library's.
+ */
+export function Disclosure({ title, summary, open, onToggle, flush = false, children }: { title: string; summary: string; open: boolean; onToggle: () => void; flush?: boolean; children: ReactNode }) {
+  return (
+    <section className={`flex flex-col ${flush ? "gap-3" : "gap-2 px-2.5 py-2 first:pt-3 last:pb-4"}`}>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+        className={`flex h-8 min-w-0 items-center gap-1.5 rounded-md text-left text-[13px] font-semibold text-fg transition-colors duration-[120ms] ease-out hover:bg-white/[.05] ${flush ? "-mx-2 px-2" : "px-2"}`}
+      >
+        {open ? <ChevronDown size={14} className="shrink-0 text-muted" /> : <ChevronRight size={14} className="shrink-0 text-muted" />}
+        <span className="shrink-0">{title}</span>
+        {!open && <span className="truncate text-[12px] font-normal text-muted">{summary}</span>}
+      </button>
+      {open && <div className={flush ? "flex flex-col gap-3" : GROUP}>{children}</div>}
+    </section>
+  );
+}
+
+/** `mixed`: several clips with different colours; it shows a dash until one is picked for all of them. */
+export function ColorInput({ label, name = label, value, onChange, mixed = false }: { label: string; /** As Slider's. */ name?: string; value: string; onChange: (v: string) => void; mixed?: boolean }) {
+  const lock = useLockReason();
+  return (
+    <label className="flex items-center justify-between gap-2 has-[:disabled]:opacity-40" title={lock ?? undefined}>
+      <span className="text-[12px] text-muted">{label}</span>
+      <span className="flex items-center gap-2">
+        <span className="tabular text-[12px] text-muted">{mixed ? "—" : value.slice(0, 7).toUpperCase()}</span>
+        {/* WebKitGTK draws the colour well like a switch, so a plain swatch sits over a see-through input. */}
+        <span
+          className="relative h-5 w-8 rounded-[5px] shadow-[inset_0_0_0_1px_rgb(255_255_255/.18)] has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent"
+          style={{ background: mixed ? "transparent" : value.slice(0, 7) }}
+        >
+          <input
+            type="color"
+            aria-label={name}
+            disabled={!!lock}
+            value={value.slice(0, 7)}
+            onChange={(e) => onChange(e.target.value + value.slice(7))}
+            className="absolute inset-0 h-full w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
+          />
+        </span>
+      </span>
+    </label>
+  );
+}
+
+export function Checkbox({
+  label,
+  checked,
+  onChange,
+  disabled,
+  title,
+  mixed = false,
+  hideLabel = false,
+  tabIndex,
+  detail,
+  children,
+  tour,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  title?: string;
+  /** Some of the selected clips have it on: a dash, and checking turns it on for all of them. */
+  mixed?: boolean;
+  /** The label only names it for screen readers, where the row around it says what it is. */
+  hideLabel?: boolean;
+  tabIndex?: number;
+  /** A read-only value at the right end of the line, such as the gain it gives. */
+  detail?: ReactNode;
+  /** What it says in place of `label`, such as a name over a line about it; `label` still names it. */
+  children?: ReactNode;
+  /** Names it for the first-run tour, which points at it. */
+  tour?: string;
+}) {
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (input.current) input.current.indeterminate = mixed;
+  }, [mixed]);
+  return (
+    <label
+      className={`flex cursor-pointer has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-40 ${children ? "min-w-0 flex-1 items-start gap-3" : "items-center gap-2"}`}
+      title={lock ?? title}
+      data-tour={tour}
+    >
+      <span className={`relative inline-flex ${children ? "mt-0.5" : ""}`}>
+        <input
+          ref={input}
+          type="checkbox"
+          checked={checked && !mixed}
+          disabled={disabled}
+          tabIndex={tabIndex}
+          onChange={(e) => onChange(e.target.checked)}
+          aria-label={children ? label : undefined}
+          className="peer absolute inset-0 m-0 h-full w-full cursor-[inherit] opacity-0"
+        />
+        <span
+          aria-hidden
+          className={`flex h-4 w-4 items-center justify-center rounded-[4px] border transition-colors duration-[120ms] ease-out peer-focus-visible:outline-2 peer-focus-visible:outline-offset-1 peer-focus-visible:outline-accent ${
+            checked || mixed ? "border-accent-strong bg-accent-strong text-white" : "border-white/25 bg-white/[.07]"
+          }`}
+        >
+          {mixed ? <Minus size={12} strokeWidth={3} /> : checked && <Check size={12} strokeWidth={3} />}
+        </span>
+      </span>
+      {children ?? <span className={hideLabel ? "sr-only" : "text-[12px] text-fg"}>{label}</span>}
+      {detail && <span className="tabular ml-auto text-[12px] text-muted">{detail}</span>}
+    </label>
+  );
+}
+
+/** An on/off setting that takes effect at once; `Space` or `Enter` flips it. */
+export function Switch({ label, checked, onChange, disabledReason }: { label: string; checked: boolean; onChange: (v: boolean) => void; disabledReason?: string }) {
+  const reason = useLockReason() ?? disabledReason;
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      title={reason ?? label}
+      {...disabledProps(!!reason, () => onChange(!checked))}
+      className={`relative h-[22px] w-[38px] shrink-0 rounded-full transition-colors duration-[120ms] ease-out ${checked ? "bg-accent-strong" : "bg-white/[.16]"} ${
+        reason ? "cursor-not-allowed opacity-40" : ""
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`absolute left-0 top-[2px] h-[18px] w-[18px] rounded-full bg-white shadow-[0_1px_3px_rgb(0_0_0/.35)] transition-transform duration-[120ms] ease-out ${
+          checked ? "translate-x-[18px]" : "translate-x-[2px]"
+        }`}
+      />
+    </button>
+  );
+}
+
+/**
+ * Keyboard for a tablist: ←/→ move to the previous/next tab (wrapping), Home/End to the first/last,
+ * and focus follows. The keys stop here, so they never also move the playhead.
+ * Tabs carry `data-tab={id}`.
+ */
+export function tabListKeys<T extends string>(ids: readonly T[], value: T, onChange: (id: T) => void) {
+  return (e: KeyboardEvent<HTMLElement>) => {
+    const i = ids.indexOf(value);
+    const n = ids.length;
+    const to = e.key === "ArrowRight" ? (i + 1) % n : e.key === "ArrowLeft" ? (i + n - 1) % n : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
+    if (to < 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onChange(ids[to]);
+    e.currentTarget.querySelector<HTMLElement>(`[data-tab="${ids[to]}"]`)?.focus();
+  };
+}
+
+/**
+ * Arrow keys move between the buttons `selector` finds in a grid, so a long grid is one Tab stop. ↑/↓ move
+ * by the row length of the focused button's own grid; Home and End go to the first and last button.
+ */
+export function gridKeys(selector: string) {
+  return (e: KeyboardEvent<HTMLElement>) => {
+    const cells = [...e.currentTarget.querySelectorAll<HTMLElement>(selector)];
+    const at = cells.indexOf(document.activeElement as HTMLElement);
+    if (at < 0) return;
+    const grid = cells.filter((c) => c.parentElement === cells[at].parentElement);
+    const row = grid.filter((c) => c.offsetTop === grid[0].offsetTop).length;
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -row, ArrowDown: row, Home: -at, End: cells.length - 1 - at }[e.key];
+    if (step === undefined) return;
+    e.preventDefault();
+    e.stopPropagation();
+    cells[Math.max(0, Math.min(cells.length - 1, at + step))].focus();
+  };
+}
+
+/** Ids that tie a tab to its panel, unique per tab `group`. */
+export const tabIds = (group: string, id: string) => ({ tab: `${group}-tab-${id}`, panel: `${group}-panel-${id}` });
+
+/** The content of the selected tab, named by its tab. */
+export function TabPanel({ group, id, className, children }: { group: string; id: string; className?: string; children: ReactNode }) {
+  const ids = tabIds(group, id);
+  return (
+    <div role="tabpanel" id={ids.panel} aria-labelledby={ids.tab} className={className}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The chosen segment's plate in a `seg-track` (made `relative`), whose segments carry `data-seg` and `relative` so they
+ * paint over it. A new choice slides it there, as a segmented control does on macOS and iOS; anything else that moves
+ * the segments, such as a resized pane, other segments or the font arriving, puts it there at once.
+ */
+export function SegThumb({ value, className = "" }: { value: string | number | null; className?: string }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const shown = useRef<{ key: string | null; segments: string; box: string }>({ key: null, segments: "", box: "" });
+  const key = value === null ? null : String(value);
+  useLayoutEffect(() => {
+    const thumb = ref.current!;
+    const track = thumb.parentElement!;
+    const segment = (k: string | null) => (k === null ? null : track.querySelector<HTMLElement>(`:scope > [data-seg="${CSS.escape(k)}"]`));
+    const place = (slide: boolean) => {
+      const seg = segment(key);
+      thumb.style.visibility = seg ? "" : "hidden";
+      if (!seg) return;
+      // In px of the layout, also while a dialog around it scales in, with its edges on the screen's pixels, as a
+      // background of the segment itself would be.
+      const t = track.getBoundingClientRect(), b = seg.getBoundingClientRect();
+      const scale = track.offsetWidth ? t.width / track.offsetWidth : 1;
+      const px = (v: number) => Math.round((v / scale) * devicePixelRatio) / devicePixelRatio;
+      const [x, y] = [px(b.left - t.left), px(b.top - t.top)];
+      const [w, h] = [px(b.right - t.left) - x, px(b.bottom - t.top) - y];
+      const box = `${x} ${y} ${w} ${h}`;
+      if (box === shown.current.box) return;
+      shown.current.box = box;
+      if (!slide) thumb.style.transition = "none";
+      Object.assign(thumb.style, { width: `${w}px`, height: `${h}px`, transform: `translate(${x}px, ${y}px)` });
+      if (!slide) {
+        thumb.getBoundingClientRect();
+        thumb.style.transition = "";
+      }
+    };
+    // Only a new choice among the same segments slides; new segments, such as another model's efforts, put it there at once.
+    const segments = [...track.querySelectorAll<HTMLElement>(":scope > [data-seg]")].map((s) => s.dataset.seg).join("\n");
+    place(shown.current.key !== key && shown.current.segments === segments && !!segment(shown.current.key));
+    Object.assign(shown.current, { key, segments });
+    const moved = new ResizeObserver(() => place(false));
+    moved.observe(track);
+    track.querySelectorAll(":scope > [data-seg]").forEach((seg) => moved.observe(seg));
+    return () => moved.disconnect();
+  });
+  return <span ref={ref} aria-hidden className={`seg-on seg-thumb pointer-events-none absolute top-0 left-0 ${className}`} />;
+}
+
+/** Tabs in a segmented track, arrow keys move between them. The selected tab's content goes in a `TabPanel` of the same `group`. */
+export function TabBar<T extends string>({
+  group,
+  tabs,
+  value,
+  onChange,
+  label,
+  className = "mx-3 mb-1",
+}: {
+  group: string;
+  tabs: { id: T; label: string }[];
+  value: T;
+  onChange: (id: T) => void;
+  label: string;
+  /** Its margins; the inspector's by default. */
+  className?: string;
+}) {
+  const onKeyDown = tabListKeys(
+    tabs.map((t) => t.id),
+    value,
+    onChange,
+  );
+  return (
+    <div role="tablist" aria-label={label} className={`seg-track relative flex shrink-0 gap-0.5 overflow-hidden rounded-[9px] p-0.5 ${className}`} onKeyDown={onKeyDown}>
+      <SegThumb value={value} className="rounded-[7px]" />
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="tab"
+          id={tabIds(group, t.id).tab}
+          data-tab={t.id}
+          data-seg={t.id}
+          aria-selected={t.id === value}
+          aria-controls={t.id === value ? tabIds(group, t.id).panel : undefined}
+          tabIndex={t.id === value ? 0 : -1}
+          onClick={() => onChange(t.id)}
+          className={`relative h-7 min-w-0 flex-auto truncate rounded-[7px] px-1 text-[12px] font-medium whitespace-nowrap transition-colors duration-[120ms] ease-out ${
+            t.id === value ? "text-fg" : "text-muted hover:text-fg"
+          }`}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Small exclusive choice, e.g. animation In / Out or speed presets. */
+export function Segmented<T extends string | number>({
+  options,
+  value,
+  onChange,
+  label,
+  disabled = false,
+  disabledReason,
+  compact = false,
+}: {
+  options: { id: T; label: ReactNode; title?: string }[];
+  value: T | null;
+  onChange: (id: T) => void;
+  label: string;
+  disabled?: boolean;
+  disabledReason?: string;
+  /** Narrower padding, so five segments share a menu's width evenly. */
+  compact?: boolean;
+}) {
+  const reasonId = useId();
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  const reason = lock ?? (disabled ? disabledReason : undefined);
+  return (
+    <div role="group" aria-label={label} className="seg-track relative flex gap-0.5 rounded-[9px] p-0.5">
+      <SegThumb value={value} className={`rounded-[7px] ${disabled ? "opacity-40" : ""}`} />
+      {options.map((o) => (
+        <button
+          key={o.id}
+          type="button"
+          data-seg={o.id}
+          aria-pressed={o.id === value}
+          title={disabled ? reason : o.title}
+          {...disabledProps(disabled, () => onChange(o.id), reason ? reasonId : undefined)}
+          className={`tabular relative h-7 flex-1 rounded-[7px] ${compact ? "px-1" : "px-2"} text-[12px] font-medium whitespace-nowrap transition-colors duration-[120ms] ease-out disabled:cursor-not-allowed disabled:opacity-40 aria-disabled:cursor-not-allowed aria-disabled:opacity-40 ${
+            o.id === value ? "text-fg" : `text-muted ${disabled ? "" : "enabled:hover:text-fg"}`
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+      {reason && (
+        <span id={reasonId} hidden>
+          {reason}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A picture of media or a project that fades in over 180 ms when it arrives after its place was drawn, instead of popping
+ * in; one the webview already has shows at once with its place. A keyframe animation, as a transition would not start
+ * for a picture that loads before it was first styled.
+ */
+export function FadeImg({ className = "", onLoad, onError, ...props }: ComponentProps<"img">) {
+  // A picture that cannot load shows what it shows today rather than staying hidden.
+  const loaded = (img: HTMLImageElement) => (img.dataset.loaded ||= "fade");
+  return (
+    <img
+      {...props}
+      ref={(img) => {
+        if (img?.complete && img.naturalWidth) img.dataset.loaded ||= "at-once";
+      }}
+      onLoad={(e) => {
+        loaded(e.currentTarget);
+        onLoad?.(e);
+      }}
+      onError={(e) => {
+        loaded(e.currentTarget);
+        onError?.(e);
+      }}
+      className={`opacity-0 data-loaded:opacity-100 ${className}`}
+    />
+  );
+}
+
+/** Preset grid item: preview on top, label below; the selected one carries a check. */
+export function PresetTile({
+  label,
+  selected,
+  onClick,
+  disabled,
+  title,
+  children,
+}: {
+  label: string;
+  selected: boolean;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+  children: ReactNode;
+}) {
+  const lock = useLockReason();
+  disabled = disabled || !!lock;
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      title={lock ?? title ?? label}
+      {...disabledProps(disabled, onClick)}
+      className="group flex min-w-0 flex-col gap-1.5 rounded-[10px] text-left disabled:cursor-not-allowed disabled:opacity-40 aria-disabled:cursor-not-allowed aria-disabled:opacity-40"
+    >
+      <span
+        className={`relative block aspect-[4/3] w-full overflow-hidden rounded-[10px] border bg-bg ${
+          selected ? "border-accent shadow-[0_0_0_1px_var(--color-accent)]" : disabled ? "border-white/[.08]" : "border-white/[.08] group-enabled:group-hover:border-white/30"
+        }`}
+      >
+        {children}
+        {selected && (
+          <span className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent-strong text-white shadow-[0_1px_2px_rgb(0_0_0/.5)]">
+            <Check size={11} strokeWidth={3} />
+          </span>
+        )}
+      </span>
+      <span className={`truncate text-[11px] ${selected ? "font-medium text-fg" : "text-muted"}`}>{label}</span>
+    </button>
+  );
+}
+
+const SPLITTER_KEYS: Record<string, number> = { ArrowLeft: -24, ArrowRight: 24, ArrowUp: -24, ArrowDown: 24 };
+
+/**
+ * The 6 px gap between two panes, which resizes the pane on one side: drag it, double-click to
+ * reset, or ←/→ (↑/↓ across a horizontal gap) by 24 px while it has focus. A short grip shows on
+ * hover, and in `accent` while dragging or focused from the keyboard, in place of a focus ring
+ * that would run along the edges of the panes. `grow` is 1 when moving the gap right or down enlarges the pane, -1
+ * when moving it left or up does. `className` places it: `relative` with a negative margin in a
+ * row or column of panes, `absolute` over a gap it does not own.
+ */
+export function Splitter({
+  what,
+  axis,
+  size,
+  min,
+  max,
+  grow,
+  onResize,
+  onReset,
+  className,
+}: {
+  /** The pane it resizes, as in "Resize the timeline". */
+  what: string;
+  /** "x" for a gap between panes side by side. */
+  axis: "x" | "y";
+  size: number;
+  min: number;
+  max: number;
+  grow: 1 | -1;
+  onResize: (size: number) => void;
+  onReset: () => void;
+  className: string;
+}) {
+  const [active, setActive] = useState(false);
+  const x = axis === "x";
+  const set = (v: number) => onResize(Math.round(Math.max(min, Math.min(max, v))));
+  return (
+    <div
+      role="separator"
+      aria-orientation={x ? "vertical" : "horizontal"}
+      aria-label={`Resize ${what}`}
+      aria-valuenow={size}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      title={`Drag to resize the ${what}. Double-click to reset.`}
+      onPointerDown={(e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const start = x ? e.clientX : e.clientY;
+        setActive(true);
+        // A cancelled drag keeps the size reached so far.
+        followPointer({ move: (ev) => set(size + grow * ((x ? ev.clientX : ev.clientY) - start)), up: () => setActive(false), cancel: () => setActive(false) });
+      }}
+      onDoubleClick={onReset}
+      onKeyDown={(e) => {
+        const step = SPLITTER_KEYS[e.key];
+        if (!step || x !== (e.key === "ArrowLeft" || e.key === "ArrowRight")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        set(size + grow * step);
+      }}
+      className={`group z-30 shrink-0 rounded-full focus-visible:outline-none ${x ? "w-2.5 cursor-col-resize" : "h-2.5 cursor-row-resize"} ${className}`}
+    >
+      <div
+        className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full transition-colors duration-[120ms] ${x ? "h-10 w-1" : "h-1 w-10"} ${active ? "bg-accent" : "group-hover:bg-white/30 group-focus-visible:bg-accent"}`}
+      />
+    </div>
+  );
+}
+
+/** Determinate when `value` is above 0, otherwise an indeterminate sweep. `label` names the work in progress. */
+export function ProgressBar({ value, label, className = "" }: { value: number; label: string; className?: string }) {
+  const known = value > 0;
+  return (
+    <div
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={known ? Math.round(value * 100) : undefined}
+      className={`h-1.5 overflow-hidden rounded-full bg-white/10 ${className}`}
+    >
+      {known ? (
+        <div className="h-full origin-left rounded-full bg-accent transition-transform duration-200" style={{ transform: `scaleX(${Math.max(0.02, value)})` }} />
+      ) : (
+        <div className="indeterminate h-full w-1/3 rounded-full bg-accent" />
+      )}
+    </div>
+  );
+}
+
+/** Three bars, as many lit as the confidence is high. */
+export function Bars({ lit }: { lit: number }) {
+  return (
+    <span aria-hidden className="flex h-3 shrink-0 items-end gap-[2px]">
+      {[5, 8, 11].map((h, i) => (
+        <span key={h} className={`w-[3px] rounded-[1px] ${i < lit ? "bg-fg/85" : "bg-white/20"}`} style={{ height: h }} />
+      ))}
+    </span>
+  );
+}
+
+const CASE_CSS = { none: undefined, upper: "uppercase", lower: "lowercase", title: "capitalize" } as const;
+
+/** The engine's text shadow in CSS, on text `size` pixels high. */
+function swatchShadow(shadow: TextShadow, size: number) {
+  const angle = (shadow.angle * Math.PI) / 180;
+  const distance = (shadow.distance / 100) * size;
+  const [x, y] = [Math.cos(angle) * distance, -Math.sin(angle) * distance];
+  const alpha = Math.round(Math.min(1, Math.max(0, shadow.opacity)) * 255).toString(16).padStart(2, "0");
+  return `${x.toFixed(2)}px ${y.toFixed(2)}px ${((shadow.blur / 200) * size).toFixed(2)}px ${shadow.color.slice(0, 7)}${alpha}`;
+}
+
+/** A style preview in the font the engine draws it with. */
+export function TextSwatch({ style, label, size = 15, lines = 1 }: { style: TextStyle; label: string; /** Font size in px. */ size?: number; /** A long label wraps onto two. */ lines?: 1 | 2 }) {
+  // Karaoke styles show the moment a word is spoken: the last word, or the end of a one-word label, lit.
+  // Key words take the first word, or the start of a one-word label.
+  const split = label.lastIndexOf(" ") + 1 || Math.ceil(label.length / 2);
+  const key = style.keywords ? label.indexOf(" ") + 1 || Math.floor(label.length / 2) : 0;
+  return (
+    <span
+      className={`inline-block max-w-full rounded px-1 ${lines === 2 ? "line-clamp-2 text-center leading-[15px]" : "truncate leading-6"}`}
+      style={{
+        fontSize: size,
+        fontFamily: fontCss(style.fontFamily),
+        color: style.color,
+        fontWeight: style.bold ? 700 : 400,
+        background: style.background ?? undefined,
+        // As the engine rounds the box and lines up a label of two lines; without either, the usual look.
+        borderRadius: style.boxRadius !== undefined ? `${style.boxRadius * size}px` : undefined,
+        textAlign: style.align && style.align !== "center" ? style.align : undefined,
+        WebkitTextStroke: style.strokeWidth > 0 ? `${Math.min(2, style.strokeWidth / 4)}px ${style.strokeColor}` : undefined,
+        paintOrder: "stroke fill",
+        textShadow: style.shadow ? swatchShadow(style.shadow, size) : undefined,
+        textTransform: CASE_CSS[style.letterCase ?? "none"],
+        letterSpacing: style.letterSpacing ? `${style.letterSpacing}em` : undefined,
+      }}
+    >
+      {key > 0 && <span style={{ color: style.keywords?.color }}>{label.slice(0, Math.min(key, style.highlight ? split : label.length))}</span>}
+      {style.highlight ? (
+        <>
+          {label.slice(key, split)}
+          <span style={{ color: style.highlight }}>{label.slice(Math.max(key, split))}</span>
+        </>
+      ) : (
+        label.slice(key)
+      )}
+    </span>
+  );
+}
+
+/** Keeps Tab and Shift+Tab inside a modal dialog. */
+export function trapTab(e: KeyboardEvent<HTMLElement>) {
+  if (e.key !== "Tab") return;
+  const items = [...e.currentTarget.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]")].filter(
+    (el) => !el.matches(":disabled, [tabindex='-1']") && el.offsetParent !== null,
+  );
+  if (items.length === 0) return;
+  const [first, last] = [items[0], items[items.length - 1]];
+  const inside = items.includes(document.activeElement as HTMLElement);
+  if (e.shiftKey && (document.activeElement === first || !inside)) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !inside)) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+export type MenuEntry =
+  | {
+      label: string;
+      icon?: ReactNode;
+      /** Shown on the right, e.g. "F2". */
+      shortcut?: string;
+      run?: () => void;
+      /** Why it cannot be chosen now; it stays reachable and says so. */
+      disabled?: string | null;
+      danger?: boolean;
+      /** The current choice, marked with a check. */
+      checked?: boolean;
+      submenu?: MenuEntry[];
+    }
+  | "separator";
+
+type MenuItemEntry = Exclude<MenuEntry, "separator">;
+
+/**
+ * A menu at a point: a context menu, or under the button that opened it (`align: "end"` puts its
+ * right edge at `x`). ↑/↓ move, Enter or Space chooses, → opens a submenu and ← closes it, Esc closes,
+ * and so do Tab and a click elsewhere. `onClose(chose)` says whether an item ran, so the caller can
+ * return focus to what opened it. `keyboard` marks the first item at once, as when opened by a key.
+ */
+export function Menu({
+  items,
+  at,
+  label,
+  onClose,
+  keyboard = false,
+  minWidth = 220,
+}: {
+  items: MenuEntry[];
+  at: { x: number; y: number; align?: "start" | "end"; /** Opens upwards from `y`, e.g. from a bar at the bottom. */ above?: boolean };
+  label: string;
+  onClose: (chose: boolean) => void;
+  keyboard?: boolean;
+  minWidth?: number;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const choices = items.flatMap((item, i) => (item === "separator" ? [] : [i]));
+  // From the keyboard it starts on the current choice among several, so Enter keeps it (a lone switch is not a choice), or on the first item that can be chosen.
+  const among = items.filter((item) => item !== "separator" && item.checked !== undefined).length > 1;
+  const first = choices.find((i) => !(items[i] as MenuItemEntry).disabled) ?? choices[0] ?? -1;
+  const [active, setActive] = useState(keyboard ? ((among ? choices.find((i) => (items[i] as MenuItemEntry).checked) : undefined) ?? first) : -1);
+  const [open, setOpen] = useState<{ index: number; keyboard: boolean } | null>(null);
+  const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // Its size before it grows in from 96 % (menu-in), so it is placed inside the window at its full size.
+    const [width, height] = [el.offsetWidth, el.offsetHeight];
+    const x = at.align === "end" ? at.x - width : at.x;
+    const left = Math.max(8, Math.min(x, window.innerWidth - width - 8));
+    const top = at.above ? Math.max(8, at.y - height) : at.y + height > window.innerHeight - 8 ? Math.max(8, window.innerHeight - height - 8) : at.y;
+    setPlace({ left, top });
+    // A hidden element cannot take focus, so it shows in place now rather than with the next render. It grows out of
+    // the point it was opened from.
+    Object.assign(el.style, { left: `${left}px`, top: `${top}px`, visibility: "visible", transformOrigin: `${at.x - left}px ${at.y - top}px` });
+    el.focus({ preventScroll: true });
+  }, [at.x, at.y, at.align, at.above]);
+
+  useEffect(() => {
+    const outside = (e: PointerEvent) => {
+      const target = e.target as Element | null;
+      if (target?.closest?.("[data-menu]")) return;
+      // A click on a dialog's scrim only closes the menu, not the dialog under it.
+      if (target?.closest?.("[data-scrim]")) e.stopPropagation();
+      onClose(false);
+    };
+    const resized = () => onClose(false);
+    window.addEventListener("pointerdown", outside, true);
+    window.addEventListener("resize", resized);
+    return () => {
+      window.removeEventListener("pointerdown", outside, true);
+      window.removeEventListener("resize", resized);
+    };
+  }, [onClose]);
+
+  const choose = (index: number, viaKeyboard: boolean) => {
+    const item = items[index] as MenuItemEntry | undefined;
+    if (!item || item.disabled) return;
+    if (item.submenu) return setOpen({ index, keyboard: viaKeyboard });
+    chose(ref.current?.querySelector(`[data-index="${index}"]`));
+    onClose(true);
+    item.run?.();
+  };
+  const step = (dir: 1 | -1) => {
+    if (choices.length === 0) return;
+    const at = choices.indexOf(active);
+    setActive(choices[at < 0 ? (dir === 1 ? 0 : choices.length - 1) : (at + dir + choices.length) % choices.length]);
+  };
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // Keys stay in the menu: they never also reach the editor or the grid behind it.
+    e.stopPropagation();
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      step(e.key === "ArrowDown" ? 1 : -1);
+    } else if (e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      setActive(e.key === "Home" ? choices[0] : choices[choices.length - 1]);
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (active >= 0) choose(active, true);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      if (active >= 0 && (items[active] as MenuItemEntry).submenu) choose(active, true);
+    } else if (e.key === "Escape" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      onClose(false);
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      onClose(false);
+    } else if (e.key.length === 1) {
+      // Type-ahead: the next item starting with that letter.
+      const from = choices.indexOf(active);
+      const next = [...choices.slice(from + 1), ...choices.slice(0, from + 1)].find((i) => (items[i] as MenuItemEntry).label.toLowerCase().startsWith(e.key.toLowerCase()));
+      if (next !== undefined) setActive(next);
+    }
+  };
+
+  const submenu = open && (items[open.index] as MenuItemEntry).submenu;
+  const anchor = open && ref.current?.querySelector<HTMLElement>(`[data-index="${open.index}"]`)?.getBoundingClientRect();
+  return createPortal(
+    <>
+      <div
+        ref={ref}
+        data-menu
+        data-exit
+        role="menu"
+        aria-label={label}
+        tabIndex={-1}
+        aria-activedescendant={active >= 0 ? `${id}-${active}` : undefined}
+        onKeyDown={onKeyDown}
+        onContextMenu={(e) => e.preventDefault()}
+        className="overlay menu-in fixed z-[140] w-max max-w-[min(420px,calc(100vw-16px))] rounded-xl p-1 text-[13px] text-fg outline-none"
+        style={{ minWidth, left: place?.left ?? at.x, top: place?.top ?? at.y, visibility: place ? "visible" : "hidden" }}
+      >
+        {items.map((item, i) =>
+          item === "separator" ? (
+            <div key={i} role="separator" className="mx-2 my-1 h-px bg-white/[.08]" />
+          ) : (
+            <div
+              key={i}
+              id={`${id}-${i}`}
+              data-index={i}
+              role={item.checked !== undefined ? "menuitemradio" : "menuitem"}
+              aria-checked={item.checked}
+              aria-disabled={item.disabled ? true : undefined}
+              aria-haspopup={item.submenu ? "menu" : undefined}
+              aria-expanded={item.submenu ? open?.index === i : undefined}
+              title={item.disabled ?? undefined}
+              onPointerEnter={() => {
+                setActive(i);
+                if (item.submenu && !item.disabled) setOpen({ index: i, keyboard: false });
+                else if (open && open.index !== i) {
+                  // The submenu had the focus; the keys go on working here once it closes.
+                  ref.current?.focus({ preventScroll: true });
+                  setOpen(null);
+                }
+              }}
+              onClick={() => choose(i, false)}
+              className={`flex h-7 items-center gap-2 rounded-md px-2 ${active === i ? "bg-white/[.08]" : ""} ${
+                item.disabled ? "opacity-40" : item.danger ? "text-danger" : ""
+              }`}
+            >
+              <span className={`flex w-4 shrink-0 justify-center ${item.danger ? "text-danger" : item.checked ? "text-accent" : "text-muted"}`}>
+                {item.checked ? <Check size={15} /> : item.icon}
+              </span>
+              <span className="min-w-0 flex-1 truncate whitespace-nowrap">{item.label}</span>
+              {item.shortcut && <span className="min-w-0 truncate pl-4 text-[12px] text-muted">{item.shortcut}</span>}
+              {item.submenu && <ChevronRight size={14} className="shrink-0 text-muted" />}
+            </div>
+          ),
+        )}
+      </div>
+      {submenu && anchor && (
+        <Menu
+          items={submenu}
+          label={(items[open.index] as MenuItemEntry).label}
+          keyboard={open.keyboard}
+          minWidth={200}
+          at={{ x: anchor.right + 220 > window.innerWidth ? anchor.left - 4 : anchor.right + 4, y: anchor.top - 4, align: anchor.right + 220 > window.innerWidth ? "end" : "start" }}
+          onClose={(chose) => {
+            setOpen(null);
+            if (chose) onClose(true);
+            else ref.current?.focus({ preventScroll: true });
+          }}
+        />
+      )}
+    </>,
+    document.body,
+  );
+}

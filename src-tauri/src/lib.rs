@@ -1,0 +1,1885 @@
+#[cfg(test)]
+mod acl_tests;
+mod agent_panel;
+mod attachments;
+mod audio_out;
+mod beats;
+mod caption_styles;
+mod chatgpt;
+#[cfg(test)]
+mod commands;
+mod connect;
+mod cover;
+mod diagnostics;
+mod engine;
+#[cfg(target_os = "macos")]
+mod file_dialogs;
+mod jobs;
+mod library;
+mod model_question;
+mod plugins;
+mod preview_server;
+mod recap;
+mod reels;
+mod sample;
+mod sounds;
+mod stickers;
+mod store;
+mod style;
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub mod test_bridge;
+mod thumbs;
+mod transcripts;
+#[cfg(test)]
+mod typescript;
+mod updates;
+mod viral;
+mod youtube_videos;
+mod zooms;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use nuzky_engine::Project;
+use nuzky_engine::edit::{EditCmd, new_id};
+use nuzky_engine::media::probe;
+use nuzky_session::{Expect, Origin, RecoveryAction, SessionEvent, host::Host};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use engine::{Engine, Msg, Transport};
+use preview_server::PreviewServer;
+use store::ProjectSummary;
+
+pub struct AppState {
+    app: AppHandle,
+    session: Mutex<OpenSession>,
+    engine: Engine,
+    preview_url: String,
+    cache_dir: PathBuf,
+    jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Sound caches whose extraction failed, not retried on every edit; a changed file gets a new one.
+    audio_failed: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Files whose person could not be found, by path; not tried again until the app restarts.
+    matte_failed: Mutex<std::collections::HashSet<String>>,
+    /// Preview proxies not to make: of video that decodes fast enough, that failed or that the user stopped.
+    proxy_skipped: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Saving failed when the window was closed; the next close quits without retrying the warning.
+    close_failed: AtomicBool,
+    /// The user agreed to cancel running work when closing the window.
+    quit_confirmed: AtomicBool,
+    /// The editor is shown, so closing the window goes back to the projects instead of quitting.
+    editor_shown: AtomicBool,
+    thumbs: Mutex<HashMap<String, String>>,
+    filmstrips: Mutex<HashMap<String, Filmstrip>>,
+    preview_locks: Mutex<HashMap<String, PreviewLock>>,
+    bounds_text: Mutex<Option<nuzky_engine::text::TextRenderer>>,
+    covers: Mutex<cover::Covers>,
+    fonts: OnceLock<FontFamilies>,
+    /// Why the most recent project was not opened at startup.
+    startup_notice: Option<String>,
+    library: Arc<library::Library>,
+    sounds: sounds::Sounds,
+    beat_cuts: beats::BeatCuts,
+    youtube: youtube_videos::YoutubeVideos,
+    plugin_preview: Mutex<Arc<AtomicBool>>,
+    gallery: plugins::GalleryState,
+    /// What the last learning from imported timelines learned, by job, until the creator uses it,
+    /// with the version of the style its EDIT.md was shown over.
+    timeline_lessons: Mutex<Option<(String, Vec<nuzky_mcp::style::Evidence>, u64)>>,
+}
+
+/// Per asset id: the source file its cached previews show, and a lock for decoding each kind of preview. Each kind
+/// has its own, so the thumbnail, which takes one frame, never waits for the filmstrip, which can take seconds.
+struct PreviewLock {
+    source: String,
+    thumb: Arc<Mutex<()>>,
+    strip: Arc<Mutex<()>>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    // ts-rs warns that it ignores this; `SnapshotCanvas` in typescript.rs adds the safe area to the TypeScript type.
+    #[serde(serialize_with = "snapshot_project")]
+    project: Project,
+    revision: u64,
+    session_epoch: String,
+    /// Label of the AI run editing the project.
+    open_run_label: Option<String>,
+    recovery: bool,
+    can_undo: bool,
+    can_redo: bool,
+    path: String,
+    select: Vec<String>,
+    /// Set when agents cannot attach to this project live; editing works without them.
+    agent_bridge_error: Option<String>,
+}
+
+fn snapshot_project<S: serde::Serializer>(project: &Project, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut value = serde_json::to_value(project).map_err(serde::ser::Error::custom)?;
+    value["canvas"]["safeArea"] =
+        serde_json::to_value(project.canvas.safe_area()).map_err(serde::ser::Error::custom)?;
+    value.serialize(serializer)
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Boot {
+    limits: nuzky_engine::edit::Limits,
+    snapshot: Snapshot,
+    preview_url: String,
+    transport: Transport,
+    /// Why the preview could not start, when it failed before the UI listened.
+    engine_error: Option<String>,
+    /// Why the most recent project was not opened, when another one opened instead.
+    startup_notice: Option<String>,
+    version: String,
+    /// False when `NUZKY_NO_UPDATE_CHECK=1`: Nuzky then never asks whether a newer version exists.
+    update_checks: bool,
+    /// The Nuzky that ran before this one ended without quitting.
+    crashed: bool,
+    /// What the Nuzky before this one left when it restarted to update (`restartToUpdate` in src/lib/updates.ts).
+    update_note: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResult {
+    snapshot: Snapshot,
+    added: Vec<String>,
+    failed: Vec<ImportFailure>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFailure {
+    path: String,
+    error: String,
+}
+
+type CmdResult<T> = Result<T, String>;
+
+fn err(e: impl std::fmt::Display) -> String {
+    format!("{e:#}")
+}
+
+struct OpenSession {
+    host: Arc<Host>,
+    listener: Option<nuzky_mcp::ipc::Listener>,
+    bridge_error: Option<String>,
+    path: PathBuf,
+    stopped: Arc<AtomicBool>,
+    /// When to learn the creator's style from their edits of an AI's cut.
+    learn_at: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+fn lock_session<'a>(
+    session: &'a Mutex<OpenSession>,
+    expected_epoch: Option<&str>,
+) -> CmdResult<std::sync::MutexGuard<'a, OpenSession>> {
+    let current = session.lock().unwrap();
+    if let Some(epoch) = expected_epoch
+        && current.host.session.stamp().session_epoch != epoch
+    {
+        return Err("EPOCH_CHANGED: another project is open".into());
+    }
+    Ok(current)
+}
+
+/// Projects this app opened. A closed project keeps its lock until its jobs end.
+static HOSTS: Mutex<Vec<(PathBuf, std::sync::Weak<Host>)>> = Mutex::new(Vec::new());
+
+impl OpenSession {
+    fn open(path: PathBuf) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
+        // The home screen and the editor compare projects by this path.
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        {
+            let canonical = path.clone();
+            let mut hosts = HOSTS.lock().unwrap();
+            hosts.retain(|(_, host)| host.strong_count() > 0);
+            anyhow::ensure!(
+                !hosts.iter().any(|(open, _)| open == &canonical),
+                "Nuzky is still finishing background work on this project. Try again in a few seconds."
+            );
+        }
+        let (tx, rx) = mpsc::channel();
+        let host = Arc::new(Host::new(store::open(&path, Some(tx))?, store::cache_dir())?);
+        HOSTS.lock().unwrap().push((host.session.locked_path()?, Arc::downgrade(&host)));
+        let mut session = Self {
+            host,
+            listener: None,
+            bridge_error: None,
+            path,
+            stopped: Arc::new(AtomicBool::new(false)),
+            learn_at: Arc::default(),
+        };
+        session.start_bridge();
+        Ok((session, rx))
+    }
+
+    /// The project stays open for editing when the live agent bridge cannot start.
+    fn start_bridge(&mut self) {
+        match nuzky_mcp::ipc::Listener::start(self.host.clone(), connect::access_flag()) {
+            Ok(listener) => {
+                self.listener = Some(listener);
+                self.bridge_error = None;
+            }
+            Err(error) => {
+                log::error!("Agent bridge unavailable: {error:#}");
+                self.bridge_error = Some(format!("{error:#}"));
+            }
+        }
+    }
+
+    fn close_ipc(&mut self) {
+        self.listener.take();
+    }
+
+    fn prepare_switch(&mut self) -> anyhow::Result<()> {
+        self.close_ipc();
+        if let Err(error) = self.host.session.disconnect() {
+            self.start_bridge();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self, select: Vec<String>) -> CmdResult<Snapshot> {
+        let (state, can_undo, can_redo) = self.host.session.view().map_err(err)?;
+        Ok(Snapshot {
+            project: state.project,
+            revision: state.stamp.revision,
+            session_epoch: state.stamp.session_epoch,
+            open_run_label: state.open_run.map(|run| run.label),
+            recovery: state.recovery_checkpoint.is_some(),
+            can_undo,
+            can_redo,
+            path: self.path.to_string_lossy().into_owned(),
+            select,
+            agent_bridge_error: self.bridge_error.clone(),
+        })
+    }
+
+    fn start_pump(&self, app: AppHandle, rx: Receiver<SessionEvent>) {
+        let stopped = self.stopped.clone();
+        let learn_at = self.learn_at.clone();
+        let session = Arc::downgrade(&self.host);
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                let due = {
+                    let mut at = learn_at.lock().unwrap();
+                    at.take_if(|at| *at <= std::time::Instant::now()).is_some()
+                };
+                if due && let Some(host) = session.upgrade() {
+                    style::learn_edits(&host);
+                }
+                let event = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => break,
+                };
+                let state = app.state::<AppState>();
+                let current = state.session.lock().unwrap();
+                if stopped.load(Ordering::Acquire) || !session.ptr_eq(&Arc::downgrade(&current.host)) {
+                    break;
+                }
+                match event {
+                    SessionEvent::Job { id, kind, status, progress, error } => {
+                        if status != "running" {
+                            log::info!(target: "action", "ai job {kind} {status}");
+                        }
+                        let label = match kind {
+                            "transcription" => "Transcribing",
+                            "export" => "Exporting",
+                            "activity" => "Scanning picture and sound",
+                            "analysis" => "Analysing media",
+                            "segment" | "matte" => "Finding the person",
+                            "reframe" => "Reframing",
+                            "plugin" => "Running a plugin",
+                            _ => "Working",
+                        };
+                        app.emit(
+                            "job",
+                            jobs::JobEvent {
+                                id: format!("agent:{id}"),
+                                kind: "agent",
+                                label: label.into(),
+                                status,
+                                progress,
+                                phase: None,
+                                message: error,
+                                output: None,
+                            },
+                        )
+                        .ok();
+                    }
+                    SessionEvent::TranscriptsChanged => {
+                        app.emit("transcripts-changed", ()).ok();
+                    }
+                    SessionEvent::Changed { origin, .. } => {
+                        if matches!(origin, Origin::User | Origin::Undo | Origin::Redo | Origin::Restore) {
+                            *learn_at.lock().unwrap() = Some(std::time::Instant::now() + style::LEARN_AFTER);
+                        }
+                        if let Ok(snap) = current.snapshot(Vec::new()) {
+                            state.publish_project(&snap.project);
+                            // Media an agent added, or rebound to another file under the same id,
+                            // needs its sound prepared too; prepared sources are skipped.
+                            jobs::prepare_media(&state, &snap.project);
+                            // User edits already return this snapshot; agent undo also reaches the UI.
+                            if !matches!(origin, Origin::User) {
+                                app.emit("project-changed", snap).ok();
+                            }
+                        }
+                    }
+                    SessionEvent::Saved { revision, error } => {
+                        app.emit("saved", store::SavedEvent { revision, error }).ok();
+                    }
+                    SessionEvent::RunSummary { run_id, changes } => {
+                        app.emit(
+                            "run-summary",
+                            serde_json::json!({ "runId": run_id, "changes": changes, "cut": false }),
+                        )
+                        .ok();
+                        // What the cut removed reads the history and the transcripts, so it follows a moment later,
+                        // never holding up the end of the run.
+                        let (host, app) = (current.host.clone(), app.clone());
+                        std::thread::spawn(move || {
+                            let recap = host
+                                .session
+                                .run_pair(&run_id)
+                                .and_then(|(before, after)| nuzky_mcp::recap::recap(before, after, &host.transcripts));
+                            let (recap, _) = match recap {
+                                Ok(recap) => recap,
+                                Err(error) => return log::warn!("Cannot count what run {run_id} cut: {error:#}"),
+                            };
+                            let mut changes = changes;
+                            if let Some(text) = nuzky_mcp::recap::line(&recap.totals()) {
+                                let after = |prefixes: &[&str]| {
+                                    changes.iter().position(|c| prefixes.iter().any(|p| c.text.starts_with(p)))
+                                };
+                                let at = after(&["Cut out "])
+                                    .or_else(|| after(&["Shortened the video ", "Lengthened the video "]))
+                                    .map_or(0, |i| i + 1);
+                                changes.insert(
+                                    at,
+                                    nuzky_session::summary::RunChange { text, clip_ids: Vec::new(), at_us: None },
+                                );
+                            }
+                            let cut = !recap.cuts.is_empty();
+                            // Another project opened meanwhile has its own runs.
+                            if !Arc::ptr_eq(&host, &app.state::<AppState>().session.lock().unwrap().host) {
+                                return;
+                            }
+                            app.emit(
+                                "run-summary",
+                                serde_json::json!({ "runId": run_id, "changes": changes, "cut": cut }),
+                            )
+                            .ok();
+                        });
+                    }
+                    SessionEvent::Run(run) => {
+                        app.emit("run-changed", run.map(|run| run.label)).ok();
+                        if let Ok(snap) = current.snapshot(Vec::new()) {
+                            app.emit("project-changed", snap).ok();
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        // Edits waiting to be learned are learned as the project closes, without making it wait.
+        if self.learn_at.lock().unwrap().take().is_some() {
+            style::learn_edits(&self.host);
+        }
+        self.close_ipc();
+        if let Err(error) = self.host.retire() {
+            log::error!("{error:#}");
+        }
+    }
+}
+
+impl AppState {
+    fn project(&self) -> CmdResult<Project> {
+        self.session.lock().unwrap().host.session.state().map(|state| state.project).map_err(err)
+    }
+
+    fn publish_project(&self, project: &Project) {
+        // Previews stay while their asset id still names the same file; an id rebound to other
+        // media, by removal and re-adding in one batch, is decoded again.
+        let mut locks = self.preview_locks.lock().unwrap();
+        locks.retain(|id, entry| project.asset(id).is_some_and(|asset| asset.path == entry.source));
+        self.thumbs.lock().unwrap().retain(|id, _| locks.contains_key(id));
+        self.filmstrips.lock().unwrap().retain(|id, _| locks.contains_key(id));
+        drop(locks);
+        self.engine.send(Msg::Project(Arc::new(project.clone())));
+    }
+
+    fn apply_batch(
+        &self,
+        cmds: Vec<EditCmd>,
+        coalesce: Option<String>,
+        expect: Expect,
+        expected_epoch: Option<&str>,
+    ) -> CmdResult<Snapshot> {
+        let current = lock_session(&self.session, expected_epoch)?;
+        let result = current.host.session.edit(cmds, coalesce, expect).map_err(err)?;
+        current.snapshot(result.outcome.select)
+    }
+
+    fn asset_preview<T: Clone>(
+        &self,
+        asset_id: &str,
+        cache: &Mutex<HashMap<String, T>>,
+        kind: fn(&PreviewLock) -> &Arc<Mutex<()>>,
+        decode: impl FnOnce(&nuzky_engine::model::Asset) -> anyhow::Result<Option<T>>,
+    ) -> CmdResult<Option<T>> {
+        let (asset, lock) = {
+            let current = self.session.lock().unwrap();
+            let Some(asset) = current.host.session.state().map_err(err)?.project.asset(asset_id).cloned() else {
+                return Ok(None);
+            };
+            let mut locks = self.preview_locks.lock().unwrap();
+            let entry = locks.entry(asset_id.into()).or_insert_with(|| PreviewLock {
+                source: asset.path.clone(),
+                thumb: Arc::default(),
+                strip: Arc::default(),
+            });
+            let lock = kind(entry).clone();
+            (asset, lock)
+        };
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _current = self.session.lock().unwrap();
+            if !self
+                .preview_locks
+                .lock()
+                .unwrap()
+                .get(asset_id)
+                .is_some_and(|current| Arc::ptr_eq(kind(current), &lock))
+            {
+                return Ok(None);
+            }
+            if let Some(value) = cache.lock().unwrap().get(asset_id) {
+                return Ok(Some(value.clone()));
+            }
+        }
+        let value = decode(&asset).map_err(err)?;
+        let _current = self.session.lock().unwrap();
+        // Removal or replacement invalidates in-flight decodes, even if the ID is reused.
+        if !self.preview_locks.lock().unwrap().get(asset_id).is_some_and(|current| Arc::ptr_eq(kind(current), &lock)) {
+            return Ok(None);
+        }
+        if let Some(value) = &value {
+            cache.lock().unwrap().insert(asset_id.into(), value.clone());
+        }
+        Ok(value)
+    }
+
+    fn replace_project(&self, current: &mut OpenSession, path: PathBuf) -> CmdResult<Snapshot> {
+        let (next, rx) = OpenSession::open(path).map_err(err)?;
+        let snap = next.snapshot(Vec::new())?;
+        current.prepare_switch().map_err(err)?;
+        *current = next;
+        // The startup picker uses modification time, including projects opened without edits.
+        if let Err(error) = current.host.session.disconnect() {
+            log::error!("Cannot save opened project: {error:#}");
+        }
+        self.thumbs.lock().unwrap().clear();
+        self.filmstrips.lock().unwrap().clear();
+        self.preview_locks.lock().unwrap().clear();
+        self.engine.send(Msg::Seek(0));
+        self.publish_project(&snap.project);
+        current.start_pump(self.app.clone(), rx);
+        jobs::prepare_media(self, &snap.project);
+        Ok(snap)
+    }
+}
+
+#[tauri::command]
+fn boot(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Boot> {
+    Ok(Boot {
+        limits: nuzky_engine::edit::LIMITS,
+        snapshot: state.session.lock().unwrap().snapshot(Vec::new())?,
+        preview_url: state.preview_url.clone(),
+        transport: *state.engine.transport.lock().unwrap(),
+        engine_error: state.engine.error.lock().unwrap().clone(),
+        startup_notice: state.startup_notice.clone(),
+        version: app.package_info().version.to_string(),
+        update_checks: updates::enabled(),
+        // Taken first: a Nuzky that ended for its update did not crash.
+        update_note: updates::take_note(),
+        crashed: diagnostics::crashed_before(),
+    })
+}
+
+/// A UI flow keeps the window it set up: the size it chose on Linux, off every screen on macOS.
+#[tauri::command]
+fn maximize_window(window: tauri::Window) -> CmdResult<()> {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    let flow = test_bridge::active();
+    #[cfg(not(all(target_os = "macos", debug_assertions)))]
+    let flow = std::env::var_os("TAURI_WEBVIEW_AUTOMATION").is_some();
+    if !flow {
+        window.maximize().map_err(err)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_editor_shown(shown: bool, state: State<AppState>) {
+    state.editor_shown.store(shown, Ordering::Release);
+}
+
+#[tauri::command]
+fn apply_edit(
+    state: State<'_, AppState>,
+    cmd: EditCmd,
+    coalesce: Option<String>,
+    expected_revision: Option<u64>,
+    expected_speech_layout_key: Option<String>,
+    expected_epoch: Option<String>,
+) -> CmdResult<Snapshot> {
+    state.apply_batch(
+        vec![cmd],
+        coalesce,
+        Expect { revision: expected_revision, speech_layout_key: expected_speech_layout_key },
+        expected_epoch.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn apply_edits(
+    state: State<'_, AppState>,
+    cmds: Vec<EditCmd>,
+    coalesce: Option<String>,
+    expected_revision: Option<u64>,
+    expected_speech_layout_key: Option<String>,
+    expected_epoch: Option<String>,
+) -> CmdResult<Snapshot> {
+    state.apply_batch(
+        cmds,
+        coalesce,
+        Expect { revision: expected_revision, speech_layout_key: expected_speech_layout_key },
+        expected_epoch.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn undo(state: State<'_, AppState>, expected_epoch: Option<String>) -> CmdResult<Snapshot> {
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    current.host.session.undo().map_err(err)?;
+    current.snapshot(Vec::new())
+}
+
+#[tauri::command]
+fn redo(state: State<'_, AppState>, expected_epoch: Option<String>) -> CmdResult<Snapshot> {
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    current.host.session.redo().map_err(err)?;
+    current.snapshot(Vec::new())
+}
+
+/// The project an undo or redo step would restore, for the timeline to show before the click.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPeek {
+    label: String,
+    /// The step is a whole AI run.
+    ai: bool,
+    /// The revision the step was read at; it describes undo or redo only while the project is still there.
+    revision: u64,
+    // With the safe area, as in `Snapshot`.
+    #[serde(serialize_with = "snapshot_project")]
+    project: Project,
+}
+
+#[tauri::command]
+fn peek_history(
+    state: State<'_, AppState>,
+    expected_epoch: Option<String>,
+    redo: bool,
+) -> CmdResult<Option<HistoryPeek>> {
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    Ok(current.host.session.peek(redo).map(|peek| HistoryPeek {
+        label: peek.label,
+        ai: peek.ai,
+        revision: peek.revision,
+        project: peek.project,
+    }))
+}
+
+/// A kept version of the open project, for the list of versions in the top bar.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectVersion {
+    /// Stays with the version across restarts.
+    index: u64,
+    label: String,
+    /// Unix time in milliseconds.
+    at_ms: u64,
+    /// The AI agent's run that made it; none for the user's own steps.
+    #[cfg_attr(test, ts(optional = nullable))]
+    run_id: Option<String>,
+    /// The project is this version now; only the newest version with its contents says so.
+    current: bool,
+}
+
+/// The newest `limit` versions, newest first.
+#[tauri::command]
+fn list_versions(state: State<'_, AppState>, limit: usize) -> CmdResult<Vec<ProjectVersion>> {
+    let current = state.session.lock().unwrap();
+    let list = current.host.session.list_history(limit.clamp(1, nuzky_session::MAX_VERSIONS)).map_err(err)?;
+    let mut found = false;
+    Ok(list
+        .versions
+        .into_iter()
+        .map(|version| {
+            let current = !found && version.hash == list.current_hash;
+            found |= current;
+            ProjectVersion {
+                index: version.index,
+                label: version.label,
+                at_ms: version.at_ms,
+                run_id: version.run_id,
+                current,
+            }
+        })
+        .collect())
+}
+
+/// Restores a kept version as one undo step.
+#[tauri::command]
+fn restore_version(state: State<'_, AppState>, index: u64, expected_epoch: Option<String>) -> CmdResult<Snapshot> {
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    current.host.session.undo_to(nuzky_session::Target::Index(index)).map_err(err)?;
+    current.snapshot(Vec::new())
+}
+
+#[tauri::command]
+fn set_ui_context(state: State<'_, AppState>, selection: Vec<String>, playhead_us: i64) {
+    state.session.lock().unwrap().host.session.set_ui_context(selection, playhead_us);
+}
+
+/// Stop in the "AI is editing" bar: the run ends with its changes kept, as one undo step. With
+/// `discard`, before opening another project, its changes are taken back instead.
+#[tauri::command]
+fn stop_run(
+    state: State<'_, AppState>,
+    panel: State<'_, agent_panel::AgentPanel>,
+    expected_epoch: Option<String>,
+    discard: Option<bool>,
+) -> CmdResult<Snapshot> {
+    // The AI panel's agent stops too, so it does not go on editing; before the session lock, never inside it.
+    panel.stop();
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    let action = if discard == Some(true) { nuzky_session::EndAction::Discard } else { nuzky_session::EndAction::Keep };
+    current.host.end_open_run(action).map_err(err)?;
+    current.snapshot(Vec::new())
+}
+
+#[tauri::command]
+fn resolve_recovery(state: State<'_, AppState>, action: String, expected_epoch: Option<String>) -> CmdResult<Snapshot> {
+    let action = match action.as_str() {
+        "keep" => RecoveryAction::Keep,
+        "restore" => RecoveryAction::Restore,
+        _ => return Err("Unknown recovery action".into()),
+    };
+    let current = lock_session(&state.session, expected_epoch.as_deref())?;
+    current.host.session.resolve_recovery(action).map_err(err)?;
+    current.snapshot(Vec::new())
+}
+
+/// The media files that open, in the given order, and why the others do not.
+async fn probe_media(paths: Vec<String>) -> CmdResult<(Vec<nuzky_engine::model::Asset>, Vec<ImportFailure>)> {
+    let probed = tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                // FFmpeg would open URLs and protocol prefixes; only local files are media.
+                let local = nuzky_session::local_media_path(&p).and_then(|()| {
+                    anyhow::ensure!(Path::new(&p).is_file(), "{p} is not a file");
+                    Ok(())
+                });
+                let result = local.and_then(|()| probe(Path::new(&p), new_id()));
+                (p, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(err)?;
+    let mut assets = Vec::new();
+    let mut failed = Vec::new();
+    for (path, result) in probed {
+        match result {
+            Ok(a) => assets.push(a),
+            Err(e) => failed.push(ImportFailure { path, error: format!("{e:#}") }),
+        }
+    }
+    Ok((assets, failed))
+}
+
+#[tauri::command]
+async fn import_media(app: AppHandle, paths: Vec<String>, expected_epoch: Option<String>) -> CmdResult<ImportResult> {
+    log::info!(target: "action", "import {} files", paths.len());
+    let (assets, failed) = probe_media(paths).await?;
+    let state = app.state::<AppState>();
+    let added: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
+    let snapshot = if assets.is_empty() {
+        lock_session(&state.session, expected_epoch.as_deref())?.snapshot(Vec::new())?
+    } else {
+        let snap = state.apply_batch(
+            vec![EditCmd::AddAssets { assets }],
+            None,
+            Expect::default(),
+            expected_epoch.as_deref(),
+        )?;
+        jobs::prepare_media(&state, &snap.project);
+        snap
+    };
+    Ok(ImportResult { snapshot, added, failed })
+}
+
+#[tauri::command]
+async fn thumbnail(app: AppHandle, asset_id: String) -> CmdResult<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state.asset_preview(
+            &asset_id,
+            &state.thumbs,
+            |locks| &locks.thumb,
+            |asset| thumbs::thumbnail(&state.cache_dir, asset),
+        )
+    })
+    .await
+    .map_err(err)?
+}
+
+#[derive(serde::Serialize)]
+struct WaveformPeaks {
+    peaks: Vec<u8>,
+    /// False while the sound is still being prepared: only the part decoded so far is there.
+    complete: bool,
+}
+
+/// Waveform peaks `from..to` of an asset; the timeline asks for the blocks around what is on screen.
+#[tauri::command]
+async fn waveform(app: AppHandle, asset_id: String, from: usize, to: usize) -> CmdResult<Option<WaveformPeaks>> {
+    let state = app.state::<AppState>();
+    let asset = state.project()?.asset(&asset_id).cloned();
+    let Some(asset) = asset else { return Ok(None) };
+    // Preparing this sound failed; nothing more will come.
+    if state.audio_failed.lock().unwrap().contains(&nuzky_engine::audio::pcm_path(&state.cache_dir, &asset)) {
+        return Ok(Some(WaveformPeaks { peaks: Vec::new(), complete: true }));
+    }
+    let cache = state.cache_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (peaks, complete) = nuzky_engine::audio::waveform_peaks(&cache, &asset, from, to).ok()?;
+        Some(WaveformPeaks { peaks, complete })
+    })
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+async fn match_gain(app: AppHandle, clip_id: String) -> CmdResult<Option<f64>> {
+    let state = app.state::<AppState>();
+    let project = state.project()?;
+    let cache = state.cache_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let clip = project.tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == clip_id)?;
+        nuzky_engine::audio::match_gain_db(&cache, &project, clip)
+    })
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+fn play(state: State<'_, AppState>) {
+    log::info!(target: "action", "play");
+    state.engine.send(Msg::Play);
+}
+
+#[tauri::command]
+fn pause(state: State<'_, AppState>) {
+    log::info!(target: "action", "pause");
+    state.engine.send(Msg::Pause);
+}
+
+#[tauri::command]
+fn seek(state: State<'_, AppState>, t_us: i64) {
+    state.engine.send(Msg::Seek(t_us));
+}
+
+#[tauri::command]
+fn set_preview_box(state: State<'_, AppState>, width: u32, height: u32) {
+    state.engine.send(Msg::Resize(width, height));
+}
+
+#[tauri::command]
+fn set_preview_muted(state: State<'_, AppState>, muted: bool) {
+    state.engine.muted.store(muted, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn list_projects() -> Vec<ProjectSummary> {
+    store::list()
+}
+
+#[tauri::command]
+async fn agent_connections() -> CmdResult<Vec<connect::Connection>> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let command = connect::Command::this_app().map_err(err)?;
+        let home = std::env::home_dir().ok_or("No home folder")?;
+        Ok(connect::Agent::ALL
+            .map(|agent| connect::status(agent, &agent.config(&home), &command).shown_from(&home))
+            .to_vec())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStatus {
+    installed: bool,
+    /// The executable, with `~/` for the home folder, to run in a terminal before a new terminal knows the command.
+    path: Option<String>,
+    version: Option<String>,
+    #[cfg_attr(test, ts(as = "Option<crate::typescript::SignIn>"))]
+    signed_in: Option<nuzky_agent::SignIn>,
+    connection: connect::Connection,
+}
+
+#[tauri::command]
+async fn agent_status(agent: connect::Agent) -> CmdResult<AgentStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = nuzky_agent::find(agent.id());
+        let home = std::env::home_dir().ok_or("No home folder")?;
+        let command = connect::Command::this_app().map_err(err)?;
+        Ok(AgentStatus {
+            installed: info.path.is_some(),
+            path: info.path.as_deref().map(|path| connect::tilde(&path.to_string_lossy(), &home)),
+            version: info.version,
+            signed_in: info.path.as_deref().map(|path| nuzky_agent::signed_in(agent.id(), path)),
+            connection: connect::status(agent, &agent.config(&home), &command).shown_from(&home),
+        })
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+async fn verify_agent(agent: connect::Agent) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = nuzky_agent::find(agent.id());
+        let program = info.path.ok_or_else(|| format!("Install {} first.", info.name))?;
+        let home = std::env::home_dir().ok_or("No home folder")?;
+        connect::verify(agent, &program, &home)?;
+        if !connect::access().on {
+            return Err(format!("Agent access is off, so {} can't edit your video. Try again turns it on.", info.name));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Writes the `nuzky` entry into the agent's config after a backup; nothing else changes. The agent
+/// it connects can edit right away and after every launch, as before Agent access existed.
+#[tauri::command]
+async fn connect_agent(agent: connect::Agent) -> CmdResult<connect::Connection> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let command = connect::Command::this_app().map_err(err)?;
+        let home = std::env::home_dir().ok_or("No home folder")?;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let connection =
+            connect::connect(agent, &agent.config(&home), agent.settings(&home).as_deref(), &command, stamp)
+                .map_err(err)?;
+        connect::set_access(true, true).map_err(err)?;
+        Ok(connection.shown_from(&home))
+    })
+    .await
+    .map_err(err)?
+}
+
+/// The `nuzky` server and a first message for an agent Nuzky does not connect itself.
+#[tauri::command]
+fn agent_setup(setup: connect::Setup) -> CmdResult<String> {
+    connect::setup(setup, &connect::Command::this_app().map_err(err)?).map_err(err)
+}
+
+#[tauri::command]
+fn agent_access() -> connect::Access {
+    connect::access()
+}
+
+/// Off drops the agents attached with `--current` at once; their open run ends kept.
+#[tauri::command]
+fn set_agent_access(on: bool, at_launch: bool) -> CmdResult<connect::Access> {
+    connect::set_access(on, at_launch).map_err(err)
+}
+
+/// Families the engine can draw: bundled ones ship with Nuzky, system ones are installed on this computer.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize, Clone)]
+pub struct FontFamilies {
+    bundled: Vec<String>,
+    system: Vec<String>,
+}
+
+#[tauri::command]
+fn list_fonts(state: State<'_, AppState>) -> FontFamilies {
+    state
+        .fonts
+        .get_or_init(|| {
+            use nuzky_engine::text::{BUNDLED_FONT_FAMILIES, TextRenderer};
+            let mut renderer = state.bounds_text.lock().unwrap();
+            let families = renderer.get_or_insert_with(TextRenderer::new).font_families();
+            let (bundled, system) =
+                families.into_iter().partition(|name| BUNDLED_FONT_FAMILIES.contains(&name.as_str()));
+            FontFamilies { bundled, system }
+        })
+        .clone()
+}
+
+#[tauri::command]
+fn new_project(
+    state: State<'_, AppState>,
+    panel: State<'_, agent_panel::AgentPanel>,
+    width: u32,
+    height: u32,
+) -> CmdResult<Snapshot> {
+    log::info!(target: "action", "new project");
+    // The panel's agent works on the open project only.
+    panel.stop();
+    let mut project = Project::new("Untitled project");
+    project.canvas.width = width & !1;
+    project.canvas.height = height & !1;
+    let path = store::new_project_path();
+    store::create(&path, &project).map_err(err)?;
+    state.replace_project(&mut state.session.lock().unwrap(), path)
+}
+
+#[tauri::command]
+async fn new_project_from_media(app: AppHandle, paths: Vec<String>) -> CmdResult<ImportResult> {
+    log::info!(target: "action", "new project from {} files", paths.len());
+    let (assets, failed) = probe_media(paths).await?;
+    if assets.is_empty() {
+        let reasons: Vec<String> = failed.iter().map(|f| f.error.clone()).collect();
+        return Err(format!("None of those files could be opened: {}", reasons.join("; ")));
+    }
+    open_new_project(&app, library::UNTITLED, assets, failed)
+}
+
+/// Opens a new project named `name` with the media on its timeline.
+fn open_new_project(
+    app: &AppHandle,
+    name: &str,
+    assets: Vec<nuzky_engine::model::Asset>,
+    failed: Vec<ImportFailure>,
+) -> CmdResult<ImportResult> {
+    let added: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
+    let project = project_from_media(name, assets).map_err(err)?;
+    let path = store::new_project_path();
+    store::create(&path, &project).map_err(err)?;
+    // The panel's agent works on the open project only; never stopped while holding the session.
+    app.state::<agent_panel::AgentPanel>().stop();
+    let state = app.state::<AppState>();
+    let snapshot = state.replace_project(&mut state.session.lock().unwrap(), path)?;
+    Ok(ImportResult { snapshot, added, failed })
+}
+
+/// A project with the media on its timeline in the given order, in the format of the first picture: the
+/// matching common format, or the picture's own shape.
+fn project_from_media(name: &str, assets: Vec<nuzky_engine::model::Asset>) -> anyhow::Result<Project> {
+    let mut project = Project::new(name);
+    if let Some(first) = assets.iter().find(|a| a.kind != nuzky_engine::model::AssetKind::Audio && a.width > 0) {
+        let (width, height) = canvas_for(first.width, first.height);
+        project.apply(EditCmd::SetCanvas { width, height, background: None, background_blur: None })?;
+    }
+    let added: Vec<String> = assets.iter().map(|a| a.id.clone()).collect();
+    project.apply(EditCmd::AddAssets { assets })?;
+    for id in added {
+        project.apply(EditCmd::AddClip { asset_id: id, start_us: None, track_id: None })?;
+    }
+    nuzky_session::validate(&project)?;
+    Ok(project)
+}
+
+/// A new project of the CapCut draft in the folder `path`, opened at once; the draft stays as it was. The
+/// snapshot's project says what did not come over.
+#[tauri::command]
+async fn open_capcut_draft(app: AppHandle, path: String) -> CmdResult<Snapshot> {
+    let draft = dunce::canonicalize(&path).map_err(|_| format!("The draft {path} is not there any more."))?;
+    let families = list_fonts(app.state());
+    let fonts: Vec<String> = families.bundled.into_iter().chain(families.system).collect();
+    let project = tauri::async_runtime::spawn_blocking(move || nuzky_mcp::import::capcut_draft(&draft, &fonts))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    let path = store::new_project_path();
+    store::create(&path, &project).map_err(err)?;
+    // The panel's agent works on the open project only; never stopped while holding the session.
+    app.state::<agent_panel::AgentPanel>().stop();
+    let state = app.state::<AppState>();
+    state.replace_project(&mut state.session.lock().unwrap(), path)
+}
+
+/// The canvas for a picture of this size: a common format of the same shape, or 1080 on its short side.
+fn canvas_for(width: u32, height: u32) -> (u32, u32) {
+    const FORMATS: [(u32, u32); 4] = [(1080, 1920), (1920, 1080), (1080, 1080), (1080, 1350)];
+    let ratio = f64::from(width) / f64::from(height.max(1));
+    if let Some(&format) = FORMATS.iter().find(|(w, h)| (f64::from(*w) / f64::from(*h) / ratio - 1.0).abs() < 0.02) {
+        return format;
+    }
+    let scale = 1080.0 / f64::from(width.min(height).max(1));
+    let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(16, 7680) & !1;
+    (side(width), side(height))
+}
+
+#[tauri::command]
+fn open_project(
+    state: State<'_, AppState>,
+    panel: State<'_, agent_panel::AgentPanel>,
+    path: String,
+) -> CmdResult<Snapshot> {
+    log::info!(target: "action", "open project");
+    let path = dunce::canonicalize(path).map_err(err)?;
+    if state.session.lock().unwrap().path != path {
+        // The panel's agent works on the open project only; never stopped while holding the session.
+        panel.stop();
+    }
+    let mut current = state.session.lock().unwrap();
+    if current.path == path {
+        return current.snapshot(Vec::new());
+    }
+    let snapshot = state.replace_project(&mut current, path.clone())?;
+    drop(current);
+    state.library.remember(&path);
+    Ok(snapshot)
+}
+
+/// `replace_existing` is true once the user confirmed this exact path; false fails with
+/// DESTINATION_EXISTS when the file is already there. Absent means true.
+#[tauri::command]
+fn start_export(
+    app: AppHandle,
+    path: String,
+    options: jobs::ExportRequest,
+    replace_existing: Option<bool>,
+    replace_credits: Option<bool>,
+    expected_epoch: Option<String>,
+) -> CmdResult<String> {
+    let (replace, credits) = (replace_existing.unwrap_or(true), replace_credits.unwrap_or(false));
+    jobs::start_export(&app, PathBuf::from(path), options, replace, credits, expected_epoch.as_deref())
+}
+
+/// Filmstrip for timeline clips: one horizontal sprite of evenly spaced frames.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Filmstrip {
+    /// PNG or JPEG data URL of `count` frames side by side.
+    url: String,
+    frame_width: u32,
+    frame_height: u32,
+    /// Source time between consecutive frames.
+    interval_us: i64,
+    count: u32,
+}
+
+/// Where a visual layer sits on the canvas at a given time, for selecting and dragging
+/// layers directly in the preview.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerBounds {
+    clip_id: String,
+    /// Top-left, top-right, bottom-right, bottom-left of the visible part in canvas pixels.
+    corners: [[f32; 2]; 4],
+    /// The same corners of the whole layer, before its crop.
+    frame: [[f32; 2]; 4],
+}
+
+/// Layers visible at `t_us`, bottom to top, with animations and keyframes applied.
+#[tauri::command]
+async fn layer_bounds(app: AppHandle, t_us: i64) -> CmdResult<Vec<LayerBounds>> {
+    let project = app.state::<AppState>().project()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mut text = state.bounds_text.lock().unwrap();
+        let text = text.get_or_insert_with(nuzky_engine::text::TextRenderer::new);
+        nuzky_engine::render::layer_bounds(&project, t_us, text)
+            .into_iter()
+            .map(|(clip_id, corners, frame)| LayerBounds { clip_id, corners, frame })
+            .collect()
+    })
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+async fn filmstrip(app: AppHandle, asset_id: String) -> CmdResult<Option<Filmstrip>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state.asset_preview(
+            &asset_id,
+            &state.filmstrips,
+            |locks| &locks.strip,
+            |asset| thumbs::filmstrip(&state.cache_dir, asset),
+        )
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Files of the open project whose clips with a background still wait for the person to be found in them.
+#[tauri::command]
+fn mattes_missing(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    let project = state.project()?;
+    Ok(nuzky_engine::matte::missing(&state.cache_dir, &project).into_iter().map(|(asset, _)| asset.path).collect())
+}
+
+#[tauri::command]
+fn cancel_job(state: State<'_, AppState>, id: String) {
+    if let Some(job) = id.strip_prefix("agent:") {
+        let _ = state.session.lock().unwrap().host.jobs.get(job, true);
+        return;
+    }
+    if let Some(flag) = state.jobs.lock().unwrap().get(&id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A preview proxy the user stopped stays stopped until the app restarts.
+        if let Some(source) = id.strip_prefix("proxy:") {
+            let proxy = nuzky_engine::proxy::proxy_path(&state.cache_dir, Path::new(source));
+            state.proxy_skipped.lock().unwrap().insert(proxy);
+        }
+    }
+}
+
+/// The most recent project that opens, with a notice when a newer one could not, e.g. while an
+/// agent edits it. A new project is created only when none opens, so a busy project does not
+/// leave a new empty file behind on every start.
+fn initial_project() -> anyhow::Result<(OpenSession, Receiver<SessionEvent>, Option<String>)> {
+    let (opened, notice) = open_recent(store::list());
+    let (session, events) = match opened {
+        Some(opened) => opened,
+        None => {
+            let path = store::new_project_path();
+            store::create(&path, &Project::new("Untitled project"))?;
+            OpenSession::open(path)?
+        }
+    };
+    Ok((session, events, notice))
+}
+
+fn open_recent(recent: Vec<ProjectSummary>) -> (Option<(OpenSession, Receiver<SessionEvent>)>, Option<String>) {
+    let mut skipped: Option<(String, anyhow::Error)> = None;
+    for project in recent {
+        match dunce::canonicalize(&project.path).map_err(anyhow::Error::from).and_then(OpenSession::open) {
+            Ok(opened) => {
+                return (Some(opened), skipped.map(|(name, error)| skipped_notice(&name, Some(&project.name), &error)));
+            }
+            Err(error) => {
+                log::warn!("Cannot open {}: {error:#}", project.path);
+                skipped.get_or_insert((project.name, error));
+            }
+        }
+    }
+    (None, skipped.map(|(name, error)| skipped_notice(&name, None, &error)))
+}
+
+/// Why the most recent project did not open, which one did instead and what to do.
+fn skipped_notice(name: &str, instead: Option<&str>, error: &anyhow::Error) -> String {
+    let instead = instead
+        .map_or_else(|| "A new project opened instead.".to_string(), |other| format!("“{other}” opened instead."));
+    if error.to_string() == store::BUSY {
+        format!(
+            "“{name}” is open in another Nuzky window or an AI agent is editing it, so {}. Close it there, then open it from Projects.",
+            lowercase_first(&instead).trim_end_matches('.')
+        )
+    } else {
+        format!("“{name}” could not be opened ({error:#}). {instead}")
+    }
+}
+
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_lowercase().chain(chars).collect())
+}
+
+pub fn run() {
+    diagnostics::init();
+    let (builder, context) = (tauri::Builder::default(), tauri::generate_context!());
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    let (builder, context) = test_bridge::prepare(builder, context);
+    #[cfg(all(windows, debug_assertions))]
+    let mut context = context;
+    // Edge WebDriver opens the webview's debugging port through this variable, which the arguments wry always
+    // sets would otherwise override; these are wry's own, with the variable's added. Only for the UI flows, whose
+    // pixels are the page's at any display scale, as under gamescope on Linux and test_bridge.rs on macOS.
+    #[cfg(all(windows, debug_assertions))]
+    if let Ok(added) = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+        for window in &mut context.config_mut().app.windows {
+            window.additional_browser_args = Some(format!(
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required \
+                 --force-device-scale-factor=1 {added}"
+            ));
+        }
+    }
+    builder
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates::Updates::default())
+        .setup(|app| {
+            // GTK has set the process's locale from the system, so on a Czech or German system C code reads numbers
+            // with a decimal comma. ONNX Runtime read its operators' default values that way when the first model
+            // loaded, and the person model then saw nobody (clip backgrounds, cover framing). Numbers stay C; the
+            // interface formats its own in the webview, and native file dialogs show sizes with a point.
+            #[cfg(target_os = "linux")]
+            // SAFETY: setlocale is not thread-safe. This runs before the app starts any thread of its own, so only
+            // threads GTK and WebKit started while making the window could race it.
+            unsafe {
+                libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+            }
+            // The app is dark only (tauri.conf.json). tao asks GTK for the dark look at creation only when the desktop
+            // says dark, so on a light desktop a GTK title bar would be light over the app.
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_theme(Some(tauri::Theme::Dark))?;
+            }
+            let handle = app.handle().clone();
+            nuzky_mcp::transcript::ask_for_model_with(move |cancel, progress| {
+                model_question::ask_speech(&handle, cancel, progress)
+            });
+            let handle = app.handle().clone();
+            nuzky_mcp::vision_models::ask_for_models_with(move |needed, cancel, progress| {
+                model_question::ask_vision(&handle, needed, cancel, progress)
+            });
+            let server = Arc::new(PreviewServer::start()?);
+            let (session, events, startup_notice) = initial_project()?;
+            let project = session.host.session.state()?.project;
+            let cache_dir = store::cache_dir();
+            youtube_videos::forget(&cache_dir);
+            let engine =
+                Engine::start(app.handle().clone(), server.clone(), Arc::new(project.clone()), cache_dir.clone());
+            let state = AppState {
+                app: app.handle().clone(),
+                session: Mutex::new(session),
+                engine,
+                preview_url: server.url.clone(),
+                cache_dir,
+                jobs: Mutex::new(HashMap::new()),
+                audio_failed: Mutex::new(Default::default()),
+                matte_failed: Mutex::new(Default::default()),
+                proxy_skipped: Mutex::new(Default::default()),
+                close_failed: AtomicBool::new(false),
+                quit_confirmed: AtomicBool::new(false),
+                editor_shown: AtomicBool::new(false),
+                thumbs: Mutex::new(HashMap::new()),
+                filmstrips: Mutex::new(HashMap::new()),
+                preview_locks: Mutex::new(HashMap::new()),
+                bounds_text: Mutex::new(None),
+                covers: Mutex::default(),
+                fonts: OnceLock::new(),
+                startup_notice,
+                library: Arc::default(),
+                sounds: Default::default(),
+                beat_cuts: Default::default(),
+                youtube: Default::default(),
+                plugin_preview: Mutex::default(),
+                gallery: Default::default(),
+                timeline_lessons: Mutex::new(None),
+            };
+            // Jobs look the state up from their threads, so it must be managed first.
+            app.manage(state);
+            app.manage(agent_panel::AgentPanel::default());
+            app.state::<AppState>().session.lock().unwrap().start_pump(app.handle().clone(), events);
+            jobs::prepare_media(&app.state::<AppState>(), &project);
+            style::watch(app.handle().clone());
+            plugins::watch(app.handle().clone());
+            app.emit("ready", ()).ok();
+            #[cfg(target_os = "macos")]
+            if let Err(error) = file_dialogs::watch(app) {
+                log::warn!("Not watching file dialogs: {error:#}");
+            }
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            test_bridge::start(app)?;
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            viral::viral_lab,
+            caption_styles::caption_styles,
+            caption_styles::save_caption_style,
+            caption_styles::rename_caption_style,
+            caption_styles::delete_caption_style,
+            boot,
+            maximize_window,
+            set_ui_context,
+            stickers::sticker_catalog,
+            stickers::sticker_search,
+            stickers::sticker_thumbs,
+            stickers::sticker_add,
+            sounds::sound_library,
+            sounds::sound_downloaded,
+            sounds::sound_search,
+            sounds::sound_link,
+            sounds::install_ytdlp,
+            sounds::ytdlp_downloaded,
+            sounds::confirm_youtube_rights,
+            sounds::sound_preview,
+            sounds::sound_stop,
+            sounds::sound_cancel,
+            sounds::sound_add,
+            youtube_videos::youtube_video_link,
+            youtube_videos::youtube_video_fetch,
+            youtube_videos::youtube_video_cancel,
+            youtube_videos::youtube_video_add,
+            youtube_videos::youtube_video_stop_add,
+            youtube_videos::youtube_preview_close,
+            youtube_videos::youtube_preview_play,
+            youtube_videos::youtube_preview_error,
+            youtube_videos::youtube_preview_pause,
+            youtube_videos::youtube_preview_seek,
+            youtube_videos::youtube_preview_resize,
+            youtube_videos::youtube_filmstrip,
+            sounds::sound_credits,
+            sounds::sound_settings,
+            sounds::set_sound_settings,
+            sounds::open_sound_page,
+            resolve_recovery,
+            stop_run,
+            apply_edit,
+            apply_edits,
+            undo,
+            redo,
+            peek_history,
+            list_versions,
+            restore_version,
+            import_media,
+            thumbnail,
+            waveform,
+            match_gain,
+            play,
+            pause,
+            seek,
+            set_preview_box,
+            set_preview_muted,
+            list_projects,
+            list_fonts,
+            set_editor_shown,
+            new_project,
+            new_project_from_media,
+            sample::open_sample,
+            sample::sample_run,
+            open_capcut_draft,
+            open_project,
+            library::library,
+            library::project_poster,
+            library::search_said,
+            library::rename_project,
+            library::duplicate_project,
+            library::trash_projects,
+            library::restore_projects,
+            library::create_collection,
+            library::rename_collection,
+            library::delete_collection,
+            library::restore_collection,
+            library::set_collection,
+            start_export,
+            recap::recap_info,
+            recap::start_recap,
+            filmstrip,
+            layer_bounds,
+            cancel_job,
+            jobs::start_captions,
+            jobs::start_reframe,
+            jobs::speech_models,
+            jobs::speech_setup,
+            jobs::start_speech_setup,
+            model_question::answer_model_question,
+            jobs::vision_models,
+            jobs::start_vision_models,
+            mattes_missing,
+            jobs::start_transcript,
+            cover::cover_view,
+            cover::cover_close,
+            cover::start_cover_pick,
+            cover::start_cover_mask,
+            cover::start_cover_export,
+            transcripts::transcript_view,
+            transcripts::cut_words,
+            transcripts::remove_pauses,
+            transcripts::remove_retakes,
+            zooms::suggest_zooms,
+            zooms::apply_zooms,
+            beats::find_beats,
+            beats::beat_plans,
+            beats::cut_to_beat,
+            agent_connections,
+            agent_status,
+            verify_agent,
+            connect_agent,
+            agent_setup,
+            agent_access,
+            set_agent_access,
+            agent_panel::agent_list,
+            agent_panel::agent_send,
+            agent_panel::agent_chats,
+            agent_panel::agent_chat_open,
+            agent_panel::agent_chat_save,
+            agent_panel::agent_stop,
+            agent_panel::agent_steer,
+            agent_panel::agent_jobs,
+            attachments::agent_attach_file,
+            attachments::agent_attach_pasted,
+            transcripts::correct_words,
+            reels::reel_bounds,
+            reels::start_make_reels,
+            plugins::list_plugins,
+            plugins::effect_issues,
+            plugins::preview_plugin,
+            plugins::cancel_plugin_preview,
+            plugins::run_plugin,
+            plugins::remove_plugin,
+            plugins::show_plugin_folder,
+            plugins::gallery_plugins,
+            plugins::install_gallery_plugin,
+            plugins::cancel_gallery_install,
+            style::style_view,
+            style::style_act,
+            style::start_style_learning,
+            style::style_read_timelines,
+            style::style_capcut_drafts,
+            style::capcut_draft_cover,
+            style::start_timeline_learning,
+            style::style_use_learned,
+            updates::check_for_update,
+            updates::open_release_page,
+            updates::download_update,
+            updates::restart_to_update,
+            updates::cancel_update,
+            updates::open_feedback,
+            diagnostics::diagnostics,
+            diagnostics::open_logs,
+            diagnostics::report_bug,
+            diagnostics::show_bug_report,
+            diagnostics::log_ui_error,
+            chatgpt::chatgpt_status,
+            chatgpt::chatgpt_sign_in,
+            chatgpt::chatgpt_cancel_sign_in,
+            chatgpt::chatgpt_sign_out,
+            agent_panel::agent_models,
+        ])
+        .build(context)
+        .expect("error while building Nuzky")
+        .run(|app, event| match event {
+            tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } => {
+                // Quitting would cut short the rewriting of the app; it restarts in a moment.
+                if updates::installing(app) {
+                    api.prevent_close();
+                    app.emit("close-while-installing", ()).ok();
+                    return;
+                }
+                let state = app.state::<AppState>();
+                // Cleared here, so a second close quits even if the page never went home.
+                if state.editor_shown.swap(false, Ordering::AcqRel) {
+                    api.prevent_close();
+                    app.emit("close-to-home", ()).ok();
+                    return;
+                }
+                if !state.quit_confirmed.load(Ordering::Acquire)
+                    && let Some(question) = state.running_work()
+                {
+                    api.prevent_close();
+                    confirm_quit(app, &label, question);
+                    return;
+                }
+                let saved = state.session.lock().unwrap().host.session.disconnect();
+                // A second close after a failed save quits anyway; the user has been told what is lost.
+                if let Err(error) = saved
+                    && !state.close_failed.swap(true, Ordering::AcqRel)
+                {
+                    api.prevent_close();
+                    app.emit("close-save-failed", format!("{error:#}")).ok();
+                    return;
+                }
+                // Projects waiting for the Trash go now. One that someone opened meanwhile stays, and
+                // the window stays open to say so; nothing is left waiting, so the next close quits.
+                let failed = state.library.flush_trash();
+                if !failed.is_empty() {
+                    api.prevent_close();
+                    for message in failed {
+                        app.emit("trash-failed", message).ok();
+                    }
+                }
+            }
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            tauri::RunEvent::Ready => {
+                if let Err(error) = test_bridge::ready(app) {
+                    log::error!("UI flow bridge: {error:#}");
+                }
+            }
+            tauri::RunEvent::Exit => {
+                // The panel's agent runs in its own process group, so it would outlive the app.
+                app.state::<agent_panel::AgentPanel>().stop();
+                app.state::<AppState>().quit();
+                diagnostics::quit();
+                #[cfg(target_os = "linux")]
+                updates::start_again(app);
+            }
+            _ => {}
+        });
+}
+
+/// How long quitting waits for cancelled jobs, so exports can remove their unfinished files.
+const QUIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl AppState {
+    /// Running work that closing the window would cancel. Preparing audio, a preview proxy or a person
+    /// outline is not asked about: it starts again with the project.
+    fn running_work(&self) -> Option<&'static str> {
+        quit_question(&self.running_kinds())
+    }
+
+    /// The kinds of the app's jobs and the agents' jobs that run.
+    fn running_kinds(&self) -> Vec<String> {
+        let mut kinds: Vec<String> =
+            self.jobs.lock().unwrap().keys().map(|id| id.split(':').next().unwrap_or(id).to_owned()).collect();
+        let host = self.session.lock().unwrap().host.clone();
+        kinds.extend(host.jobs.running().into_iter().map(String::from));
+        kinds
+    }
+
+    /// Quitting stops agents, cancels every job, gives exports a moment to remove their
+    /// unfinished files, then saves and releases the project.
+    fn quit(&self) {
+        let host = {
+            let mut current = self.session.lock().unwrap();
+            current.stopped.store(true, Ordering::Release);
+            current.close_ipc();
+            current.host.clone()
+        };
+        if !drain(&self.jobs, &host, QUIT_WAIT) {
+            log::warn!("Quitting before every cancelled job stopped");
+        }
+        if let Err(error) = host.session.disconnect() {
+            log::error!("Cannot save project on exit: {error:#}");
+        }
+        for message in self.library.flush_trash() {
+            log::error!("{message}");
+        }
+    }
+}
+
+fn quit_question(kinds: &[String]) -> Option<&'static str> {
+    if kinds.iter().any(|kind| kind == "export" || kind == "cover-export") {
+        Some("An export is still running. Quitting cancels it and removes the unfinished file.")
+    } else if kinds.iter().any(|kind| !matches!(kind.as_str(), "audio" | "proxy" | "matte")) {
+        Some("Speech recognition or analysis is still running. Quitting cancels it.")
+    } else {
+        None
+    }
+}
+
+fn confirm_quit(app: &AppHandle, label: &str, question: &'static str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let window = app.get_webview_window(label);
+    let mut dialog = app
+        .dialog()
+        .message(question)
+        .title("Quit Nuzky?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom("Quit".into(), "Keep working".into()));
+    if let Some(window) = &window {
+        dialog = dialog.parent(window);
+    }
+    let app = app.clone();
+    dialog.show(move |quit| {
+        if quit {
+            app.state::<AppState>().quit_confirmed.store(true, Ordering::Release);
+            if let Some(window) = window {
+                window.close().ok();
+            }
+        }
+    });
+}
+
+/// Cancels desktop and agent jobs and waits until they end, or until the timeout.
+fn drain(jobs: &Mutex<HashMap<String, Arc<AtomicBool>>>, host: &Host, timeout: std::time::Duration) -> bool {
+    host.jobs.begin_shutdown();
+    for flag in jobs.lock().unwrap().values() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if jobs.lock().unwrap().is_empty() && host.jobs.running().is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A spawned child shares this process's open files, project locks included, until it execs.
+/// Tests that spawn children and tests that expect a released lock to be free take turns.
+#[cfg(test)]
+static CHILD_SPAWN: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod ipc_lifecycle_tests {
+    #[test]
+    fn snapshot_canvas_exposes_safe_area_without_changing_saved_project() {
+        #[derive(serde::Serialize)]
+        struct View<'a> {
+            #[serde(serialize_with = "super::snapshot_project")]
+            project: &'a nuzky_engine::Project,
+        }
+        let mut project = nuzky_engine::Project::new("test");
+        project.canvas.width = 1080;
+        project.canvas.height = 1920;
+        let snapshot = serde_json::to_value(View { project: &project }).unwrap();
+        assert_eq!(
+            snapshot["project"]["canvas"]["safeArea"],
+            serde_json::json!({"left":60.0,"top":250.0,"right":900.0,"bottom":1420.0})
+        );
+        assert!(serde_json::to_value(&project).unwrap()["canvas"].get("safeArea").is_none());
+        project.canvas.height = 1080;
+        assert!(serde_json::to_value(View { project: &project }).unwrap()["project"]["canvas"]["safeArea"].is_null());
+        let limits = serde_json::to_value(nuzky_engine::edit::LIMITS).unwrap();
+        assert_eq!(limits["maxTransitionUs"], 2_000_000);
+        assert_eq!(limits["maxSpeed"], 10.0);
+    }
+
+    #[test]
+    fn command_error_preserves_anyhow_causes() {
+        let error = anyhow::anyhow!("root cause").context("operation failed");
+        assert_eq!(super::err(error), "operation failed: root cause");
+    }
+
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn refused_switch_restores_ipc_after_save_failure() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("nuzky-save-failure-{}", new_id()));
+        let path = dir.join("project.nuzky");
+        store::create(&path, &Project::new("still open")).unwrap();
+        let (mut current, _) = OpenSession::open(path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(current.prepare_switch().unwrap_err().to_string().contains("SAVE_FAILED"));
+        assert!(current.listener.is_some());
+        let remote = nuzky_mcp::ipc::Remote::connect(&path, false, false).unwrap().unwrap();
+        let result = remote.call("get_state".into(), serde_json::json!({})).unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.unwrap()["name"], "still open");
+        drop(remote);
+        std::fs::remove_dir(&path).unwrap();
+        current.host.session.disconnect().unwrap();
+        drop(current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn squatted_agent_endpoint_still_opens_the_project() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("nuzky-squatted-{}", new_id()));
+        let path = dir.join("project.nuzky");
+        store::create(&path, &Project::new("no bridge")).unwrap();
+        let socket = nuzky_mcp::ipc::socket_path(&path).unwrap();
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(socket.parent().unwrap()).unwrap();
+        std::fs::create_dir(&socket).unwrap();
+        let opened = OpenSession::open(path.clone());
+        std::fs::remove_dir(&socket).unwrap();
+        let (current, _) = opened.unwrap();
+        assert!(current.listener.is_none());
+        let snapshot = current.snapshot(Vec::new()).unwrap();
+        assert_eq!(snapshot.project.name, "no bridge");
+        assert!(snapshot.agent_bridge_error.unwrap().starts_with("IPC_UNAVAILABLE"));
+        current
+            .host
+            .session
+            .edit(vec![EditCmd::RenameProject { name: "edited".into() }], None, Expect::default())
+            .unwrap();
+        drop(current);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn busy_recent_project_opens_the_next_one_with_a_notice() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("nuzky-busy-{}", new_id()));
+        let (older, newer) = (dir.join("older.nuzky"), dir.join("newer.nuzky"));
+        store::create(&older, &Project::new("Older")).unwrap();
+        store::create(&newer, &Project::new("Newer")).unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&older).unwrap().set_modified(an_hour_ago).unwrap();
+        let agent = nuzky_session::ProjectSession::open(&newer, nuzky_session::Mode::Write, None).unwrap();
+        let (opened, notice) = open_recent(store::list_in(&dir));
+        let (current, _) = opened.unwrap();
+        assert_eq!(current.snapshot(Vec::new()).unwrap().project.name, "Older");
+        let notice = notice.unwrap();
+        assert_eq!(
+            notice,
+            "“Newer” is open in another Nuzky window or an AI agent is editing it, so “Older” opened instead. Close it there, then open it from Projects."
+        );
+        let (opened, notice) = open_recent(store::list_in(&dir));
+        assert!(opened.is_none() && notice.is_some());
+        assert_eq!(store::list_in(&dir).len(), 2, "no new project is created while projects are busy");
+        drop((current, agent));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_project_from_media_takes_the_format_of_the_first_picture() {
+        assert_eq!(canvas_for(1080, 1920), (1080, 1920));
+        assert_eq!(canvas_for(720, 1280), (1080, 1920));
+        assert_eq!(canvas_for(3840, 2160), (1920, 1080));
+        assert_eq!(canvas_for(1440, 1800), (1080, 1350));
+        // No common format of that shape: its own, 1080 on the short side.
+        assert_eq!(canvas_for(4032, 3024), (1440, 1080));
+        assert_eq!(canvas_for(1000, 21), (7680, 1080));
+    }
+
+    #[test]
+    fn quitting_asks_about_real_work_and_waits_for_cancelled_jobs_to_clean_up() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let kinds = |list: &[&str]| list.iter().map(|kind| kind.to_string()).collect::<Vec<_>>();
+        assert_eq!(quit_question(&kinds(&["audio", "proxy"])), None);
+        assert!(quit_question(&kinds(&["audio", "captions"])).unwrap().starts_with("Speech recognition"));
+        assert!(quit_question(&kinds(&["transcription", "export"])).unwrap().starts_with("An export"));
+        let dir = std::env::temp_dir().join(format!("nuzky-quit-{}", new_id()));
+        let path = dir.join("project.nuzky");
+        store::create(&path, &Project::new("quit")).unwrap();
+        let (current, _) = OpenSession::open(path).unwrap();
+        let unfinished = dir.join(".nuzky-part-agent.mp4");
+        std::fs::write(&unfinished, b"partial").unwrap();
+        let stamp = current.host.session.stamp();
+        let file = unfinished.clone();
+        current
+            .host
+            .start_job("agent", None, "export", stamp, move |cancel, _| {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                std::fs::remove_file(&file).unwrap();
+                anyhow::bail!("CANCELLED: job cancelled")
+            })
+            .unwrap();
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let workers = ["export:desktop", "audio:clip"].map(|id| {
+            let flag = Arc::new(AtomicBool::new(false));
+            jobs.lock().unwrap().insert(id.to_string(), flag.clone());
+            let desktop = jobs.clone();
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                desktop.lock().unwrap().remove(id);
+            })
+        });
+        assert!(drain(&jobs, &current.host, Duration::from_secs(5)));
+        assert!(!unfinished.exists(), "the agent export removed its unfinished file before quitting");
+        assert!(jobs.lock().unwrap().is_empty(), "audio preparation also stops and removes its partial cache");
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        drop(current);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_mutation_rejects_replaced_session_epoch() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("nuzky-epoch-{}", new_id()));
+        let old_path = dir.join("old.nuzky");
+        let next_path = dir.join("next.nuzky");
+        store::create(&old_path, &Project::new("old")).unwrap();
+        store::create(&next_path, &Project::new("next")).unwrap();
+        let (old, _) = OpenSession::open(old_path).unwrap();
+        let epoch = old.host.session.state().unwrap().stamp.session_epoch;
+        let session = Mutex::new(old);
+        assert!(lock_session(&session, Some(&epoch)).is_ok());
+        let (next, _) = OpenSession::open(next_path).unwrap();
+        *session.lock().unwrap() = next;
+        let image = dir.join("import.ppm");
+        std::fs::write(&image, b"P6\n2 2\n255\nabcdefghijkl").unwrap();
+        let asset = probe(&image, new_id()).unwrap();
+        let apply = || -> CmdResult<()> {
+            let current = lock_session(&session, Some(&epoch))?;
+            current
+                .host
+                .session
+                .edit(vec![EditCmd::AddAssets { assets: vec![asset] }], None, Expect::default())
+                .map_err(err)?;
+            Ok(())
+        };
+        assert_eq!(apply().unwrap_err(), "EPOCH_CHANGED: another project is open");
+        let current = lock_session(&session, None).unwrap();
+        assert!(current.host.session.state().unwrap().project.assets.is_empty());
+        let epoch = current.host.session.state().unwrap().stamp.session_epoch;
+        drop(current);
+        assert!(lock_session(&session, Some(&epoch)).is_ok());
+        drop(session);
+    }
+
+    #[test]
+    fn switching_with_slow_job_returns_promptly_and_retains_project_lock() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("nuzky-switch-{}", new_id()));
+        let old_path = dir.join("old.nuzky");
+        let next_path = dir.join("next.nuzky");
+        store::create(&old_path, &Project::new("old")).unwrap();
+        store::create(&next_path, &Project::new("next")).unwrap();
+        let (mut current, _) = OpenSession::open(old_path.clone()).unwrap();
+        let (next, _) = OpenSession::open(next_path).unwrap();
+        let (release, wait) = mpsc::channel();
+        let stamp = current.host.session.state().unwrap().stamp;
+        current
+            .host
+            .start_job("client", None, "test", stamp, move |_, _| {
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(serde_json::json!({}))
+            })
+            .unwrap();
+        let began = Instant::now();
+        current.prepare_switch().unwrap();
+        current = next;
+        let elapsed = began.elapsed();
+        let locked = nuzky_session::ProjectSession::open(&old_path, nuzky_session::Mode::Write, None).is_err();
+        let reopened = OpenSession::open(old_path.clone()).err().unwrap().to_string();
+        release.send(()).unwrap();
+        assert!(reopened.starts_with("Nuzky is still finishing background work"), "{reopened}");
+        assert!(elapsed < Duration::from_millis(300), "switch took {elapsed:?}");
+        assert!(locked, "old project lock must survive until work ends");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if nuzky_session::ProjectSession::open(&old_path, nuzky_session::Mode::Write, None).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(current);
+    }
+}

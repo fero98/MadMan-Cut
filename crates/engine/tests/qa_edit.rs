@@ -1,0 +1,291 @@
+mod qa_support;
+use nuzky_engine::{
+    edit::{CaptionSegment, EditCmd, Editor},
+    model::*,
+};
+use qa_support::*;
+fn asset(id: &str, duration: i64) -> Asset {
+    Asset {
+        id: id.into(),
+        name: id.into(),
+        path: String::new(),
+        kind: AssetKind::Video,
+        duration_us: duration,
+        width: 64,
+        height: 64,
+        fps: 30.0,
+        has_audio: true,
+        rotation: 0,
+        mirror: false,
+        credit: None,
+        part: None,
+    }
+}
+fn editor() -> Editor {
+    let mut p = Project::new("properties");
+    p.assets = vec![asset("a", 5_000_000), asset("b", 3_000_000)];
+    Editor::new(p)
+}
+fn update_speed(id: &str, speed: f32) -> EditCmd {
+    EditCmd::UpdateClip {
+        clip_id: id.into(),
+        transform: None,
+        volume: None,
+        text: None,
+        style: None,
+        speed: Some(speed),
+        keep_pitch: None,
+        adjust: None,
+        fade_in_us: None,
+        fade_out_us: None,
+        clean_voice: None,
+        dereverb: None,
+        normalize: None,
+        leveler: None,
+        shape: None,
+        duck_db: None,
+        background: None,
+    }
+}
+fn invariants(p: &Project) -> Result<(), String> {
+    for track in &p.tracks {
+        let mut end = 0;
+        for c in &track.clips {
+            if c.start_us < end || track.id == "main" && c.start_us != end {
+                return Err(format!("track {} overlap/gap: expected >= {end}, clip starts {}", track.id, c.start_us));
+            }
+            if c.duration_us <= 0 {
+                return Err("nonpositive duration".into());
+            }
+            end = c.end_us();
+            if let ClipContent::Media { asset_id, source_in_us, speed, .. } = &c.content {
+                let a = p.asset(asset_id).unwrap();
+                let source_end = *source_in_us as f64 + c.duration_us as f64 * *speed as f64;
+                if *source_in_us < 0 || a.kind != AssetKind::Image && source_end > a.duration_us as f64 + 2.0 {
+                    return Err(format!(
+                        "source range exceeds {}: in={source_in_us}, duration={}, speed={speed}, end={source_end}, limit={}",
+                        a.id, c.duration_us, a.duration_us
+                    ));
+                }
+            }
+        }
+    }
+    let json = serde_json::to_string(p).unwrap();
+    let back: Project = serde_json::from_str(&json).unwrap();
+    assert_eq!(p, &back);
+    Ok(())
+}
+#[test]
+fn seeded_edits_without_speed_preserve_invariants_and_history() {
+    seeded_sequences(false);
+}
+#[test]
+fn seeded_edit_sequences_preserve_invariants_and_history() {
+    seeded_sequences(true);
+}
+fn seeded_sequences(with_speed: bool) {
+    let mut failures = Vec::new();
+    for seed in [0x12345678, 0xCAFEBABE, 0xF00DFACE, 0xBADC0DE] {
+        let mut rng = Rng(seed);
+        let mut e = editor();
+        let mut history = Vec::new();
+        for step in 0..120 {
+            let clips: Vec<_> =
+                e.project.tracks.iter().flat_map(|t| t.clips.iter().map(|c| (t.id.clone(), c.clone()))).collect();
+            let cmd = if clips.is_empty() || rng.next().is_multiple_of(7) {
+                EditCmd::AddClip {
+                    asset_id: if rng.next().is_multiple_of(2) { "a" } else { "b" }.into(),
+                    start_us: None,
+                    track_id: None,
+                }
+            } else {
+                let (track, c) = &clips[rng.next() as usize % clips.len()];
+                match rng.next() % if with_speed { 6 } else { 5 } {
+                    0 => EditCmd::MoveClip {
+                        clip_id: c.id.clone(),
+                        track_id: if rng.next().is_multiple_of(2) { Some("main".into()) } else { None },
+                        start_us: (rng.next() % 10_000_000) as i64,
+                        new_track: None,
+                    },
+                    1 => EditCmd::TrimClip {
+                        clip_id: c.id.clone(),
+                        start_us: c.start_us,
+                        duration_us: 100_000 + (rng.next() % 6_000_000) as i64,
+                        source_in_us: Some((rng.next() % 5_000_000) as i64),
+                    },
+                    2 => EditCmd::SplitClip { clip_id: c.id.clone(), at_us: c.start_us + c.duration_us / 2 },
+                    3 => EditCmd::DuplicateClip { clip_id: c.id.clone() },
+                    4 => EditCmd::DeleteClips { clip_ids: vec![c.id.clone()] },
+                    _ => {
+                        let _ = track;
+                        update_speed(&c.id, [0.5, 1.0, 2.0, 4.0][rng.next() as usize % 4])
+                    }
+                }
+            };
+            let before = e.project.clone();
+            let desc = format!("{cmd:?}");
+            let result = e.apply(cmd, None);
+            history.push(desc);
+            if result.is_err() {
+                assert_eq!(e.project, before, "rejected command mutated project");
+                continue;
+            }
+            let after = e.project.clone();
+            if after != before {
+                assert!(e.undo());
+                assert_eq!(e.project, before);
+                assert!(e.redo());
+                assert_eq!(e.project, after);
+            }
+            if let Err(error) = invariants(&e.project) {
+                std::fs::write(dir("edit-traces").join(format!("seed-{seed:x}-{with_speed}.txt")), history.join("\n"))
+                    .unwrap();
+                failures.push(format!("seed={seed:#x} step={step}: {error}"));
+                break;
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+#[test]
+fn slowing_overlay_must_not_overlap_next_clip() {
+    let mut e = editor();
+    e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+    let id = e.project.tracks[0].clips[0].id.clone();
+    e.apply(EditCmd::MoveClip { clip_id: id.clone(), track_id: None, start_us: 0, new_track: None }, None).unwrap();
+    let track = e.project.tracks[1].id.clone();
+    e.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: Some(5_000_000), track_id: Some(track) }, None).unwrap();
+    let _ = e.apply(update_speed(&id, 0.5), None);
+    invariants(&e.project).unwrap();
+}
+#[test]
+fn fast_trim_stays_inside_source() {
+    let mut e = editor();
+    e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+    let id = e.project.tracks[0].clips[0].id.clone();
+    e.apply(update_speed(&id, 10.0), None).unwrap();
+    let _ = e.apply(
+        EditCmd::TrimClip { clip_id: id, start_us: 0, duration_us: 33_334, source_in_us: Some(4_966_666) },
+        None,
+    );
+    invariants(&e.project).unwrap();
+}
+#[test]
+fn a_whole_clip_changes_from_one_speed_to_another() {
+    let mut p = Project::new("speeds");
+    p.assets = vec![asset("a", 17_812_000)];
+    let mut e = Editor::new(p);
+    e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+    let id = e.project.tracks[0].clips[0].id.clone();
+    e.apply(update_speed(&id, 1.25), None).unwrap();
+    e.apply(update_speed(&id, 1.5), None).unwrap();
+    invariants(&e.project).unwrap();
+    // Half an hour at 1.97x lands a float error above the end of the file.
+    let mut p = Project::new("speeds");
+    p.assets = vec![asset("a", 1_829_517_000)];
+    let mut e = Editor::new(p);
+    e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+    let id = e.project.tracks[0].clips[0].id.clone();
+    e.apply(update_speed(&id, 1.97), None).unwrap();
+    invariants(&e.project).unwrap();
+}
+#[test]
+fn equal_start_captions_do_not_overlap() {
+    let mut e = editor();
+    let style = TextStyle {
+        font_family: None,
+        font_size: 40.0,
+        color: "#fff".into(),
+        bold: false,
+        stroke_width: 0.0,
+        stroke_color: "#000".into(),
+        background: None,
+        max_width: None,
+        highlight: None,
+        keywords: None,
+        shadow: None,
+        letter_case: Default::default(),
+        letter_spacing: 0.0,
+        line_spacing: 0.0,
+        align: TextAlign::Center,
+        box_radius: BOX_RADIUS,
+    };
+    let _ = e.apply(
+        EditCmd::AddCaptions {
+            segments: vec![
+                CaptionSegment { start_us: 0, end_us: 1_000_000, text: "first".into(), words: Vec::new() },
+                CaptionSegment { start_us: 0, end_us: 2_000_000, text: "second".into(), words: Vec::new() },
+            ],
+            style,
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        },
+        None,
+    );
+    invariants(&e.project).unwrap();
+}
+#[test]
+fn replacing_media_keeps_everything_but_the_source() {
+    let mut e = editor();
+    let mut image = asset("still", 0);
+    image.kind = AssetKind::Image;
+    image.has_audio = false;
+    let mut silent = asset("silent", 9_000_000);
+    silent.has_audio = false;
+    let mut music = asset("music", 9_000_000);
+    music.kind = AssetKind::Audio;
+    let mut chosen = asset("chosen", 20_000_000);
+    chosen.part = Some(Part { start_us: 12_000_000, end_us: 16_000_000 });
+    e.project.assets.extend([image, silent, music, chosen]);
+    e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+    let id = e.project.tracks[0].clips[0].id.clone();
+    e.apply(
+        EditCmd::TrimClip { clip_id: id.clone(), start_us: 0, duration_us: 4_000_000, source_in_us: Some(1_000_000) },
+        None,
+    )
+    .unwrap();
+    e.apply(update_speed(&id, 2.0), None).unwrap();
+    let mut styled = update_speed(&id, 2.0);
+    if let EditCmd::UpdateClip { speed, transform, clean_voice, normalize, .. } = &mut styled {
+        *speed = None;
+        *transform = Some(Transform { x: 0.2, y: -0.1, scale: 0.6, ..Transform::default() });
+        *clean_voice = Some(true);
+        *normalize = Some(true);
+    }
+    e.apply(styled, None).unwrap();
+    let before = e.project.tracks[0].clips[0].clone();
+    assert_eq!(before.duration_us, 2_000_000, "4 s at 2x play in 2 s");
+
+    let replace = |e: &mut Editor, asset: &str| {
+        e.apply(EditCmd::ReplaceClip { clip_id: id.clone(), asset_id: asset.into() }, None)
+    };
+    let project = e.project.clone();
+    let err = replace(&mut e, "b").map(|_| ()).unwrap_err().to_string();
+    assert!(err.starts_with("This media is 3.0 s and the clip needs 4.0 s at 2x."), "{err}");
+    assert_eq!(e.project, project, "too short media changes nothing");
+    let err = replace(&mut e, "music").map(|_| ()).unwrap_err().to_string();
+    assert!(err.starts_with("Sound can't go in a video clip"), "{err}");
+
+    replace(&mut e, "silent").unwrap();
+    let after = e.project.tracks[0].clips[0].clone();
+    let ClipContent::Media { asset_id, source_in_us, clean_voice, normalize, .. } = &after.content else { panic!() };
+    assert_eq!((asset_id.as_str(), *source_in_us, *clean_voice, *normalize), ("silent", 0, false, false));
+    let mut expected = before.clone();
+    if let ClipContent::Media { asset_id, source_in_us, clean_voice, normalize, .. } = &mut expected.content {
+        *asset_id = "silent".into();
+        *source_in_us = 0;
+        *clean_voice = false;
+        *normalize = false;
+    }
+    assert_eq!(after, expected, "only the media and its sound settings change");
+    assert!(e.undo());
+    assert_eq!(e.project.tracks[0].clips[0], before);
+
+    replace(&mut e, "chosen").unwrap();
+    let ClipContent::Media { source_in_us, .. } = e.project.tracks[0].clips[0].content else { panic!() };
+    assert_eq!(source_in_us, 12_000_000, "starts at the part the user chose");
+    replace(&mut e, "still").unwrap();
+    assert_eq!(e.project.tracks[0].clips[0].duration_us, 2_000_000);
+    invariants(&e.project).unwrap();
+}

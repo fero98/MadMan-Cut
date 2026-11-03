@@ -1,0 +1,1190 @@
+//! The home screen's library: every project file with what stops it from opening, collections,
+//! posters, the Trash with Undo, and search through what was said in the projects.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
+
+use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
+use nuzky_engine::Project;
+use nuzky_engine::edit::{EditCmd, new_id};
+use nuzky_engine::media::VideoDecoder;
+use nuzky_engine::model::{Thumbnail, ThumbnailFormat};
+use nuzky_engine::render::{Renderer, Wait};
+use nuzky_engine::thumbnail::ImageKind;
+use nuzky_session::Expect;
+use nuzky_session::hash::{FNV_OFFSET, hash_bytes};
+use nuzky_session::transcripts::TranscriptStore;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State};
+use unicode_normalization::UnicodeNormalization;
+
+use crate::store::sidecar;
+use crate::{AppState, CmdResult, err, store};
+
+/// Name of the projects that New project and the first start create.
+pub const UNTITLED: &str = "Untitled project";
+/// Undo in the toast brings a project back until it really goes to the Trash.
+const TRASH_DELAY: Duration = Duration::from_secs(30);
+/// Longest side of a poster in pixels: sharp on a 2× screen at the size of a card.
+const POSTER_SIDE: u32 = 360;
+/// A new value makes every cached poster render again.
+const POSTER_VERSION: u8 = 6;
+const MAX_HITS_PER_PROJECT: usize = 3;
+const MAX_HITS: usize = 30;
+const CONTEXT_BEFORE: usize = 5;
+const CONTEXT_AFTER: usize = 6;
+const MAX_COLLECTION_NAME: usize = 60;
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+}
+
+/// `library.json`: what the project files themselves do not hold.
+#[derive(Serialize, Deserialize, Default)]
+struct Index {
+    #[serde(default)]
+    collections: Vec<Collection>,
+    /// The collection of each project, by project path.
+    #[serde(default)]
+    members: BTreeMap<String, String>,
+    /// Projects opened from outside the projects folder.
+    #[serde(default)]
+    external: Vec<String>,
+}
+
+/// A project on the home screen.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LibraryProject"))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Entry {
+    path: String,
+    name: String,
+    modified_ms: u64,
+    duration_us: i64,
+    /// Canvas size; 0 for a project that cannot be read.
+    width: u32,
+    height: u32,
+    /// The cover the card shows instead of a frame, in that cover's shape.
+    cover: Option<ThumbnailFormat>,
+    /// The poster cache key: a new one draws its picture again.
+    poster: String,
+    collection: Option<String>,
+    /// `broken`: the file cannot be read. `busy`: another Nuzky window or an agent has it open.
+    /// `missing`: some of its media files are gone. `empty`: nothing on the timeline.
+    #[cfg_attr(test, ts(type = r#""broken" | "busy" | "missing" | "empty" | null"#))]
+    state: Option<&'static str>,
+    missing: usize,
+    /// Why a broken project cannot be read.
+    error: Option<String>,
+    /// The folder of the CapCut draft it was opened from.
+    imported_from: Option<String>,
+    /// When that draft was last saved before it was opened, in milliseconds since 1970.
+    draft_modified_ms: Option<i64>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "Library"))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Listing {
+    projects: Vec<Entry>,
+    collections: Vec<Collection>,
+    /// Set when the collections could not be read.
+    notice: Option<String>,
+}
+
+/// What Undo needs to bring a deleted collection back.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedCollection {
+    collection: Collection,
+    /// Where it was in the list.
+    position: usize,
+    paths: Vec<String>,
+}
+
+/// Where words of a search were said: the project and its timeline time.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaidHit {
+    path: String,
+    start_us: i64,
+    before: String,
+    text: String,
+    after: String,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Said {
+    hits: Vec<SaidHit>,
+    /// Projects with speech that is not transcribed, so only their names were searched.
+    untranscribed: Vec<String>,
+    /// How many projects have a transcript to search.
+    transcribed: usize,
+}
+
+struct SpokenWord {
+    folded: String,
+    text: String,
+    start_us: i64,
+}
+
+/// The words on a project's timeline, as of its file and the transcripts at `stamp`.
+struct Spoken {
+    stamp: (u128, u64, u128),
+    words: Vec<SpokenWord>,
+    transcribed: bool,
+    untranscribed: bool,
+}
+
+struct PosterRequest {
+    project: Project,
+    /// The cover to draw, when it can be drawn; otherwise the frame.
+    cover: Option<ThumbnailFormat>,
+    reply: Sender<Option<Poster>>,
+}
+
+struct Poster {
+    png: Vec<u8>,
+    /// For a cover drawn before what it needs is made; none for a finished picture.
+    waits_for: Option<Waits>,
+}
+
+/// What a cover was drawn without: the chunks of person outlines the project's clip backgrounds still waited for, and
+/// when the person's mask was not made, the file it will be in with that file's state then.
+struct Waits {
+    mattes: usize,
+    mask: Option<(PathBuf, Option<u128>)>,
+}
+
+impl Waits {
+    fn unchanged(&self, project: &Project, cover: &Thumbnail) -> bool {
+        self.mattes == crate::cover::waiting_mattes(project, cover, &store::cache_dir())
+            && self.mask.as_ref().is_none_or(|(file, seen)| file_state(file) == *seen)
+    }
+}
+
+/// A cover drawn before what it needs is made. It is shown again without drawing while the poster it stands for
+/// (`file`, the poster cache key) and what it waits for are the same.
+struct Draft {
+    file: String,
+    png: Vec<u8>,
+    waits: Waits,
+}
+
+/// A project's picture on its card.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPoster {
+    /// A PNG data URL.
+    url: String,
+    width: u32,
+    height: u32,
+    /// A cover drawn before the person is found in its frame or cut out of it. It is not kept on disk, and the home
+    /// screen asks for it again when it lists the projects; it is the same picture until the person's outlines or mask
+    /// are made.
+    provisional: bool,
+}
+
+#[derive(Default)]
+pub struct Library {
+    /// Serialises reading and writing `library.json`.
+    index: Mutex<()>,
+    /// Projects moved to the Trash and hidden from the list: path, and which move it was, so the timer
+    /// of a move that was undone never takes a later one. `None` while the file is on its way to the
+    /// Trash, when Undo can no longer bring it back and a list must still not show it.
+    pending_trash: Mutex<HashMap<String, Option<u64>>>,
+    trash_moves: AtomicU64,
+    spoken: Mutex<HashMap<String, Arc<Spoken>>>,
+    transcripts: OnceLock<Option<TranscriptStore>>,
+    posters: Mutex<Option<Sender<PosterRequest>>>,
+    /// Poster cache keys whose rendering failed this session; they are not tried again.
+    failed_posters: Mutex<HashSet<String>>,
+    /// The draft cover each project's card shows, by project path.
+    drafts: Mutex<HashMap<String, Draft>>,
+}
+
+/// The path a project is known by: canonical where it exists, so every list and the editor agree.
+pub fn key(path: &Path) -> String {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
+}
+
+fn index_path() -> PathBuf {
+    store::data_dir().join("library.json")
+}
+
+fn modified(meta: &std::fs::Metadata) -> u128 {
+    meta.modified().ok().and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
+}
+
+/// Lowercase without accents and punctuation, so "Západ," finds "zapad".
+pub fn fold(text: &str) -> String {
+    text.nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Nothing to lose: the name it was created with, no media, no clips and no corrections.
+fn pristine(project: &Project) -> bool {
+    project.name == UNTITLED
+        && project.assets.is_empty()
+        && project.word_corrections.is_empty()
+        && project.tracks.iter().all(|t| t.clips.is_empty())
+}
+
+fn busy(path: &Path) -> bool {
+    nuzky_session::lock_project(path, false).is_err_and(|e| e.to_string().starts_with("PROJECT_BUSY"))
+}
+
+impl Library {
+    /// The index, or an empty one with a notice when it is not valid; that file is kept aside. A file
+    /// that cannot be read is an error, so that nothing writes over the collections in it.
+    fn read_index(&self) -> Result<(Index, Option<String>)> {
+        let path = index_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Index::default(), None)),
+            Err(error) => {
+                log::error!("Cannot read {}: {error}", path.display());
+                bail!("Your collections could not be read ({error}).");
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(index) => Ok((index, None)),
+            Err(error) => {
+                let aside = sidecar(&path, &format!(".unreadable-{}", new_id()));
+                log::error!("{} is not valid ({error}); keeping it as {}", path.display(), aside.display());
+                std::fs::rename(&path, &aside).context("Your collections could not be read")?;
+                Ok((
+                    Index::default(),
+                    Some(format!(
+                        "Your collections could not be read, so projects show without them. The old file was kept as {}.",
+                        aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    )),
+                ))
+            }
+        }
+    }
+
+    /// The index for showing: without collections, and saying why, when it cannot be read.
+    fn shown_index(&self) -> (Index, Option<String>) {
+        let _guard = self.index.lock().unwrap();
+        self.read_index().unwrap_or_else(|error| (Index::default(), Some(format!("{error:#}"))))
+    }
+
+    fn update<T>(&self, change: impl FnOnce(&mut Index) -> Result<T>) -> Result<T> {
+        let _guard = self.index.lock().unwrap();
+        let (mut index, _) = self.read_index()?;
+        let value = change(&mut index)?;
+        std::fs::create_dir_all(store::data_dir()).context("Creating the Nuzky data folder")?;
+        nuzky_session::write_json_atomic(&index_path(), &index).context("Saving your collections")?;
+        Ok(value)
+    }
+
+    /// Every project file in the projects folder and every project opened from elsewhere, newest first.
+    fn paths(&self, index: &Index) -> Vec<PathBuf> {
+        let dir = store::projects_dir();
+        let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+        let mut seen = HashSet::new();
+        let pending: HashSet<String> = self.pending_trash.lock().unwrap().keys().cloned().collect();
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == store::EXTENSION))
+            .chain(index.external.iter().map(PathBuf::from).filter(|p| p.is_file()))
+            .filter(|p| seen.insert(key(p)) && !pending.contains(&key(p)))
+            .collect()
+    }
+
+    pub fn list(&self, current: &str) -> Listing {
+        let (index, notice) = self.shown_index();
+        let projects_dir = key(&store::projects_dir());
+        let mut projects = Vec::new();
+        for path in self.paths(&index) {
+            let path_key = key(&path);
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let modified_ms = (modified(&meta) / 1_000_000) as u64;
+            let collection =
+                index.members.get(&path_key).filter(|c| index.collections.iter().any(|x| &x.id == *c)).cloned();
+            let project = store::load(&path).and_then(|p| nuzky_session::validate(&p).map(|()| p));
+            let project = match project {
+                Ok(project) => project,
+                Err(error) => {
+                    projects.push(Entry {
+                        path: path_key,
+                        name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        modified_ms,
+                        duration_us: 0,
+                        width: 0,
+                        height: 0,
+                        cover: None,
+                        poster: String::new(),
+                        collection,
+                        state: Some("broken"),
+                        missing: 0,
+                        error: Some(format!("{error:#}")),
+                        imported_from: None,
+                        draft_modified_ms: None,
+                    });
+                    continue;
+                }
+            };
+            // Projects left empty by New project or a first start go away once something else is open.
+            if path_key != current
+                && pristine(&project)
+                && path_key.starts_with(&projects_dir)
+                && self.remove_pristine(&path)
+            {
+                continue;
+            }
+            let missing = project.assets.iter().filter(|a| !Path::new(&a.path).exists()).count();
+            let duration_us = project.duration_us();
+            let state = if path_key != current && busy(&path) {
+                Some("busy")
+            } else if missing > 0 {
+                Some("missing")
+            } else if duration_us == 0 {
+                Some("empty")
+            } else {
+                None
+            };
+            let shown = shown_cover(&project).filter(|c| duration_us > 0 && drawable(&project, c));
+            let (cover, poster) = (shown.map(|c| c.format), poster_stamp(&meta, &project, shown));
+            projects.push(Entry {
+                path: path_key,
+                name: project.name,
+                modified_ms,
+                duration_us,
+                width: project.canvas.width,
+                height: project.canvas.height,
+                cover,
+                poster,
+                collection,
+                state,
+                missing,
+                error: None,
+                draft_modified_ms: project.imported.as_ref().map(|i| i.modified_ms),
+                imported_from: project.imported.map(|i| i.path),
+            });
+        }
+        projects.sort_by_key(|p| std::cmp::Reverse(p.modified_ms));
+        Listing { projects, collections: index.collections, notice }
+    }
+
+    /// Deletes an empty untitled project nobody has open; there is nothing in it to lose.
+    fn remove_pristine(&self, path: &Path) -> bool {
+        let Ok(lock) = nuzky_session::lock_project(path, true) else { return false };
+        // Read again under the lock: it may have changed since it was listed.
+        // Its versions may hold what it had before it was emptied.
+        let Some(project) = store::load(path).ok().filter(pristine) else { return false };
+        if sidecar(path, ".checkpoint.json").exists()
+            || nuzky_session::other_versions(path, &project)
+            || crate::agent_panel::chats_dir(path).exists()
+        {
+            return false;
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            log::warn!("Cannot remove empty project {}: {error}", path.display());
+            return false;
+        }
+        let _ = std::fs::remove_file(sidecar(path, nuzky_session::HISTORY_SUFFIX));
+        drop(lock);
+        let _ = std::fs::remove_file(sidecar(path, ".lock"));
+        true
+    }
+
+    /// Projects opened from elsewhere stay in the list.
+    pub fn remember(&self, path: &Path) {
+        let path_key = key(path);
+        if path_key.starts_with(&key(&store::projects_dir())) {
+            return;
+        }
+        let added = self.update(|index| {
+            if !index.external.contains(&path_key) {
+                index.external.push(path_key.clone());
+            }
+            Ok(())
+        });
+        if let Err(error) = added {
+            log::error!("Cannot remember {path_key}: {error:#}");
+        }
+    }
+
+    pub fn rename(&self, path: &Path, name: &str) -> Result<()> {
+        ensure!(!name.trim().is_empty(), "A project needs a name.");
+        let session = store::open(path, None)?;
+        session.edit(vec![EditCmd::RenameProject { name: name.into() }], None, Expect::default())?;
+        session.disconnect()
+    }
+
+    /// A copy next to the other projects, in the same collection. Returns its path.
+    pub fn duplicate(&self, path: &Path, open: Option<Project>) -> Result<String> {
+        let mut project = match open {
+            Some(project) => project,
+            None => {
+                let project = store::load(path)?;
+                nuzky_session::validate(&project)?;
+                project
+            }
+        };
+        project.name = format!("{} copy", project.name);
+        let target = store::new_project_path();
+        store::create(&target, &project)?;
+        let (from, to) = (key(path), key(&target));
+        self.update(|index| {
+            if let Some(collection) = index.members.get(&from).cloned() {
+                index.members.insert(to.clone(), collection);
+            }
+            Ok(())
+        })?;
+        Ok(to)
+    }
+
+    /// Reels made of `source` join its collection and show on the home screen wherever they were written.
+    pub fn remember_reels(&self, source: &Path, reels: &[nuzky_mcp::reels::MadeReel]) -> Result<()> {
+        self.update(|index| {
+            if let Some(collection) = index.members.get(&key(source)).cloned() {
+                for reel in reels {
+                    index.members.insert(key(&reel.path), collection.clone());
+                }
+            }
+            Ok(())
+        })?;
+        for reel in reels {
+            self.remember(&reel.path);
+        }
+        Ok(())
+    }
+
+    /// Hides the projects at once and moves them to the Trash after `TRASH_DELAY`, unless restored.
+    /// A move that fails then, for example because an agent opened the project meanwhile, is told
+    /// to the window with `trash-failed`, and the project shows again.
+    pub fn trash(self: &Arc<Self>, app: AppHandle, paths: Vec<String>, current: &str) -> Result<()> {
+        for path in &paths {
+            ensure!(path != current, "This project is open. Open another project first, then move it to the Trash.");
+            if busy(Path::new(path)) {
+                bail!(store::BUSY);
+            }
+        }
+        let move_id = self.trash_moves.fetch_add(1, Ordering::Relaxed);
+        self.pending_trash.lock().unwrap().extend(paths.iter().map(|p| (p.clone(), Some(move_id))));
+        let library = self.clone();
+        std::thread::Builder::new()
+            .name("nuzky-trash".into())
+            .spawn(move || {
+                std::thread::sleep(TRASH_DELAY);
+                for message in library.commit_trash(&paths, Some(move_id)) {
+                    app.emit("trash-failed", message).ok();
+                }
+            })
+            .context("Starting the Trash timer")?;
+        Ok(())
+    }
+
+    pub fn restore(&self, paths: &[String]) -> Result<()> {
+        let mut pending = self.pending_trash.lock().unwrap();
+        ensure!(
+            paths.iter().all(|p| pending.get(p).is_some_and(Option::is_some)),
+            "It is already in the Trash. Put it back from there, then open it with Open file."
+        );
+        for path in paths {
+            pending.remove(path);
+        }
+        Ok(())
+    }
+
+    /// When the app quits, nothing waits for Undo any more; returns what failed, in words.
+    pub fn flush_trash(&self) -> Vec<String> {
+        let pending: Vec<String> = self.pending_trash.lock().unwrap().keys().cloned().collect();
+        self.commit_trash(&pending, None)
+    }
+
+    /// Moves the projects still waiting from move `move_id` (any, with `None`); returns what failed, in words.
+    fn commit_trash(&self, paths: &[String], move_id: Option<u64>) -> Vec<String> {
+        let mut failed = Vec::new();
+        for path in paths {
+            {
+                let mut pending = self.pending_trash.lock().unwrap();
+                match pending.get_mut(path) {
+                    Some(waiting @ Some(_)) if move_id.is_none_or(|m| *waiting == Some(m)) => *waiting = None,
+                    _ => continue,
+                }
+            }
+            let moved = self.move_to_trash(Path::new(path));
+            self.pending_trash.lock().unwrap().remove(path);
+            if let Err(error) = moved {
+                log::error!("Cannot move {path} to the Trash: {error:#}");
+                let name = store::load(Path::new(path)).map(|p| p.name).unwrap_or_else(|_| "A project".into());
+                failed.push(if error.to_string().starts_with("PROJECT_BUSY") {
+                    format!("“{name}” was opened in another Nuzky window or by an AI agent, so it was not moved to the Trash.")
+                } else {
+                    format!("“{name}” could not be moved to the Trash ({error:#}). It is back in your projects.")
+                });
+            }
+        }
+        failed
+    }
+
+    fn move_to_trash(&self, path: &Path) -> Result<()> {
+        // Nobody may be editing it: another window or an agent could have opened it meanwhile.
+        let lock = nuzky_session::lock_project(path, true)?;
+        // Named by the project's canonical path, which is gone once the project is in the Trash.
+        let chats = crate::agent_panel::chats_dir(path);
+        to_trash(path).context("Moving the project to the Trash")?;
+        let checkpoint = sidecar(path, ".checkpoint.json");
+        if checkpoint.exists() {
+            to_trash(&checkpoint).context("Moving the unfinished AI edit to the Trash")?;
+        }
+        let versions = sidecar(path, nuzky_session::HISTORY_SUFFIX);
+        if versions.exists() {
+            to_trash(&versions).context("Moving the project's versions to the Trash")?;
+        }
+        // A project saved at this path later must not reopen these chats.
+        if chats.exists() {
+            to_trash(&chats).context("Moving the project's AI chats to the Trash")?;
+        }
+        drop(lock);
+        let _ = std::fs::remove_file(sidecar(path, ".lock"));
+        let path_key = key(path);
+        self.update(|index| {
+            index.members.remove(&path_key);
+            index.external.retain(|p| p != &path_key);
+            Ok(())
+        })
+    }
+
+    pub fn create_collection(&self, name: &str) -> Result<Collection> {
+        self.update(|index| {
+            let name = collection_name(index, name, None)?;
+            let collection = Collection { id: new_id(), name };
+            index.collections.push(collection.clone());
+            Ok(collection)
+        })
+    }
+
+    pub fn rename_collection(&self, id: &str, name: &str) -> Result<()> {
+        self.update(|index| {
+            let name = collection_name(index, name, Some(id))?;
+            index.collections.iter_mut().find(|c| c.id == id).context("That collection no longer exists.")?.name = name;
+            Ok(())
+        })
+    }
+
+    /// The projects stay; they are no longer in a collection. Returns what `restore_collection` needs.
+    pub fn delete_collection(&self, id: &str) -> Result<DeletedCollection> {
+        self.update(|index| {
+            let position =
+                index.collections.iter().position(|c| c.id == id).context("That collection no longer exists.")?;
+            let collection = index.collections.remove(position);
+            let paths: Vec<String> = index.members.iter().filter(|(_, c)| *c == id).map(|(p, _)| p.clone()).collect();
+            index.members.retain(|_, c| c != id);
+            Ok(DeletedCollection { collection, position, paths })
+        })
+    }
+
+    pub fn restore_collection(&self, deleted: DeletedCollection) -> Result<()> {
+        self.update(|index| {
+            if !index.collections.iter().any(|c| c.id == deleted.collection.id) {
+                let position = deleted.position.min(index.collections.len());
+                index.collections.insert(position, deleted.collection.clone());
+            }
+            for path in &deleted.paths {
+                index.members.entry(path.clone()).or_insert_with(|| deleted.collection.id.clone());
+            }
+            Ok(())
+        })
+    }
+
+    /// `None` takes the projects out of their collection.
+    pub fn set_collection(&self, paths: &[String], collection: Option<&str>) -> Result<()> {
+        self.update(|index| {
+            if let Some(id) = collection {
+                ensure!(index.collections.iter().any(|c| c.id == id), "That collection no longer exists.");
+            }
+            for path in paths {
+                match collection {
+                    Some(id) => index.members.insert(path.clone(), id.to_owned()),
+                    None => index.members.remove(path),
+                };
+            }
+            Ok(())
+        })
+    }
+
+    fn transcripts(&self) -> Option<&TranscriptStore> {
+        self.transcripts
+            .get_or_init(|| {
+                TranscriptStore::open()
+                    .inspect_err(|error| log::error!("Transcripts unavailable for search: {error:#}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// The words on the timeline of the project at `path`, cached until the file or a transcript changes.
+    fn spoken(&self, path: &Path, transcripts_changed: u128) -> Option<Arc<Spoken>> {
+        let meta = std::fs::metadata(path).ok()?;
+        let stamp = (modified(&meta), meta.len(), transcripts_changed);
+        let path_key = key(path);
+        if let Some(hit) = self.spoken.lock().unwrap().get(&path_key).filter(|s| s.stamp == stamp) {
+            return Some(hit.clone());
+        }
+        let project = store::load(path).ok()?;
+        nuzky_session::validate(&project).ok()?;
+        let heard = nuzky_mcp::transcript::heard_assets(&project);
+        let mut sources = HashMap::new();
+        let mut untranscribed = Vec::new();
+        if let Some(store) = self.transcripts() {
+            for asset in project.assets.iter().filter(|a| heard.contains(&a.id)) {
+                match store.get(asset) {
+                    Ok(Some(record)) => {
+                        sources.insert(asset.id.clone(), record.words);
+                    }
+                    Ok(None) => untranscribed.push(asset.id.clone()),
+                    // A missing or unreadable file has nothing to search.
+                    Err(_) => {}
+                }
+            }
+        }
+        let derived = nuzky_mcp::transcript::Derived::new(&project, sources, untranscribed);
+        let words = derived
+            .words
+            .iter()
+            .map(|w| SpokenWord { folded: fold(&w.text), text: w.text.trim().to_owned(), start_us: w.start_us })
+            .filter(|w| !w.folded.is_empty())
+            .collect();
+        let spoken = Arc::new(Spoken {
+            stamp,
+            words,
+            transcribed: !derived.sources.is_empty(),
+            untranscribed: !derived.untranscribed.is_empty(),
+        });
+        self.spoken.lock().unwrap().insert(path_key, spoken.clone());
+        Some(spoken)
+    }
+
+    /// Where the words of `query` were said, in the projects of `collection` (all with `None`), newest first.
+    pub fn search(&self, query: &str, collection: Option<&str>) -> Said {
+        let tokens: Vec<String> = query.split_whitespace().map(fold).filter(|t| !t.is_empty()).collect();
+        let mut said = Said { hits: Vec::new(), untranscribed: Vec::new(), transcribed: 0 };
+        if tokens.iter().map(|t| t.chars().count()).sum::<usize>() < 2 {
+            return said;
+        }
+        let (index, _) = self.shown_index();
+        let transcripts_changed = std::fs::metadata(store::data_dir().join("transcripts")).map_or(0, |m| modified(&m));
+        let mut paths = self.paths(&index);
+        if let Some(collection) = collection {
+            paths.retain(|p| index.members.get(&key(p)).is_some_and(|c| c == collection));
+        }
+        paths.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map_or(0, |m| modified(&m))));
+        for path in paths {
+            let Some(spoken) = self.spoken(&path, transcripts_changed) else { continue };
+            if spoken.untranscribed {
+                said.untranscribed.push(key(&path));
+            }
+            if spoken.transcribed {
+                said.transcribed += 1;
+            }
+            let mut found = 0;
+            for start in 0..spoken.words.len() {
+                if found == MAX_HITS_PER_PROJECT || said.hits.len() == MAX_HITS {
+                    break;
+                }
+                let Some(matched) = spoken.words.get(start..start + tokens.len()) else { break };
+                let last = tokens.len() - 1;
+                let hit = matched.iter().zip(&tokens).enumerate().all(|(i, (word, token))| {
+                    if i == last { word.folded.starts_with(token.as_str()) } else { &word.folded == token }
+                });
+                if !hit {
+                    continue;
+                }
+                let text = |words: &[SpokenWord]| words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+                let end = start + tokens.len();
+                said.hits.push(SaidHit {
+                    path: key(&path),
+                    start_us: matched[0].start_us,
+                    before: text(&spoken.words[start.saturating_sub(CONTEXT_BEFORE)..start]),
+                    text: text(matched),
+                    after: text(&spoken.words[end..(end + CONTEXT_AFTER).min(spoken.words.len())]),
+                });
+                found += 1;
+            }
+        }
+        said
+    }
+
+    /// The project's picture, its cover or a frame, rendered like the export and cached until its poster cache key
+    /// (`poster_stamp`) changes.
+    pub fn poster(&self, path: &Path) -> Result<Option<ProjectPoster>> {
+        let meta = std::fs::metadata(path).context("The project file is gone")?;
+        let project = store::load(path)?;
+        nuzky_session::validate(&project)?;
+        if project.duration_us() == 0 {
+            return Ok(None);
+        }
+        let shown = shown_cover(&project).filter(|c| drawable(&project, c));
+        let path_key = key(path);
+        let mut path_hash = FNV_OFFSET;
+        hash_bytes(&mut path_hash, path_key.as_bytes());
+        let dir = store::cache_dir().join("posters");
+        let file = dir.join(format!("{path_hash:016x}-{}.png", poster_stamp(&meta, &project, shown)));
+        let url = |png: &[u8], provisional| {
+            let (width, height) = png_size(png);
+            ProjectPoster {
+                url: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)),
+                width,
+                height,
+                provisional,
+            }
+        };
+        if let Ok(png) = std::fs::read(&file) {
+            return Ok(Some(url(&png, false)));
+        }
+        let cache_key = file.to_string_lossy().into_owned();
+        if self.failed_posters.lock().unwrap().contains(&cache_key) {
+            return Ok(None);
+        }
+        if let Some(draft) = self.drafts.lock().unwrap().get(&path_key)
+            && draft.file == cache_key
+            && shown.is_some_and(|cover| draft.waits.unchanged(&project, cover))
+        {
+            return Ok(Some(url(&draft.png, true)));
+        }
+        let cover = shown.map(|c| c.format);
+        let Some(poster) = self.render_poster(project, cover) else {
+            self.failed_posters.lock().unwrap().insert(cache_key);
+            return Ok(None);
+        };
+        if let Some(waits) = poster.waits_for {
+            let provisional = url(&poster.png, true);
+            let draft = Draft { file: cache_key, png: poster.png, waits };
+            self.drafts.lock().unwrap().insert(path_key, draft);
+            return Ok(Some(provisional));
+        }
+        self.drafts.lock().unwrap().remove(&path_key);
+        std::fs::create_dir_all(&dir).context("Creating the poster cache")?;
+        let part = sidecar(&file, &format!(".{}.part", new_id()));
+        std::fs::write(&part, &poster.png)
+            .and_then(|()| std::fs::rename(&part, &file))
+            .context("Caching the poster")?;
+        // Older posters of the same project are not needed any more.
+        let prefix = format!("{path_hash:016x}-");
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && entry.path() != file {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(Some(url(&poster.png, false)))
+    }
+
+    /// One renderer draws posters one after another; it is freed after a while without requests.
+    fn render_poster(&self, project: Project, cover: Option<ThumbnailFormat>) -> Option<Poster> {
+        let (reply, answer) = mpsc::channel();
+        let mut request = Some(PosterRequest { project, cover, reply });
+        let mut posters = self.posters.lock().unwrap();
+        for _ in 0..2 {
+            let sender = posters.get_or_insert_with(spawn_poster_worker);
+            match sender.send(request.take()?) {
+                Ok(()) => break,
+                // The worker is gone; start another one with the same request.
+                Err(mpsc::SendError(back)) => {
+                    request = Some(back);
+                    *posters = None;
+                }
+            }
+        }
+        drop(posters);
+        answer.recv_timeout(Duration::from_secs(60)).ok().flatten()
+    }
+}
+
+fn collection_name(index: &Index, name: &str, renaming: Option<&str>) -> Result<String> {
+    let name = name.trim();
+    ensure!(!name.is_empty(), "A collection needs a name.");
+    ensure!(name.chars().count() <= MAX_COLLECTION_NAME, "Use a name of at most {MAX_COLLECTION_NAME} characters.");
+    ensure!(
+        !index
+            .collections
+            .iter()
+            .any(|c| Some(c.id.as_str()) != renaming && c.name.to_lowercase() == name.to_lowercase()),
+        "There is already a collection called “{name}”."
+    );
+    Ok(name.to_owned())
+}
+
+fn spawn_poster_worker() -> Sender<PosterRequest> {
+    let (tx, rx) = mpsc::channel::<PosterRequest>();
+    let spawned = std::thread::Builder::new().name("nuzky-posters".into()).spawn(move || {
+        let mut renderer: Option<Renderer> = None;
+        loop {
+            let request = match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(request) => request,
+                Err(RecvTimeoutError::Timeout) => {
+                    renderer = None;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            let project = &request.project;
+            let drawn = request.cover.and_then(|format| project.thumbnail(format)).and_then(|cover| {
+                guarded(&mut renderer, |r| draw_cover(r, project, cover))
+                    .inspect_err(|error| log::warn!("The cover of “{}” cannot be drawn: {error:#}", project.name))
+                    .ok()
+            });
+            let poster = drawn.or_else(|| {
+                guarded(&mut renderer, |r| draw_frame(r, project))
+                    .map(|png| Poster { png, waits_for: None })
+                    .inspect_err(|error| log::warn!("No poster for “{}”: {error:#}", project.name))
+                    .ok()
+            });
+            let _ = request.reply.send(poster);
+        }
+    });
+    if let Err(error) = spawned {
+        log::error!("Cannot start the poster renderer: {error}");
+    }
+    tx
+}
+
+/// Runs `draw` with the poster renderer, started when there is none. A project that trips the renderer gets no
+/// picture from it and the others still do: the renderer, maybe left halfway through a frame, is freed.
+fn guarded<T>(renderer: &mut Option<Renderer>, draw: impl FnOnce(&mut Renderer) -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if renderer.is_none() {
+            let mut new = Renderer::new()?;
+            // A clip whose person is not found yet shows as recorded, as in the preview.
+            new.use_mattes(store::cache_dir(), nuzky_engine::Pending::Original);
+            *renderer = Some(new);
+        }
+        draw(renderer.as_mut().expect("renderer was just created"))
+    }))
+    .unwrap_or_else(|_| {
+        *renderer = None;
+        bail!("the renderer failed")
+    })
+}
+
+/// The cover a card shows instead of a frame: on a landscape canvas the YouTube thumbnail, on any other the 9:16
+/// cover, or the other one when only that exists.
+fn shown_cover(project: &Project) -> Option<&Thumbnail> {
+    let (first, second) = if project.canvas.width > project.canvas.height {
+        (ThumbnailFormat::Youtube16x9, ThumbnailFormat::Cover9x16)
+    } else {
+        (ThumbnailFormat::Cover9x16, ThumbnailFormat::Youtube16x9)
+    };
+    project.thumbnail(first).or_else(|| project.thumbnail(second))
+}
+
+/// The files the cover is drawn from are there and its frame is in the video.
+fn drawable(project: &Project, cover: &Thumbnail) -> bool {
+    (cover.image.is_some() || cover.time_us < project.duration_us())
+        && crate::cover::cover_missing(project, cover).is_empty()
+}
+
+/// The poster cache key of a project file whose card shows `cover`, when it can be drawn. It changes with the file, with
+/// the images the cover is drawn from, so a logo that would not open, replaced by one that does, is drawn again, and
+/// with how its plugin effects draw, so a plugin changed, added or removed draws it again.
+fn poster_stamp(meta: &std::fs::Metadata, project: &Project, cover: Option<&Thumbnail>) -> String {
+    let mut stamp = FNV_OFFSET;
+    hash_bytes(&mut stamp, &modified(meta).to_le_bytes());
+    hash_bytes(&mut stamp, &meta.len().to_le_bytes());
+    hash_bytes(&mut stamp, &[POSTER_VERSION, u8::from(cover.is_some())]);
+    let images = cover.into_iter().flat_map(|c| c.image.iter().chain(c.overlays.iter().map(|o| &o.asset_id)));
+    for image in images.filter_map(|id| project.asset(id)) {
+        hash_bytes(&mut stamp, nuzky_engine::thumbnail::file_version(&image.path).as_bytes());
+    }
+    hash_bytes(&mut stamp, nuzky_engine::plugin_effects::stamp(project).as_bytes());
+    format!("{stamp:016x}")
+}
+
+fn png_size(png: &[u8]) -> (u32, u32) {
+    png::Decoder::new(std::io::Cursor::new(png)).read_info().map_or((0, 0), |r| (r.info().width, r.info().height))
+}
+
+/// Width and height with the canvas's shape, the longer side `POSTER_SIDE`, both even.
+fn poster_size(width: u32, height: u32) -> (u32, u32) {
+    let scale = f64::from(POSTER_SIDE) / f64::from(width.max(height).max(1));
+    let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(16, POSTER_SIDE) & !1;
+    (side(width), side(height))
+}
+
+fn draw_frame(renderer: &mut Renderer, project: &Project) -> Result<Vec<u8>> {
+    let (width, height) = poster_size(project.canvas.width, project.canvas.height);
+    // Just after the start: past a fade in, still the opening shot.
+    let t = (project.duration_us() / 10).min(1_500_000);
+    let rgba = renderer.render(project, t, width, height, Wait::Exact, false)?;
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.write_header()?.write_image_data(&rgba)?;
+    }
+    Ok(png)
+}
+
+/// The cover at the size of a poster, drawn as its export draws it. A poster never makes the person's outlines or
+/// mask: without them the cover is drawn as the cover editor shows it meanwhile.
+fn draw_cover(renderer: &mut Renderer, project: &Project, cover: &Thumbnail) -> Result<Poster> {
+    if let Some(image) = cover.image.as_deref().and_then(|id| project.asset(id)) {
+        // This renderer leaves out a picture that does not decode, where the export fails.
+        VideoDecoder::open(Path::new(&image.path))?.next_frame()?.context("The cover's image has no picture")?;
+    }
+    let cache = store::cache_dir();
+    // Counted before the frame is drawn, so outlines made meanwhile still count as a change.
+    let mattes = crate::cover::waiting_mattes(project, cover, &cache);
+    let frame = renderer.thumbnail_frame(project, cover)?;
+    let size = (frame.width, frame.height);
+    // Looked at before it is read, so a mask made meanwhile still counts as a change.
+    let mask_file = cover.needs_mask().then(|| {
+        let file = nuzky_vision::mask_path(&frame.data, size, &cache);
+        let seen = file_state(&file);
+        (file, seen)
+    });
+    let mask = mask_file.as_ref().and_then(|_| nuzky_vision::cached_alpha(&frame.data, size, &cache));
+    let (width, height) = cover.format.size();
+    let (rendered, draft) =
+        crate::cover::draw(renderer, project, cover, &frame, mask.as_deref(), poster_size(width, height).0)?;
+    if draft {
+        log::info!(
+            "The card of “{}” shows its cover without the person cut out until their mask is made",
+            project.name
+        );
+    }
+    let png = nuzky_engine::thumbnail::encode(&rendered, ImageKind::Png)?;
+    let waits_for = (draft || mattes > 0).then(|| Waits { mattes, mask: mask_file.filter(|_| draft) });
+    Ok(Poster { png, waits_for })
+}
+
+fn file_state(path: &Path) -> Option<u128> {
+    std::fs::metadata(path).ok().map(|meta| modified(&meta))
+}
+
+// --- Commands ---------------------------------------------------------------------------------------
+
+fn current_path(state: &AppState) -> String {
+    key(&state.session.lock().unwrap().path)
+}
+
+#[tauri::command]
+pub async fn library(app: AppHandle) -> CmdResult<Listing> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let current = current_path(&state);
+        state.library.list(&current)
+    })
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn project_poster(app: AppHandle, path: String) -> CmdResult<Option<ProjectPoster>> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().library.poster(Path::new(&path)))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+#[tauri::command]
+pub async fn search_said(app: AppHandle, query: String, collection: Option<String>) -> CmdResult<Said> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().library.search(&query, collection.as_deref()))
+        .await
+        .map_err(err)
+}
+
+/// For a project that is not open here; the open one is renamed through the editor.
+#[tauri::command]
+pub async fn rename_project(app: AppHandle, path: String, name: String) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        if key(Path::new(&path)) == current_path(&state) {
+            return Err("Rename the open project in the editor.".to_string());
+        }
+        state.library.rename(Path::new(&path), &name).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+pub async fn duplicate_project(app: AppHandle, path: String) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let open = {
+            let current = state.session.lock().unwrap();
+            (key(&current.path) == key(Path::new(&path))).then(|| state_project(&current)).transpose()?
+        };
+        state.library.duplicate(Path::new(&path), open).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+fn state_project(current: &crate::OpenSession) -> CmdResult<Project> {
+    current.host.session.state().map(|s| s.project).map_err(err)
+}
+
+#[tauri::command]
+pub fn trash_projects(app: AppHandle, state: State<'_, AppState>, paths: Vec<String>) -> CmdResult<()> {
+    let current = current_path(&state);
+    state.library.trash(app.clone(), paths, &current).map_err(err)
+}
+
+#[tauri::command]
+pub fn restore_projects(state: State<'_, AppState>, paths: Vec<String>) -> CmdResult<()> {
+    state.library.restore(&paths).map_err(err)
+}
+
+#[tauri::command]
+pub fn create_collection(state: State<'_, AppState>, name: String) -> CmdResult<Collection> {
+    state.library.create_collection(&name).map_err(err)
+}
+
+#[tauri::command]
+pub fn rename_collection(state: State<'_, AppState>, id: String, name: String) -> CmdResult<()> {
+    state.library.rename_collection(&id, &name).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_collection(state: State<'_, AppState>, id: String) -> CmdResult<DeletedCollection> {
+    state.library.delete_collection(&id).map_err(err)
+}
+
+#[tauri::command]
+pub fn restore_collection(state: State<'_, AppState>, deleted: DeletedCollection) -> CmdResult<()> {
+    state.library.restore_collection(deleted).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_collection(state: State<'_, AppState>, paths: Vec<String>, collection: Option<String>) -> CmdResult<()> {
+    state.library.set_collection(&paths, collection.as_deref()).map_err(err)
+}
+
+/// The system Trash. The UI flows on macOS and Windows use the Trash of their own home, since Finder and the
+/// Recycle Bin would put their projects in the person's own.
+pub(crate) fn to_trash(path: &Path) -> Result<()> {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    if let Some(moved) = crate::test_bridge::trash(path) {
+        return moved;
+    }
+    // Edge WebDriver drives only the UI flows' app.
+    #[cfg(all(windows, debug_assertions))]
+    if std::env::var_os("TAURI_WEBVIEW_AUTOMATION").is_some() {
+        let trash = std::env::home_dir().context("no home folder")?.join(".Trash");
+        std::fs::create_dir_all(&trash)?;
+        return Ok(std::fs::rename(path, trash.join(path.file_name().context("the path has no file name")?))?);
+    }
+    Ok(trash::delete(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fold_ignores_case_accents_and_punctuation() {
+        assert_eq!(fold("Západ,"), "zapad");
+        assert_eq!(fold("SUNSET!"), "sunset");
+        assert_eq!(fold("—"), "");
+        assert_eq!(fold("Ščřž"), "scrz");
+    }
+
+    /// An untitled project emptied after it had clips still has them in its versions, so it stays.
+    #[test]
+    fn an_emptied_project_with_earlier_versions_is_not_cleared_away() {
+        let _children = crate::CHILD_SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("library-pristine-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fresh, emptied) = (dir.join("fresh.nuzky"), dir.join("emptied.nuzky"));
+        for path in [&fresh, &emptied] {
+            store::create(path, &Project::new(UNTITLED)).unwrap();
+            drop(store::open(path, None).unwrap());
+        }
+        let session = store::open(&emptied, None).unwrap();
+        session.edit(vec![EditCmd::RenameProject { name: "Holiday".into() }], None, Default::default()).unwrap();
+        session.edit(vec![EditCmd::RenameProject { name: UNTITLED.into() }], None, Default::default()).unwrap();
+        drop(session);
+        // An older project with only one version, as it opened with its clips, emptied without a
+        // version: a write of the versions failed, for example.
+        let older = dir.join("older.nuzky");
+        store::create(&older, &Project::new("Holiday")).unwrap();
+        drop(store::open(&older, None).unwrap());
+        store::save(&older, &Project::new(UNTITLED)).unwrap();
+        let library = Library::default();
+        assert!(library.remove_pristine(&fresh), "a project that never had anything goes");
+        assert!(!fresh.exists() && !sidecar(&fresh, nuzky_session::HISTORY_SUFFIX).exists());
+        assert!(!library.remove_pristine(&emptied));
+        assert!(!library.remove_pristine(&older));
+        assert!(emptied.exists() && older.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_card_shows_the_cover_of_its_canvas_shape_first() {
+        let dir = std::env::temp_dir().join(format!("library-cover-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("cover.png");
+        std::fs::write(&image, b"").unwrap();
+        let mut project = Project::new("Covers");
+        project.assets.push(
+            serde_json::from_value(
+                serde_json::json!({"id": "image", "name": "cover.png", "path": image, "kind": "image",
+                "durationUs": 0, "width": 1080, "height": 1920, "fps": 0.0, "hasAudio": false}),
+            )
+            .unwrap(),
+        );
+        let cover = |format| Thumbnail {
+            format,
+            time_us: 0,
+            image: Some("image".into()),
+            frame: Default::default(),
+            background: Default::default(),
+            texts: Vec::new(),
+            overlays: Vec::new(),
+            outline: None,
+        };
+        let shown = |p: &Project| shown_cover(p).filter(|c| drawable(p, c)).map(|c| c.format);
+        project.thumbnails = vec![cover(ThumbnailFormat::Cover9x16), cover(ThumbnailFormat::Youtube16x9)];
+        for (width, height, format) in [
+            (1920, 1080, ThumbnailFormat::Youtube16x9),
+            (1080, 1080, ThumbnailFormat::Cover9x16),
+            (1080, 1920, ThumbnailFormat::Cover9x16),
+        ] {
+            (project.canvas.width, project.canvas.height) = (width, height);
+            assert_eq!(shown(&project), Some(format), "{width}×{height}");
+        }
+        project.thumbnails = vec![cover(ThumbnailFormat::Cover9x16)];
+        assert_eq!(shown(&project), Some(ThumbnailFormat::Cover9x16), "only the other format");
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(shown(&project), None, "its image is gone");
+        project.thumbnails[0].image = None;
+        assert_eq!(shown(&project), None, "its frame is past the end of an empty timeline");
+    }
+
+    #[test]
+    fn poster_keeps_the_canvas_shape_with_even_sides() {
+        assert_eq!(poster_size(1080, 1920), (202, 360));
+        assert_eq!(poster_size(1920, 1080), (360, 202));
+        assert_eq!(poster_size(1080, 1350), (288, 360));
+        assert_eq!(poster_size(7680, 16), (360, 16));
+    }
+}

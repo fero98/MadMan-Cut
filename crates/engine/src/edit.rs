@@ -1,0 +1,5050 @@
+//! Timeline edits and undo history. The main track is magnetic like in CapCut:
+//! its clips always sit back to back from zero, so deleting or moving closes gaps.
+
+use anyhow::{Result, anyhow, bail, ensure};
+use serde::{Deserialize, Serialize};
+
+use crate::model::{
+    Adjust, Animation, Asset, AssetKind, Background, CAPTIONS_TRACK, Canvas, CaptionWord, Clip, ClipContent, Ease,
+    Effect, Keyframe, Keywords, LetterCase, MAX_CLIP_EFFECTS, Project, ReelCandidate, Shape, TextAlign, TextShadow,
+    TextStyle, Thumbnail, ThumbnailFormat, Track, TrackKind, Transform, Transition, WordCorrection,
+};
+
+pub const MAIN_TRACK: &str = "main";
+const IMAGE_DURATION_US: i64 = 3_000_000;
+pub const FREEZE_DURATION_US: i64 = 3_000_000;
+const TEXT_DURATION_US: i64 = 3_000_000;
+const UNDO_LIMIT: usize = 200;
+pub const MIN_SPEED: f32 = 0.1;
+pub const MAX_SPEED: f32 = 10.0;
+pub const MAX_TRANSITION_US: i64 = 2_000_000;
+pub const MAX_DUCK_DB: f32 = 40.0;
+pub const CAPTION_Y: f32 = 0.15;
+
+/// A caption style: its look, a font when it brings its own, the entry and exit animation of every caption
+/// and how it marks key words. The built-in ones are in `assets/presets/captions.json`; the user's own live
+/// beside the projects.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionPreset {
+    pub name: String,
+    /// Without `fontFamily` the captions keep the font they have.
+    pub style: TextStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub anim_in: Option<Animation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub anim_out: Option<Animation>,
+}
+
+pub fn caption_presets() -> &'static [CaptionPreset] {
+    static PRESETS: std::sync::LazyLock<Vec<CaptionPreset>> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(include_str!("../../../assets/presets/captions.json")).expect("valid caption presets")
+    });
+    &PRESETS
+}
+
+/// The caption preset named `name`, ignoring case, with `_` or `-` for spaces: "green_box" is Green box.
+pub fn caption_preset(name: &str) -> Option<&'static CaptionPreset> {
+    let name = name.trim().replace(['_', '-'], " ");
+    caption_presets().iter().find(|preset| preset.name.eq_ignore_ascii_case(&name))
+}
+
+/// Editing limits the engine enforces, sent to the UI at start so it never copies them.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Limits {
+    pub min_speed: f32,
+    pub max_speed: f32,
+    pub max_transition_us: i64,
+    /// Vertical offset of generated captions from the canvas centre, as a fraction of its height.
+    pub caption_y: f32,
+    pub max_duck_db: f32,
+    pub min_motion_strength: f64,
+    pub max_motion_strength: f64,
+}
+
+pub const LIMITS: Limits = Limits {
+    min_speed: MIN_SPEED,
+    max_speed: MAX_SPEED,
+    max_transition_us: MAX_TRANSITION_US,
+    caption_y: CAPTION_Y,
+    max_duck_db: MAX_DUCK_DB,
+    min_motion_strength: *MOTION_STRENGTHS.start(),
+    max_motion_strength: *MOTION_STRENGTHS.end(),
+};
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionSegment {
+    pub start_us: i64,
+    pub end_us: i64,
+    pub text: String,
+    /// The spoken words, with TIMELINE times, for karaoke styles; their texts joined by single spaces
+    /// must be `text`. The clip stores them relative to its start.
+    #[serde(default)]
+    pub words: Vec<CaptionWord>,
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum EditCmd {
+    AddAssets {
+        assets: Vec<Asset>,
+    },
+    RemoveAsset {
+        asset_id: String,
+    },
+    AddClip {
+        asset_id: String,
+        start_us: Option<i64>,
+        track_id: Option<String>,
+    },
+    /// Puts a video or image in a small window with rounded corners and a soft shadow in the top right
+    /// corner, inside the Reels and TikTok safe area on vertical videos, on an overlay track above the
+    /// main track. `duration_us` defaults to the whole video, or 3 s of an image.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    AddPictureInPicture {
+        asset_id: String,
+        start_us: i64,
+        duration_us: Option<i64>,
+    },
+    /// Puts a video or image over the whole picture, filling the canvas when it is at least as large as the
+    /// canvas both ways and fitted to it otherwise, on an overlay track above the main track. `duration_us` defaults to the whole video, or 3 s of an image.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    AddOverlay {
+        asset_id: String,
+        start_us: i64,
+        duration_us: Option<i64>,
+    },
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    AddSticker {
+        asset_id: String,
+        start_us: i64,
+        duration_us: Option<i64>,
+        transform: Option<Transform>,
+    },
+    AddText {
+        start_us: i64,
+        text: String,
+        style: TextStyle,
+    },
+    /// `track_id: None` moves the clip to a new track of the right kind. With `new_track` it always goes on a new
+    /// track right above or below `track_id` as the timeline shows it, or its own track without one; on screen a
+    /// higher video or text track covers a lower one, and nothing goes below the main track.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    MoveClip {
+        clip_id: String,
+        track_id: Option<String>,
+        start_us: i64,
+        #[serde(default)]
+        new_track: Option<TrackSide>,
+    },
+    /// Moves clips by the same time, each on its own track, with the earliest stopping at zero. When one of a
+    /// track's clips would overlap a clip there, they all go on a new track right above it, as when pasting.
+    /// Not for main-track clips, which sit back to back: move one of them with moveClip.
+    MoveClips {
+        clip_ids: Vec<String>,
+        offset_us: i64,
+    },
+    /// On the main track the other tracks, except audio kept in place, gain or lose the same time at the moved edge.
+    TrimClip {
+        clip_id: String,
+        start_us: i64,
+        duration_us: i64,
+        source_in_us: Option<i64>,
+    },
+    SplitClip {
+        clip_id: String,
+        at_us: i64,
+    },
+    /// Holds the frame of a video clip shown at `at_us` for `duration_us` (3 s by default): the clip is split there
+    /// and the still goes in between, on the same track, pushing what follows along; on the main track the other
+    /// tracks, except audio kept in place, open the same time. Within a frame of the clip's start or end the still
+    /// goes before or after it. The still is the same video at speed 0, silent; trim it to change its length.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    FreezeFrame {
+        clip_id: String,
+        at_us: i64,
+        duration_us: Option<i64>,
+    },
+    DeleteClips {
+        clip_ids: Vec<String>,
+    },
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    UpdateClip {
+        clip_id: String,
+        transform: Option<Transform>,
+        volume: Option<f32>,
+        text: Option<String>,
+        style: Option<TextStyle>,
+        /// Changing speed keeps the source range, so the clip gets shorter or longer.
+        speed: Option<f32>,
+        /// Sound at another speed keeps its pitch. Moving a clip off 1x turns it on unless the
+        /// same command sets it.
+        keep_pitch: Option<bool>,
+        adjust: Option<Adjust>,
+        fade_in_us: Option<i64>,
+        fade_out_us: Option<i64>,
+        /// Clean voice on clips with sound: less rumble, hum, background noise and harsh s sounds.
+        clean_voice: Option<bool>,
+        /// Reduce echo on clips with sound: how much of the room's reverb comes out, 0 to 1; 0 turns it
+        /// off. 0.8 suits speech in a bare room. The sound is prepared once per file in the background.
+        dereverb: Option<f32>,
+        /// Match loudness on clips with sound: the clip plays at -16 LUFS, measured over its whole file,
+        /// so takes from different rooms and distances sound as loud. Volume still applies on top.
+        normalize: Option<bool>,
+        /// Even out volume on clips with sound: how far quiet and loud passages come together, 0 to 1;
+        /// 0 turns it off. 0.5 suits a speaker who moves away from the phone.
+        leveler: Option<f32>,
+        /// Video and image clips: corners, border and shadow. The default shape removes them.
+        shape: Option<Shape>,
+        /// Ducking: how many dB the clip goes down while a video's own sound has speech, up to 40;
+        /// 0 turns it off. 12 suits music under speech.
+        duck_db: Option<f32>,
+        /// Video and image clips: blur what is behind the person, or put a colour or an image of the
+        /// project there; `{"type": "none"}` shows the picture as recorded. The person's outline is made
+        /// once per file in the background.
+        background: Option<Box<Background>>,
+    },
+    SetAnimation {
+        clip_id: String,
+        slot: AnimationSlot,
+        animation: Option<Animation>,
+    },
+    /// Main-track clips only, and not the first one.
+    SetTransition {
+        clip_id: String,
+        transition: Option<Transition>,
+    },
+    SetKeyframes {
+        clip_id: String,
+        keyframes: Vec<Keyframe>,
+    },
+    /// Plugin effects drawn over a video or image clip, in order, at most four; an empty list removes them.
+    /// `list_plugins` names each plugin's effects and their params.
+    SetEffects {
+        clip_id: String,
+        effects: Vec<Effect>,
+    },
+    /// Places a copy right after the clip.
+    DuplicateClip {
+        clip_id: String,
+    },
+    /// Pastes copied clips with new ids, keeping their offsets to each other. The clips of each track go back on
+    /// it when they all fit there, else on a new track right above it, as when dragging. Clips from the main track
+    /// go in back to back at its cut nearest `at_us`, where the other tracks except audio kept in place open the same
+    /// time, and every other clip keeps its offset to the main-track clip it
+    /// starts over; without them the earliest clip starts at `at_us`. The pasted clips are selected.
+    PasteClips {
+        clips: Vec<CopiedClip>,
+        at_us: i64,
+    },
+    /// Puts these video and picture clips on the main track in place of all its clips, back to back from 0 in the
+    /// order given, with new ids. Nothing else moves: the other tracks, their keyframes and cover frames keep their
+    /// time, as when recutting the video to a song.
+    ReplaceMainClips {
+        clips: Vec<Clip>,
+    },
+    /// Gives clips of the source's kind its look. Text: style, font, transform, keyframes and animations, never
+    /// the text; a caption keeps its wrap width. Video and images: Adjust, effects, background, crop and shape, motion
+    /// (keyframes, moving each clip from its own framing) and animations. Sound: volume, fades, Voice and
+    /// ducking. Keyframes stretch to each clip's length, and what the source lacks the clips lose. Clips of
+    /// another kind are left alone and listed in the outcome's `skipped`.
+    PasteAttributes {
+        source: CopiedClip,
+        clip_ids: Vec<String>,
+    },
+    /// Moves a video clip's sound to an audio track and silences the video clip.
+    DetachAudio {
+        clip_id: String,
+    },
+    /// Puts other media in a clip. The clip keeps its id, place, length, speed, size, position, keyframes,
+    /// animations and effects, and reads the new media from its start, or from the part the user chose.
+    /// A video track takes a video or an image, an audio track a file with sound. Media shorter than the
+    /// clip at its speed is refused. Sound settings drop off when the new media has no sound.
+    ReplaceClip {
+        clip_id: String,
+        asset_id: String,
+    },
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    UpdateTrack {
+        track_id: String,
+        muted: Option<bool>,
+        hidden: Option<bool>,
+        keep_in_place: Option<bool>,
+    },
+    /// Changes every clip of a text track in place, such as all captions: the given style and transform fields
+    /// replace each clip's own, and its id, text, words, timing, animations and every field left out stay. Clips
+    /// with keyframes keep their transform, as their keyframes decide where they are, and are listed in the
+    /// outcome's `skipped`; their style still changes.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    RestyleTrack {
+        track_id: String,
+        style: Option<TextStylePatch>,
+        transform: Option<TransformPatch>,
+    },
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    SetCanvas {
+        width: u32,
+        height: u32,
+        background: Option<String>,
+        background_blur: Option<f32>,
+    },
+    /// Adds a new captions track; existing tracks are left alone. Every caption gets the animations, and the
+    /// transform fields given over its place a little below the middle.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    AddCaptions {
+        segments: Vec<CaptionSegment>,
+        style: TextStyle,
+        #[serde(default)]
+        anim_in: Option<Animation>,
+        #[serde(default)]
+        anim_out: Option<Animation>,
+        #[serde(default)]
+        transform: Option<TransformPatch>,
+    },
+    /// Replaces the clips of an existing captions track.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    ReplaceCaptions {
+        track_id: String,
+        segments: Vec<CaptionSegment>,
+        style: TextStyle,
+        #[serde(default)]
+        anim_in: Option<Animation>,
+        #[serde(default)]
+        anim_out: Option<Animation>,
+        #[serde(default)]
+        transform: Option<TransformPatch>,
+    },
+    /// Cuts the timeline ranges out of every track except `keep_track_ids` (by default the
+    /// tracks kept in place) and closes the gaps, so video, overlays, audio and captions stay in sync.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    RippleDeleteRanges {
+        ranges: Vec<TimeRange>,
+        #[serde(default)]
+        keep_track_ids: Option<Vec<String>>,
+    },
+    RenameProject {
+        name: String,
+    },
+    /// Sets how recognised words read, each found by its media file, its start in the file and
+    /// its recognised text. Setting a word back to its recognised text removes the correction.
+    CorrectWords {
+        corrections: Vec<WordCorrection>,
+    },
+    /// Punch-ins on the main track: the picture of each range is scaled by its `scale`, which
+    /// multiplies the clip's own scale and keeps its position and rotation. Clips are split at the
+    /// range edges. An edge that would leave a piece shorter than 0.3 s, or shorter than a
+    /// transition, animation or fade the piece carries, moves to the clip's edge. Clips with
+    /// keyframes are left alone and listed in the outcome's `skipped`. Ranges must not overlap.
+    ZoomRanges {
+        ranges: Vec<ZoomRange>,
+    },
+    /// A slow camera move on video and image clips, written as two keyframes on a smooth curve
+    /// from the clip's own transform, so they stay editable. The zoom centres on the middle of the
+    /// Reels and TikTok safe area on vertical canvases, else on the canvas centre, so what is
+    /// framed there stays put. `clip_id` moves one clip on any track, over the part of it inside
+    /// `range` or its whole length; without it every main-track video and image clip under
+    /// `range` moves, as one continuous motion. Clips with keyframes are left alone and listed in
+    /// the outcome's `skipped`.
+    #[cfg_attr(feature = "ts", ts(optional_fields = nullable))]
+    ApplyMotion {
+        clip_id: Option<String>,
+        range: Option<TimeRange>,
+        kind: MotionKind,
+        /// How far it zooms, as a fraction: 0.06 is subtle, 0.15 strong.
+        strength: f64,
+    },
+    /// Sets the thumbnail of its format, replacing the one there.
+    SetThumbnail {
+        thumbnail: Thumbnail,
+    },
+    RemoveThumbnail {
+        format: ThumbnailFormat,
+    },
+    /// Replaces every reel candidate.
+    SetReelCandidates {
+        candidates: Vec<ReelCandidate>,
+    },
+    /// Replaces the reel candidate with the same id.
+    UpdateReelCandidate {
+        candidate: ReelCandidate,
+    },
+}
+
+/// A clip as it was copied, with the track it was on, which may be gone by the time it is pasted.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopiedClip {
+    pub clip: Clip,
+    pub track_id: String,
+    /// Sound detached from a video is a video asset on an audio track, so the kind comes from the track.
+    pub track_kind: TrackKind,
+    #[serde(default)]
+    pub keep_in_place: bool,
+}
+
+/// The `TextStyle` fields to change; null clears a field that may be empty.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TextStylePatch {
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<String>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<String>>"))]
+    pub font_family: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_color: Option<String>,
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<String>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<String>>"))]
+    pub background: Option<Option<String>>,
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<f32>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<f32>>"))]
+    pub max_width: Option<Option<f32>>,
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<String>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<String>>"))]
+    pub highlight: Option<Option<String>>,
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<Keywords>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<Keywords>>"))]
+    pub keywords: Option<Option<Keywords>>,
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<TextShadow>>"))]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Option<TextShadow>>"))]
+    pub shadow: Option<Option<TextShadow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub letter_case: Option<LetterCase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub letter_spacing: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_spacing: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<TextAlign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_radius: Option<f32>,
+}
+
+/// The `Transform` fields to change.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransformPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
+}
+
+/// Tells a field given as null (`Some(None)`) from one left out (`None`).
+mod present {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize>(value: &Option<Option<T>>, s: S) -> Result<S::Ok, S::Error> {
+        value.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+        Option::deserialize(d).map(Some)
+    }
+}
+
+impl TextStylePatch {
+    fn apply(&self, style: &mut TextStyle) {
+        fn set<T: Clone>(field: &mut T, value: &Option<T>) {
+            if let Some(value) = value {
+                *field = value.clone();
+            }
+        }
+        set(&mut style.font_family, &self.font_family);
+        set(&mut style.font_size, &self.font_size);
+        set(&mut style.color, &self.color);
+        set(&mut style.bold, &self.bold);
+        set(&mut style.stroke_width, &self.stroke_width);
+        set(&mut style.stroke_color, &self.stroke_color);
+        set(&mut style.background, &self.background);
+        set(&mut style.max_width, &self.max_width);
+        set(&mut style.highlight, &self.highlight);
+        set(&mut style.keywords, &self.keywords);
+        set(&mut style.shadow, &self.shadow);
+        set(&mut style.letter_case, &self.letter_case);
+        set(&mut style.letter_spacing, &self.letter_spacing);
+        set(&mut style.line_spacing, &self.line_spacing);
+        set(&mut style.align, &self.align);
+        set(&mut style.box_radius, &self.box_radius);
+    }
+}
+
+impl TransformPatch {
+    fn apply(&self, transform: &mut Transform) {
+        let fields = [
+            (&mut transform.x, self.x),
+            (&mut transform.y, self.y),
+            (&mut transform.scale, self.scale),
+            (&mut transform.rotation, self.rotation),
+            (&mut transform.opacity, self.opacity),
+        ];
+        for (field, value) in fields {
+            if let Some(value) = value {
+                *field = value;
+            }
+        }
+    }
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TrackSide {
+    Above,
+    Below,
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MotionKind {
+    /// Zooms in.
+    PushIn,
+    /// Starts zoomed in and ends on the clip's own framing.
+    PullOut,
+    /// Zooms in while drifting to the right.
+    KenBurns,
+}
+
+/// Motion strengths an `ApplyMotion` may have.
+pub const MOTION_STRENGTHS: std::ops::RangeInclusive<f64> = 0.02..=0.5;
+
+/// The canvas point a motion zooms about, as the transform's fractions of the canvas from its
+/// centre: the middle of the safe area on vertical canvases, else the centre. Ken Burns zooms
+/// about the right edge of that area, so the picture drifts right as it grows.
+fn motion_centre(canvas: &Canvas, kind: MotionKind) -> (f32, f32) {
+    let (w, h) = (canvas.width as f32, canvas.height as f32);
+    let (left, top, right, bottom) =
+        canvas.safe_area().map_or((0.0, 0.0, w, h), |area| (area.left, area.top, area.right, area.bottom));
+    let x = if kind == MotionKind::KenBurns { right } else { (left + right) / 2.0 };
+    (x / w - 0.5, (top + bottom) / 2.0 / h - 0.5)
+}
+
+/// A punch-in over the timeline range `[start_us, end_us)`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoomRange {
+    pub start_us: i64,
+    pub end_us: i64,
+    /// Multiplies the clip's scale; 1.15–1.3 is a subtle punch-in.
+    pub scale: f64,
+}
+
+/// Zoom factors a range may have.
+pub const ZOOM_SCALES: std::ops::RangeInclusive<f64> = 0.25..=4.0;
+/// The shortest piece a zoom leaves of a clip, so it never flashes for a few frames.
+pub const MIN_ZOOM_PIECE_US: i64 = 300_000;
+
+/// Timeline range `[start_us, end_us)`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeRange {
+    pub start_us: i64,
+    pub end_us: i64,
+}
+
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AnimationSlot {
+    In,
+    Out,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutcome {
+    /// Clips the UI should select after the edit, e.g. a newly added clip.
+    pub select: Vec<String>,
+    /// Clip ids that exist after the edit but not before (including split halves).
+    pub created: Vec<String>,
+    /// Clip ids that existed before the edit but not after.
+    pub removed: Vec<String>,
+    /// Clips the edit left alone on purpose, such as clips with keyframes inside a zoom range.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+fn track_kind_for(asset: &Asset) -> TrackKind {
+    match asset.kind {
+        AssetKind::Audio => TrackKind::Audio,
+        AssetKind::Video | AssetKind::Image => TrackKind::Video,
+    }
+}
+
+fn min_duration(project: &Project) -> i64 {
+    project.frame_duration_us().ceil() as i64
+}
+
+/// Music and sound files keep playing across cuts of the main track; everything else follows them.
+pub fn stays_in_place(track: &Track) -> bool {
+    track.keep_in_place && track.kind == TrackKind::Audio
+}
+
+/// A new clip's media: the whole file, or the part the user chose, at full volume and speed.
+pub fn media(asset: &Asset, transform: Transform, shape: Option<Shape>) -> ClipContent {
+    ClipContent::Media {
+        asset_id: asset.id.clone(),
+        source_in_us: source_span(asset).0,
+        volume: 1.0,
+        transform,
+        speed: 1.0,
+        keep_pitch: false,
+        adjust: Adjust::default(),
+        fade_in_us: 0,
+        fade_out_us: 0,
+        clean_voice: false,
+        dereverb: 0.0,
+        normalize: false,
+        leveler: 0.0,
+        shape,
+        duck_db: 0.0,
+        background: Default::default(),
+    }
+}
+
+/// The longer side of a picture in picture, as a share of the canvas's shorter side.
+const PIP_SIZE: f32 = 0.45;
+/// The longer side of a new sticker, as a share of the canvas's shorter side.
+const STICKER_SIZE: f32 = 0.3;
+/// Gap to the canvas edges where no safe area applies, as a share of the canvas's shorter side.
+const PIP_MARGIN: f32 = 0.04;
+const PIP_RADIUS: f32 = 0.15;
+const PIP_SHADOW: f32 = 0.5;
+
+/// The asset scaled down into the top right corner: inside the safe area on vertical videos, a small gap
+/// from the edges on the others.
+fn picture_in_picture(canvas: &Canvas, asset: &Asset) -> Transform {
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let fit = (cw / asset.width as f32).min(ch / asset.height as f32);
+    let (w, h) = (asset.width as f32 * fit, asset.height as f32 * fit);
+    let scale = PIP_SIZE * cw.min(ch) / w.max(h);
+    let margin = PIP_MARGIN * cw.min(ch);
+    let (right, top) = canvas.safe_area().map_or((cw - margin, margin), |area| (area.right, area.top));
+    Transform {
+        x: (right - w * scale / 2.0) / cw - 0.5,
+        y: (top + h * scale / 2.0) / ch - 0.5,
+        scale,
+        ..Transform::default()
+    }
+}
+
+/// Over the video: filling the canvas when the picture is at least as large as it both ways, so filling only
+/// shrinks it; a smaller picture is fitted, as filling would blow it up past its own pixels.
+fn overlay_transform(canvas: &Canvas, asset: &Asset) -> Transform {
+    if asset.width < canvas.width || asset.height < canvas.height {
+        return Transform::default();
+    }
+    let (sx, sy) = (canvas.width as f32 / asset.width as f32, canvas.height as f32 / asset.height as f32);
+    // Rounded as the inspector's Fill is, so the inspector shows Fill as chosen.
+    Transform { scale: (sx.max(sy) / sx.min(sy) * 1000.0).round() / 1000.0, ..Transform::default() }
+}
+
+/// Where a new clip of the asset starts reading and how much it reads: the part the user chose, or
+/// the whole file.
+fn source_span(asset: &Asset) -> (i64, i64) {
+    match asset.part {
+        Some(part) if asset.kind != AssetKind::Image => (part.start_us, part.end_us - part.start_us),
+        _ => (0, asset.duration_us),
+    }
+}
+
+fn overlay_duration(asset: &Asset, duration_us: Option<i64>, min: i64) -> i64 {
+    let (source_in, length) = source_span(asset);
+    match (asset.kind, duration_us) {
+        (AssetKind::Image, d) => d.unwrap_or(IMAGE_DURATION_US).max(min),
+        (_, d) => d.unwrap_or(length).clamp(min, (asset.duration_us - source_in).max(min)),
+    }
+}
+
+impl Project {
+    fn find_clip(&self, id: &str) -> Option<(usize, usize)> {
+        self.tracks.iter().enumerate().find_map(|(ti, t)| t.clips.iter().position(|c| c.id == id).map(|ci| (ti, ci)))
+    }
+
+    fn track_index(&self, id: &str) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
+    fn is_free(&self, track: usize, start: i64, end: i64, ignore: Option<&str>) -> bool {
+        self.tracks[track]
+            .clips
+            .iter()
+            .filter(|c| Some(c.id.as_str()) != ignore)
+            .all(|c| end <= c.start_us || start >= c.end_us())
+    }
+
+    fn insert_track(&mut self, at: usize, kind: TrackKind, keep_in_place: bool) -> usize {
+        let name = match kind {
+            TrackKind::Video => "Overlay",
+            TrackKind::Audio => "Audio",
+            TrackKind::Text => "Text",
+        };
+        let at = at.clamp(1, self.tracks.len());
+        self.tracks.insert(
+            at,
+            Track {
+                id: new_id(),
+                kind,
+                name: name.into(),
+                muted: false,
+                hidden: false,
+                keep_in_place,
+                clips: Vec::new(),
+            },
+        );
+        at
+    }
+
+    /// A track of `kind` free over [start, end) that is kept in place or not, creating one if needed.
+    /// Captions tracks only take generated captions, so regenerating them never removes a title.
+    fn free_track(&mut self, kind: TrackKind, start: i64, end: i64, keep_in_place: bool) -> usize {
+        let found = self
+            .tracks
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(i, t)| {
+                t.kind == kind
+                    && !t.is_captions()
+                    && t.keep_in_place == keep_in_place
+                    && self.is_free(*i, start, end, None)
+            })
+            .map(|(i, _)| i);
+        found.unwrap_or_else(|| {
+            let at = match kind {
+                TrackKind::Video => self.tracks.iter().rposition(|t| t.kind == TrackKind::Video).unwrap_or(0) + 1,
+                TrackKind::Audio | TrackKind::Text => self.tracks.len(),
+            };
+            self.insert_track(at, kind, keep_in_place)
+        })
+    }
+
+    /// Lays out main-track clips back to back. Existing clips keep their order; a clip
+    /// that was moved or added goes before the first clip whose middle is past `start`.
+    /// Returns where that clip starts and how long it is when clips follow it.
+    fn pack_main(&mut self, moved: Option<(&str, i64)>) -> Option<(i64, i64)> {
+        let main = self.track_index(MAIN_TRACK)?;
+        let clips = &mut self.tracks[main].clips;
+        let moved_clip = moved.and_then(|(id, _)| clips.iter().position(|c| c.id == id)).map(|i| clips.remove(i));
+        clips.sort_by_key(|c| c.start_us);
+        let mut followed = None;
+        if let (Some(clip), Some((_, start))) = (moved_clip, moved) {
+            let at = clips.iter().position(|c| c.start_us + c.duration_us / 2 > start).unwrap_or(clips.len());
+            followed = (at < clips.len()).then_some(at);
+            clips.insert(at, clip);
+        }
+        let mut t = 0;
+        for c in clips.iter_mut() {
+            c.start_us = t;
+            t += c.duration_us;
+        }
+        followed.map(|i| (clips[i].start_us, clips[i].duration_us))
+    }
+
+    /// Splits a clip at `at_us` (strictly inside it) and returns the index of the second half.
+    fn split_clip(&mut self, ti: usize, ci: usize, at_us: i64) -> usize {
+        let clip = &mut self.tracks[ti].clips[ci];
+        let offset = at_us - clip.start_us;
+        let mut second = clip.clone();
+        second.id = new_id();
+        second.start_us = at_us;
+        second.duration_us = clip.end_us() - at_us;
+        if let ClipContent::Media { source_in_us, speed, fade_in_us, .. } = &mut second.content {
+            *source_in_us += (offset as f64 * *speed as f64).round() as i64;
+            *fade_in_us = 0;
+        }
+        // The first half keeps the entry animation and fade, the second the exit ones.
+        if let ClipContent::Media { fade_out_us, .. } = &mut clip.content {
+            *fade_out_us = 0;
+        }
+        clip.anim_out = None;
+        second.anim_in = None;
+        second.transition_in = None;
+        for k in &mut second.keyframes {
+            k.t_us -= offset;
+        }
+        shift_words(&mut second, offset);
+        clip.duration_us = offset;
+        self.tracks[ti].clips.insert(ci + 1, second);
+        ci + 1
+    }
+
+    /// Removes `range` from one track: clips are cut at its edges, the inside goes, later
+    /// clips move left. Pieces shorter than `min` are dropped rather than kept as slivers.
+    fn ripple_delete_track(&mut self, ti: usize, range: TimeRange, min: i64) {
+        // Backwards, so a caption split in two leaves the clips still to visit where they were.
+        for ci in (0..self.tracks[ti].clips.len()).rev() {
+            let c = &self.tracks[ti].clips[ci];
+            if !matches!(c.content, ClipContent::Text { .. })
+                || c.end_us() <= range.start_us
+                || range.end_us <= c.start_us
+            {
+                continue;
+            }
+            let (from, to) = (range.start_us - c.start_us, range.end_us - c.start_us);
+            let inside = 0 < from && to < c.duration_us;
+            let longer_before = from >= c.duration_us - to;
+            match heard_sides(c, from, to) {
+                // A generated caption shows only the words still heard; with none left, it goes.
+                Some((before, after)) if before.is_empty() && after.is_empty() => {
+                    self.tracks[ti].clips[ci].duration_us = 0
+                }
+                Some((before, after)) if inside && !before.is_empty() && !after.is_empty() => {
+                    set_words(&mut self.tracks[ti].clips[ci], after);
+                    self.split_clip(ti, ci, range.end_us);
+                    set_words(&mut self.tracks[ti].clips[ci], before);
+                }
+                Some((before, after)) => {
+                    let keep_before = !before.is_empty();
+                    set_words(&mut self.tracks[ti].clips[ci], [before, after].concat());
+                    if inside {
+                        keep_side(&mut self.tracks[ti].clips[ci], keep_before, range);
+                    }
+                }
+                // Splitting other text would show its whole text twice; it keeps only the longer side.
+                None if inside => keep_side(&mut self.tracks[ti].clips[ci], longer_before, range),
+                None => {}
+            }
+        }
+        for at in [range.start_us, range.end_us] {
+            if let Some(ci) = self.tracks[ti].clips.iter().position(|c| c.start_us < at && at < c.end_us()) {
+                self.split_clip(ti, ci, at);
+            }
+        }
+        let length = range.end_us - range.start_us;
+        let clips = &mut self.tracks[ti].clips;
+        clips.retain(|c| !(c.start_us >= range.start_us && c.end_us() <= range.end_us) && c.duration_us >= min);
+        for c in clips.iter_mut().filter(|c| c.start_us >= range.end_us) {
+            c.start_us -= length;
+        }
+    }
+
+    /// Moves the time from `at` on by `delta` on every track that follows the main track: a negative
+    /// `delta` cuts `at..at - delta` out of them, a positive one opens that much time at `at`.
+    fn ripple_others(&mut self, at: i64, delta: i64, min: i64) {
+        if delta == 0 {
+            return;
+        }
+        for thumbnail in self.thumbnails.iter_mut().filter(|t| t.time_us >= at) {
+            thumbnail.time_us = (thumbnail.time_us + delta).max(at);
+        }
+        for ti in 0..self.tracks.len() {
+            let track = &self.tracks[ti];
+            if track.id == MAIN_TRACK || stays_in_place(track) {
+                continue;
+            }
+            if delta < 0 {
+                self.ripple_delete_track(ti, TimeRange { start_us: at, end_us: at - delta }, min);
+            } else {
+                let across = self.tracks[ti].clips.iter().position(|c| c.start_us < at && at < c.end_us());
+                for c in self.tracks[ti].clips.iter_mut().filter(|c| c.start_us >= at) {
+                    c.start_us += delta;
+                }
+                // A clip across the edge opens there too: video, sound and a caption split, the caption between
+                // its words; other text and images grow rather than showing twice.
+                let Some(ci) = across else { continue };
+                let still = self.source_limit(&self.tracks[ti].clips[ci]).is_none();
+                let clip = &mut self.tracks[ti].clips[ci];
+                match heard_sides(clip, at - clip.start_us, at - clip.start_us) {
+                    Some((before, _)) if before.is_empty() => clip.start_us += delta,
+                    Some((_, after)) if after.is_empty() => {}
+                    None if still => {
+                        let offset = at - clip.start_us;
+                        for k in clip.keyframes.iter_mut().filter(|k| k.t_us >= offset) {
+                            k.t_us += delta;
+                        }
+                        clip.duration_us += delta;
+                    }
+                    sides => {
+                        if let Some((_, after)) = &sides {
+                            set_words(clip, after.clone());
+                        }
+                        let second = self.split_clip(ti, ci, at);
+                        self.tracks[ti].clips[second].start_us += delta;
+                        if let Some((before, _)) = sides {
+                            set_words(&mut self.tracks[ti].clips[ci], before);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Source length a media clip may read, or `None` for images, freeze frames and text, which have no end.
+    fn source_limit(&self, clip: &Clip) -> Option<i64> {
+        match &clip.content {
+            ClipContent::Media { .. } if clip.is_freeze() => None,
+            ClipContent::Media { asset_id, .. } => {
+                self.asset(asset_id).filter(|a| a.kind != AssetKind::Image).map(|a| a.duration_us)
+            }
+            ClipContent::Text { .. } => None,
+        }
+    }
+
+    fn caption_track(&mut self, track_id: &str) -> Result<usize> {
+        self.track_index(track_id)
+            .filter(|&i| self.tracks[i].is_captions())
+            .ok_or_else(|| anyhow!("Unknown captions track: replaceCaptions needs a text track named Captions"))
+    }
+
+    /// Revalidate fades and both sides of transitions after duration or adjacency changes.
+    fn clamp_timing_windows(&mut self) {
+        for track in &mut self.tracks {
+            let mut previous_duration = None;
+            for clip in &mut track.clips {
+                if let ClipContent::Media { fade_in_us, fade_out_us, .. } = &mut clip.content {
+                    let half = clip.duration_us.max(0) / 2;
+                    *fade_in_us = (*fade_in_us).clamp(0, half);
+                    *fade_out_us = (*fade_out_us).clamp(0, half);
+                }
+                if track.id == MAIN_TRACK
+                    && let (Some(previous), Some(transition)) = (previous_duration, &mut clip.transition_in)
+                {
+                    transition.duration_us =
+                        transition.duration_us.min(MAX_TRANSITION_US).min(previous).min(clip.duration_us);
+                }
+                previous_duration = Some(clip.duration_us);
+            }
+        }
+    }
+
+    fn tidy(&mut self) {
+        self.tracks.retain(|t| t.id == MAIN_TRACK || !t.clips.is_empty());
+        for t in &mut self.tracks {
+            t.clips.sort_by_key(|c| c.start_us);
+        }
+    }
+
+    /// Applies one edit. On error the project may be partly changed; `Editor::apply`
+    /// restores it, so callers that need atomic edits go through the editor.
+    pub fn apply(&mut self, cmd: EditCmd) -> Result<EditOutcome> {
+        let mut out = EditOutcome::default();
+        let mut moved: Option<(String, i64)> = None;
+        let moving = matches!(cmd, EditCmd::MoveClip { .. });
+        match cmd {
+            EditCmd::AddAssets { .. }
+            | EditCmd::RemoveAsset { .. }
+            | EditCmd::AddClip { .. }
+            | EditCmd::AddPictureInPicture { .. }
+            | EditCmd::AddOverlay { .. }
+            | EditCmd::AddSticker { .. }
+            | EditCmd::AddText { .. }
+            | EditCmd::DetachAudio { .. }
+            | EditCmd::ReplaceClip { .. } => self.apply_media(cmd, &mut out, &mut moved)?,
+            EditCmd::MoveClip { .. }
+            | EditCmd::MoveClips { .. }
+            | EditCmd::TrimClip { .. }
+            | EditCmd::SplitClip { .. }
+            | EditCmd::FreezeFrame { .. }
+            | EditCmd::DeleteClips { .. }
+            | EditCmd::DuplicateClip { .. } => self.apply_placement(cmd, &mut out, &mut moved)?,
+            EditCmd::UpdateClip { .. }
+            | EditCmd::SetAnimation { .. }
+            | EditCmd::SetTransition { .. }
+            | EditCmd::SetKeyframes { .. }
+            | EditCmd::SetEffects { .. } => self.apply_clip(cmd)?,
+            EditCmd::UpdateTrack { .. } | EditCmd::SetCanvas { .. } | EditCmd::RenameProject { .. } => {
+                self.apply_tracks(cmd)?
+            }
+            EditCmd::AddCaptions { .. } | EditCmd::ReplaceCaptions { .. } | EditCmd::RippleDeleteRanges { .. } => {
+                self.apply_captions(cmd, &mut out)?
+            }
+            EditCmd::PasteClips { clips, at_us } => self.paste_clips(clips, at_us, &mut out)?,
+            EditCmd::ReplaceMainClips { clips } => self.replace_main_clips(clips)?,
+            EditCmd::PasteAttributes { source, clip_ids } => self.paste_attributes(source, clip_ids, &mut out)?,
+            EditCmd::RestyleTrack { track_id, style, transform } => {
+                self.restyle_track(&track_id, style, transform, &mut out)?
+            }
+            EditCmd::CorrectWords { corrections } => self.correct_words(corrections)?,
+            EditCmd::ZoomRanges { ranges } => self.zoom_ranges(ranges, &mut out)?,
+            EditCmd::ApplyMotion { clip_id, range, kind, strength } => {
+                self.apply_motion(clip_id, range, kind, strength, &mut out)?
+            }
+            EditCmd::SetThumbnail { thumbnail } => {
+                self.thumbnails.retain(|t| t.format != thumbnail.format);
+                self.thumbnails.push(thumbnail);
+                self.thumbnails.sort_by_key(|t| t.format as u8);
+            }
+            EditCmd::RemoveThumbnail { format } => self.thumbnails.retain(|t| t.format != format),
+            EditCmd::SetReelCandidates { candidates } => {
+                self.reel_candidates = candidates;
+                self.reel_candidates.sort_by_key(|c| c.start_us);
+            }
+            EditCmd::UpdateReelCandidate { candidate } => {
+                let slot = self
+                    .reel_candidates
+                    .iter_mut()
+                    .find(|c| c.id == candidate.id)
+                    .ok_or_else(|| anyhow!("Unknown reel candidate"))?;
+                *slot = candidate;
+                self.reel_candidates.sort_by_key(|c| c.start_us);
+            }
+        }
+        // A clip added in between main-track clips pushes the clips after it along, so the other tracks open the same
+        // time there and captions and overlays stay over their picture, as when pasting. A moved clip does not: what
+        // sits at its old time on the other tracks, such as its detached sound, can be its own.
+        if let Some((at, duration)) = self.pack_main(moved.as_ref().map(|(id, s)| (id.as_str(), *s)))
+            && !moving
+        {
+            self.ripple_others(at, duration, min_duration(self));
+        }
+        self.tidy();
+        self.clamp_timing_windows();
+        Ok(out)
+    }
+
+    fn add_overlay(
+        &mut self,
+        asset: &Asset,
+        start_us: i64,
+        duration: i64,
+        transform: Transform,
+        shape: Option<Shape>,
+        out: &mut EditOutcome,
+    ) {
+        let start = start_us.max(0);
+        let clip = Clip::new(new_id(), start, duration, media(asset, transform, shape));
+        let track = self.free_track(TrackKind::Video, start, start + duration, false);
+        out.select.push(clip.id.clone());
+        self.tracks[track].clips.push(clip);
+    }
+
+    fn apply_media(&mut self, cmd: EditCmd, out: &mut EditOutcome, moved: &mut Option<(String, i64)>) -> Result<()> {
+        let min = min_duration(self);
+        match cmd {
+            EditCmd::AddAssets { assets } => {
+                for a in assets {
+                    if self.asset(&a.id).is_none() {
+                        self.assets.push(a);
+                    }
+                }
+            }
+            EditCmd::RemoveAsset { asset_id } => {
+                self.assets.retain(|a| a.id != asset_id);
+                for t in &mut self.tracks {
+                    t.clips.retain(|c| !matches!(&c.content, ClipContent::Media { asset_id: a, .. } if *a == asset_id));
+                    // An image behind a person goes with the image; the person stays.
+                    for c in &mut t.clips {
+                        if let ClipContent::Media { background, .. } = &mut c.content
+                            && matches!(background, Background::Image { asset_id: a } if *a == asset_id)
+                        {
+                            *background = Background::None;
+                        }
+                    }
+                }
+                for t in &mut self.thumbnails {
+                    if t.image.as_deref() == Some(asset_id.as_str()) {
+                        t.image = None;
+                    }
+                    t.overlays.retain(|o| o.asset_id != asset_id);
+                }
+            }
+            EditCmd::AddClip { asset_id, start_us, track_id } => {
+                let asset = self.asset(&asset_id).ok_or_else(|| anyhow!("Unknown media"))?.clone();
+                let kind = track_kind_for(&asset);
+                let keep = asset.kind == AssetKind::Audio;
+                let duration =
+                    if asset.kind == AssetKind::Image { IMAGE_DURATION_US } else { source_span(&asset).1.max(min) };
+                let clip = Clip::new(new_id(), 0, duration, media(&asset, Transform::default(), None));
+                out.select.push(clip.id.clone());
+                let requested = track_id.and_then(|id| self.track_index(&id)).filter(|&i| self.tracks[i].kind == kind);
+                let target = match (kind, requested) {
+                    (_, Some(i)) => i,
+                    (TrackKind::Video, None) => 0,
+                    (_, None) => self.free_track(kind, start_us.unwrap_or(0), start_us.unwrap_or(0) + duration, keep),
+                };
+                let start = start_us.unwrap_or(if target == 0 { i64::MAX / 4 } else { 0 }).max(0);
+                if target != 0 && !self.is_free(target, start, start + duration, None) {
+                    let t = self.free_track(kind, start, start + duration, keep);
+                    self.tracks[t].clips.push(Clip { start_us: start, ..clip });
+                } else {
+                    if target == 0 {
+                        *moved = Some((clip.id.clone(), start));
+                    }
+                    self.tracks[target].clips.push(Clip { start_us: start, ..clip });
+                }
+            }
+            EditCmd::AddPictureInPicture { asset_id, start_us, duration_us } => {
+                let asset = self.asset(&asset_id).ok_or_else(|| anyhow!("Unknown media"))?.clone();
+                ensure!(
+                    asset.kind != AssetKind::Audio && asset.width > 0 && asset.height > 0,
+                    "Only a video or an image can be a picture in picture"
+                );
+                let duration = overlay_duration(&asset, duration_us, min);
+                let shape = Shape { radius: PIP_RADIUS, shadow: PIP_SHADOW, ..Shape::default() };
+                self.add_overlay(
+                    &asset,
+                    start_us,
+                    duration,
+                    picture_in_picture(&self.canvas, &asset),
+                    Some(shape),
+                    out,
+                );
+            }
+            EditCmd::AddOverlay { asset_id, start_us, duration_us } => {
+                let asset = self.asset(&asset_id).ok_or_else(|| anyhow!("Unknown media"))?.clone();
+                ensure!(
+                    asset.kind != AssetKind::Audio && asset.width > 0 && asset.height > 0,
+                    "Only a video or an image can go over the video"
+                );
+                let duration = overlay_duration(&asset, duration_us, min);
+                self.add_overlay(&asset, start_us, duration, overlay_transform(&self.canvas, &asset), None, out);
+            }
+            EditCmd::AddSticker { asset_id, start_us, duration_us, transform } => {
+                let asset = self.asset(&asset_id).ok_or_else(|| anyhow!("Unknown media"))?.clone();
+                ensure!(
+                    asset.kind != AssetKind::Audio && asset.width > 0 && asset.height > 0,
+                    "Only a video or an image can be a sticker"
+                );
+                let duration = overlay_duration(&asset, duration_us, min);
+                let transform = transform.unwrap_or_else(|| {
+                    let (cw, ch) = (self.canvas.width as f32, self.canvas.height as f32);
+                    let fit = (cw / asset.width as f32).min(ch / asset.height as f32);
+                    Transform {
+                        scale: STICKER_SIZE * cw.min(ch) / (asset.width.max(asset.height) as f32 * fit),
+                        ..Transform::default()
+                    }
+                });
+                self.add_overlay(&asset, start_us, duration, transform, None, out);
+            }
+            EditCmd::AddText { start_us, text, style } => {
+                let start = start_us.max(0);
+                let t = self.free_track(TrackKind::Text, start, start + TEXT_DURATION_US, false);
+                let clip = Clip::new(
+                    new_id(),
+                    start,
+                    TEXT_DURATION_US,
+                    ClipContent::Text {
+                        text,
+                        style,
+                        // Centred like CapCut; captions sit lower, so a hook title and captions do not collide.
+                        transform: Transform::default(),
+                        words: Vec::new(),
+                    },
+                );
+                out.select.push(clip.id.clone());
+                self.tracks[t].clips.push(clip);
+            }
+            EditCmd::DetachAudio { clip_id } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let clip = self.tracks[ti].clips[ci].clone();
+                let ClipContent::Media { asset_id, volume, .. } = &clip.content else {
+                    bail!("Only video clips have sound to detach")
+                };
+                if self.tracks[ti].kind != TrackKind::Video {
+                    bail!("This clip is already sound on its own track");
+                }
+                let asset = self.asset(asset_id).ok_or_else(|| anyhow!("Unknown media"))?;
+                if asset.kind != AssetKind::Video || !asset.has_audio || *volume <= 0.0 {
+                    bail!("This clip has no sound to detach");
+                }
+                let mut sound = Clip::new(new_id(), clip.start_us, clip.duration_us, clip.content.clone());
+                if let ClipContent::Media { transform, adjust, shape, background, .. } = &mut sound.content {
+                    *transform = Transform::default();
+                    *adjust = Adjust::default();
+                    *shape = None;
+                    *background = Background::None;
+                }
+                if let ClipContent::Media { volume, .. } = &mut self.tracks[ti].clips[ci].content {
+                    *volume = 0.0;
+                }
+                // Detached sound is speech: it is cut together with the picture.
+                let target = self.free_track(TrackKind::Audio, clip.start_us, clip.end_us(), false);
+                out.select.push(sound.id.clone());
+                self.tracks[target].clips.push(sound);
+            }
+            EditCmd::ReplaceClip { clip_id, asset_id } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let asset = self.asset(&asset_id).ok_or_else(|| anyhow!("Unknown media"))?.clone();
+                let clip = &self.tracks[ti].clips[ci];
+                let ClipContent::Media { speed, .. } = clip.content else {
+                    bail!("Only video, image and sound clips take other media")
+                };
+                ensure!(
+                    !clip.is_freeze(),
+                    "A freeze frame holds a frame of its video; freeze a frame of the other media instead"
+                );
+                match self.tracks[ti].kind {
+                    TrackKind::Video => ensure!(
+                        asset.kind != AssetKind::Audio,
+                        "Sound can't go in a video clip; drop it on an audio track"
+                    ),
+                    _ => ensure!(crate::audio::has_audio(&asset), "This media has no sound for an audio clip"),
+                }
+                let needed = (clip.duration_us as f64 * speed as f64).round() as i64;
+                let source_in = if asset.kind == AssetKind::Image {
+                    0
+                } else {
+                    let available = asset.duration_us;
+                    ensure!(
+                        needed as f64 <= available as f64 + min as f64 * speed as f64,
+                        "This media is {:.1} s and the clip needs {:.1} s{}. Pick longer media or shorten the clip first.",
+                        available as f64 / 1e6,
+                        needed as f64 / 1e6,
+                        if speed == 1.0 { String::new() } else { format!(" at {speed}x") }
+                    );
+                    source_span(&asset).0.min(available - needed).max(0)
+                };
+                let sound = crate::audio::has_audio(&asset);
+                if let ClipContent::Media {
+                    asset_id: a, source_in_us, clean_voice, dereverb, normalize, leveler, ..
+                } = &mut self.tracks[ti].clips[ci].content
+                {
+                    *a = asset.id;
+                    *source_in_us = source_in;
+                    if !sound {
+                        *clean_voice = false;
+                        *dereverb = 0.0;
+                        *normalize = false;
+                        *leveler = 0.0;
+                    }
+                }
+                out.select.push(clip_id);
+            }
+            _ => unreachable!("command dispatched to the wrong edit group"),
+        }
+        Ok(())
+    }
+
+    fn apply_placement(
+        &mut self,
+        cmd: EditCmd,
+        out: &mut EditOutcome,
+        moved: &mut Option<(String, i64)>,
+    ) -> Result<()> {
+        let min = min_duration(self);
+        match cmd {
+            EditCmd::MoveClip { clip_id, track_id, start_us, new_track } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                // Clips always sit on a track of their kind; detached sound is a video asset on an audio track.
+                let kind = self.tracks[ti].kind;
+                let keep = self.tracks[ti].keep_in_place;
+                let beside = match new_track {
+                    None => None,
+                    Some(side) => {
+                        let at = match &track_id {
+                            Some(id) => self.track_index(id).ok_or_else(|| anyhow!("Unknown track"))?,
+                            None => ti,
+                        };
+                        let audio = kind == TrackKind::Audio;
+                        ensure!(
+                            (self.tracks[at].kind == TrackKind::Audio) == audio,
+                            "A new track for this clip goes beside {} track",
+                            if audio { "an audio" } else { "a video or text" }
+                        );
+                        // Audio tracks are listed top down; video and text tracks stack, the main track lowest.
+                        Some(match (side, audio) {
+                            (TrackSide::Above, false) | (TrackSide::Below, true) => at + 1,
+                            _ => {
+                                ensure!(at != 0, "Nothing goes below the main track");
+                                at
+                            }
+                        })
+                    }
+                };
+                let mut clip = self.tracks[ti].clips.remove(ci);
+                let start = start_us.max(0);
+                clip.start_us = start;
+                let end = start + clip.duration_us;
+                let target = match beside {
+                    Some(at) => Some(self.insert_track(at, kind, keep)),
+                    None => track_id.and_then(|id| self.track_index(&id)).filter(|&i| self.tracks[i].kind == kind),
+                };
+                let target = match target {
+                    Some(0) => {
+                        *moved = Some((clip.id.clone(), start));
+                        0
+                    }
+                    Some(i) if self.is_free(i, start, end, None) => i,
+                    // Dropped onto an occupied spot or no track: a new track right above.
+                    Some(i) => self.insert_track(i + 1, kind, keep),
+                    None => {
+                        let at = match kind {
+                            TrackKind::Video => ti + 1,
+                            _ => self.tracks.len(),
+                        };
+                        self.insert_track(at, kind, keep)
+                    }
+                };
+                out.select.push(clip.id.clone());
+                self.tracks[target].clips.push(clip);
+            }
+            EditCmd::MoveClips { clip_ids, offset_us } => {
+                let mut groups: Vec<(String, Vec<Clip>)> = Vec::new();
+                for id in &clip_ids {
+                    let (ti, ci) = self.find_clip(id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                    ensure!(
+                        self.tracks[ti].id != MAIN_TRACK,
+                        "Main-track clips sit back to back; move one with moveClip"
+                    );
+                    let clip = self.tracks[ti].clips.remove(ci);
+                    let track = &self.tracks[ti].id;
+                    match groups.iter_mut().find(|g| &g.0 == track) {
+                        Some(group) => group.1.push(clip),
+                        None => groups.push((track.clone(), vec![clip])),
+                    }
+                }
+                let earliest = groups.iter().flat_map(|g| &g.1).map(|c| c.start_us).min().unwrap_or(0);
+                let offset = offset_us.max(-earliest);
+                for (track_id, mut clips) in groups {
+                    for c in &mut clips {
+                        c.start_us += offset;
+                    }
+                    let i = self.track_index(&track_id).ok_or_else(|| anyhow!("Unknown track"))?;
+                    let target = if clips.iter().all(|c| self.is_free(i, c.start_us, c.end_us(), None)) {
+                        i
+                    } else {
+                        let Track { kind, keep_in_place, muted, hidden, .. } = self.tracks[i];
+                        let t = self.insert_track(i + 1, kind, keep_in_place);
+                        // The group only steps aside, so it stays hidden or muted with its own track.
+                        (self.tracks[t].muted, self.tracks[t].hidden) = (muted, hidden);
+                        t
+                    };
+                    self.tracks[target].clips.extend(clips);
+                }
+            }
+            EditCmd::TrimClip { clip_id, start_us, duration_us, source_in_us } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let limit = self.source_limit(&self.tracks[ti].clips[ci]);
+                let freeze = self.tracks[ti].clips[ci].is_freeze();
+                let (speed, old_src) = match &self.tracks[ti].clips[ci].content {
+                    ClipContent::Media { speed, source_in_us, .. } => (*speed as f64, *source_in_us),
+                    ClipContent::Text { .. } => (1.0, 0),
+                };
+                let main = self.tracks[ti].id == MAIN_TRACK;
+                let clip = &mut self.tracks[ti].clips[ci];
+                let (old_start, old_end) = (clip.start_us, clip.end_us());
+                let mut start = start_us.max(0);
+                let mut duration = duration_us.max(min);
+                // A later source start with the source end kept trims the head even when start_us stays, as an
+                // agent sends it for a packed main track; otherwise the picture would slip under the captions.
+                let head_trim = source_in_us.is_some_and(|s| {
+                    s != old_src
+                        && (s - old_src - ((clip.duration_us - duration_us) as f64 * speed).round() as i64).abs() <= 1
+                });
+                let moves_left = start_us != old_start || head_trim;
+                // An image or a freeze frame has no source time to move, so its left edge moves without one.
+                let left_edge = moves_left && (source_in_us.is_some() || limit.is_none());
+                if let ClipContent::Media { source_in_us: src, .. } = &mut clip.content
+                    && speed > 0.0
+                {
+                    let mut new_src = source_in_us.unwrap_or(*src).max(0);
+                    if source_in_us.is_some() && moves_left {
+                        // Trimming the left edge: keep the right edge in place.
+                        let shift = ((new_src - *src) as f64 / speed).round() as i64;
+                        // The main track packs the clip where it was, so its head can grow past the timeline's start.
+                        start = if main { old_start + shift } else { (old_start + shift).max(0) };
+                        new_src = *src + ((start - old_start) as f64 * speed).round() as i64;
+                        duration = (old_end - start).max(min);
+                    }
+                    if let Some(limit) = limit {
+                        // The shortest clip still covers `min * speed` of source.
+                        let reserve = (min as f64 * speed).ceil() as i64;
+                        new_src = new_src.min((limit - reserve).max(0));
+                        duration = duration.min(((limit - new_src) as f64 / speed) as i64).max(min);
+                    }
+                    *src = new_src;
+                }
+                // Keyframes and spoken words stay attached to the content when the left edge moves.
+                let shift = start - old_start;
+                for k in &mut clip.keyframes {
+                    k.t_us -= shift;
+                }
+                shift_words(clip, shift);
+                clip.start_us = if main { old_start } else { start };
+                clip.duration_us = duration;
+                if main {
+                    // Packing keeps the clip's start, so the other tracks gain or lose the time at the moved edge.
+                    if left_edge {
+                        self.ripple_others(old_start, old_start - start, min);
+                    } else {
+                        let old_duration = old_end - old_start;
+                        self.ripple_others(old_start + duration.min(old_duration), duration - old_duration, min);
+                    }
+                }
+                if ti != 0 {
+                    let end = start + duration;
+                    // A freeze frame pushes what follows it on its track, as when it was made, so it can stretch.
+                    if freeze && end > old_end {
+                        for c in self.tracks[ti].clips.iter_mut().filter(|c| c.id != clip_id && c.start_us >= old_end) {
+                            c.start_us += end - old_end;
+                        }
+                    }
+                    if !self.is_free(ti, start, end, Some(&clip_id)) {
+                        bail!("Clips on the same track cannot overlap");
+                    }
+                }
+            }
+            EditCmd::SplitClip { clip_id, at_us } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let clip = &self.tracks[ti].clips[ci];
+                if at_us < clip.start_us + min || at_us > clip.end_us() - min {
+                    bail!("Move the playhead inside the clip to split it");
+                }
+                let second = self.split_clip(ti, ci, at_us);
+                out.select.push(self.tracks[ti].clips[second].id.clone());
+            }
+            EditCmd::FreezeFrame { clip_id, at_us, duration_us } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let clip = self.tracks[ti].clips[ci].clone();
+                let ClipContent::Media { asset_id, .. } = &clip.content else {
+                    bail!("Only video clips have a frame to freeze")
+                };
+                let asset = self.asset(asset_id).ok_or_else(|| anyhow!("Unknown media"))?;
+                ensure!(
+                    self.tracks[ti].kind == TrackKind::Video && asset.kind == AssetKind::Video,
+                    "Only video clips have a frame to freeze"
+                );
+                ensure!(!clip.is_freeze(), "This clip is already a freeze frame");
+                ensure!(
+                    clip.start_us <= at_us && at_us < clip.end_us(),
+                    "Move the playhead over the clip to freeze its frame"
+                );
+                let duration = duration_us.unwrap_or(FREEZE_DURATION_US);
+                ensure!(duration >= min, "A freeze frame lasts at least one frame");
+                let last = (asset.duration_us - 1).max(0);
+                let mut still = clip.clone();
+                still.id = new_id();
+                still.duration_us = duration;
+                if let ClipContent::Media { transform, .. } = &mut still.content {
+                    let shown = crate::effects::transform_at(&clip, at_us).0;
+                    // A picture popping in from nothing is invisible there, and a scale of 0 is no transform.
+                    *transform =
+                        Transform { scale: if shown.scale > 0.0 { shown.scale } else { transform.scale }, ..shown };
+                }
+                still.anim_in = None;
+                still.anim_out = None;
+                still.transition_in = None;
+                still.keyframes.clear();
+                if let ClipContent::Media {
+                    source_in_us,
+                    speed,
+                    volume,
+                    keep_pitch,
+                    fade_in_us,
+                    fade_out_us,
+                    clean_voice,
+                    dereverb,
+                    normalize,
+                    leveler,
+                    duck_db,
+                    ..
+                } = &mut still.content
+                {
+                    *source_in_us = crate::effects::source_time(&clip, at_us).min(last);
+                    (*speed, *volume, *keep_pitch, *clean_voice, *normalize) = (0.0, 0.0, false, false, false);
+                    (*fade_in_us, *fade_out_us, *dereverb, *leveler, *duck_db) = (0, 0, 0.0, 0.0, 0.0);
+                }
+                let at = if at_us - clip.start_us < min {
+                    clip.start_us
+                } else if clip.end_us() - at_us < min {
+                    clip.end_us()
+                } else {
+                    self.split_clip(ti, ci, at_us);
+                    at_us
+                };
+                still.start_us = at;
+                out.select.push(still.id.clone());
+                if ti == 0 {
+                    *moved = Some((still.id.clone(), at));
+                } else {
+                    for c in self.tracks[ti].clips.iter_mut().filter(|c| c.start_us >= at) {
+                        c.start_us += duration;
+                    }
+                }
+                self.tracks[ti].clips.push(still);
+            }
+            EditCmd::DeleteClips { clip_ids } => {
+                let cuts: Vec<(i64, i64)> = self
+                    .track_index(MAIN_TRACK)
+                    .map(|ti| &self.tracks[ti].clips)
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| clip_ids.contains(&c.id))
+                    .map(|c| (c.start_us, c.duration_us))
+                    .collect();
+                for t in &mut self.tracks {
+                    t.clips.retain(|c| !clip_ids.contains(&c.id));
+                }
+                // The main track closes the gap, so the other tracks lose that time too and captions and
+                // overlays stay over the same picture, as when trimming. Later cuts first keep earlier ones valid.
+                for (start, duration) in cuts.into_iter().rev() {
+                    self.ripple_others(start, -duration, min);
+                }
+            }
+            EditCmd::DuplicateClip { clip_id } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let mut copy = self.tracks[ti].clips[ci].clone();
+                copy.id = new_id();
+                copy.start_us = self.tracks[ti].clips[ci].end_us();
+                copy.transition_in = None;
+                out.select.push(copy.id.clone());
+                let target = if ti == 0 || self.is_free(ti, copy.start_us, copy.end_us(), None) {
+                    ti
+                } else {
+                    let (kind, keep) = (self.tracks[ti].kind, self.tracks[ti].keep_in_place);
+                    self.free_track(kind, copy.start_us, copy.end_us(), keep)
+                };
+                if target == 0 {
+                    *moved = Some((copy.id.clone(), copy.start_us));
+                }
+                self.tracks[target].clips.push(copy);
+            }
+            _ => unreachable!("command dispatched to the wrong edit group"),
+        }
+        Ok(())
+    }
+
+    fn apply_clip(&mut self, cmd: EditCmd) -> Result<()> {
+        let min = min_duration(self);
+        match cmd {
+            EditCmd::UpdateClip {
+                clip_id,
+                transform,
+                volume,
+                text,
+                style,
+                speed,
+                keep_pitch,
+                adjust,
+                fade_in_us,
+                fade_out_us,
+                clean_voice,
+                dereverb,
+                normalize,
+                leveler,
+                shape,
+                duck_db,
+                background,
+            } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let changes_length = speed.is_some();
+                ensure!(
+                    !self.tracks[ti].clips[ci].is_freeze()
+                        || (speed.is_none()
+                            && keep_pitch.is_none()
+                            && volume.is_none_or(|v| v == 0.0)
+                            && fade_in_us.is_none_or(|f| f == 0)
+                            && fade_out_us.is_none_or(|f| f == 0)
+                            && duck_db.is_none_or(|d| d == 0.0)),
+                    "A freeze frame has no sound or speed; trim it to change how long it lasts"
+                );
+                ensure!(
+                    shape.is_none() || matches!(self.tracks[ti].clips[ci].content, ClipContent::Media { .. }),
+                    "Only video and image clips have a shape"
+                );
+                if let Some(background) = background.as_ref().filter(|b| !b.is_none()) {
+                    let picture = match &self.tracks[ti].clips[ci].content {
+                        ClipContent::Media { asset_id, .. } => {
+                            self.tracks[ti].kind == TrackKind::Video
+                                && self.asset(asset_id).is_some_and(|a| a.kind != AssetKind::Audio)
+                        }
+                        ClipContent::Text { .. } => false,
+                    };
+                    ensure!(picture, "Only video and image clips have a background");
+                    if let Background::Image { asset_id } = &**background {
+                        ensure!(
+                            self.asset(asset_id).is_some_and(|a| a.kind == AssetKind::Image),
+                            "The background must be an image of the project"
+                        );
+                    }
+                }
+                if clean_voice == Some(true)
+                    || dereverb.is_some_and(|x| x > 0.0)
+                    || normalize == Some(true)
+                    || leveler.is_some_and(|x| x > 0.0)
+                {
+                    let clip = &self.tracks[ti].clips[ci];
+                    let sound = match &clip.content {
+                        ClipContent::Media { asset_id, .. } => {
+                            !clip.is_freeze() && self.asset(asset_id).is_some_and(crate::audio::has_audio)
+                        }
+                        ClipContent::Text { .. } => false,
+                    };
+                    ensure!(sound, "This clip has no sound to change");
+                }
+                let limit = self.source_limit(&self.tracks[ti].clips[ci]);
+                let clip = &mut self.tracks[ti].clips[ci];
+                let half = clip.duration_us / 2;
+                match &mut clip.content {
+                    ClipContent::Media {
+                        source_in_us: src,
+                        transform: tr,
+                        volume: v,
+                        speed: sp,
+                        keep_pitch: kp,
+                        adjust: adj,
+                        fade_in_us: fi,
+                        fade_out_us: fo,
+                        clean_voice: cv,
+                        dereverb: dr,
+                        normalize: n,
+                        leveler: l,
+                        shape: sh,
+                        duck_db: duck,
+                        background: bg,
+                        ..
+                    } => {
+                        if let Some(x) = transform {
+                            *tr = x;
+                        }
+                        if let Some(x) = shape {
+                            *sh = Some(x).filter(|x| *x != Shape::default());
+                        }
+                        if let Some(x) = volume {
+                            *v = x.clamp(0.0, 4.0);
+                        }
+                        if let Some(x) = adjust {
+                            *adj = x;
+                        }
+                        if let Some(x) = fade_in_us {
+                            *fi = x.clamp(0, half);
+                        }
+                        if let Some(x) = fade_out_us {
+                            *fo = x.clamp(0, half);
+                        }
+                        if let Some(x) = clean_voice {
+                            *cv = x;
+                        }
+                        if let Some(x) = dereverb {
+                            *dr = x.clamp(0.0, 1.0);
+                        }
+                        if let Some(x) = normalize {
+                            *n = x;
+                        }
+                        if let Some(x) = leveler {
+                            *l = x.clamp(0.0, 1.0);
+                        }
+                        if let Some(x) = duck_db {
+                            *duck = x.clamp(0.0, MAX_DUCK_DB);
+                        }
+                        if let Some(x) = background {
+                            *bg = *x;
+                        }
+                        if let Some(x) = keep_pitch {
+                            *kp = x;
+                        }
+                        if let Some(x) = speed {
+                            let x = x.clamp(MIN_SPEED, MAX_SPEED);
+                            if *sp == 1.0 && keep_pitch.is_none() {
+                                *kp = true;
+                            }
+                            let ratio = *sp as f64 / x as f64;
+                            *sp = x;
+                            // Rounded down, the clip never covers more source than it did before the change.
+                            clip.duration_us = ((clip.duration_us as f64 * ratio).floor() as i64).max(min);
+                            for k in &mut clip.keyframes {
+                                k.t_us = (k.t_us as f64 * ratio).round() as i64;
+                            }
+                            // A one-frame clip covers more source when sped up; move its start back
+                            // rather than read past the end of the file. Less than half a microsecond past it is
+                            // floating-point error, not more source.
+                            if let Some(limit) = limit {
+                                let span = (clip.duration_us as f64 * x as f64).round() as i64;
+                                if span > limit {
+                                    bail!("This clip is too short for that speed");
+                                }
+                                *src = (*src).min(limit - span);
+                            }
+                        }
+                    }
+                    ClipContent::Text { transform: tr, text: tx, style: st, words } => {
+                        if let Some(x) = transform {
+                            *tr = x;
+                        }
+                        if let Some(x) = text {
+                            retext_words(words, tx, &x);
+                            *tx = x;
+                        }
+                        if let Some(x) = style {
+                            *st = x;
+                        }
+                    }
+                }
+                let clip = &self.tracks[ti].clips[ci];
+                if changes_length && ti != 0 && !self.is_free(ti, clip.start_us, clip.end_us(), Some(&clip_id)) {
+                    bail!("There is no room on this track for the clip at the new speed");
+                }
+            }
+            EditCmd::SetAnimation { clip_id, slot, animation } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let clip = &mut self.tracks[ti].clips[ci];
+                let animation =
+                    animation.map(|a| Animation { duration_us: a.duration_us.clamp(min, clip.duration_us), ..a });
+                match slot {
+                    AnimationSlot::In => clip.anim_in = animation,
+                    AnimationSlot::Out => clip.anim_out = animation,
+                }
+            }
+            EditCmd::SetTransition { clip_id, transition } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                if self.tracks[ti].id != MAIN_TRACK || ci == 0 {
+                    bail!("Transitions go between two clips on the main track");
+                }
+                let shortest = self.tracks[ti].clips[ci - 1].duration_us.min(self.tracks[ti].clips[ci].duration_us);
+                self.tracks[ti].clips[ci].transition_in = transition.map(|t| Transition {
+                    duration_us: t.duration_us.clamp(min, MAX_TRANSITION_US.min(shortest).max(min)),
+                    ..t
+                });
+            }
+            EditCmd::SetKeyframes { clip_id, mut keyframes } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                keyframes.sort_by_key(|k| k.t_us);
+                keyframes.dedup_by_key(|k| k.t_us);
+                self.tracks[ti].clips[ci].keyframes = keyframes;
+            }
+            EditCmd::SetEffects { clip_id, effects } => {
+                let (ti, ci) = self.find_clip(&clip_id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                let picture = self.tracks[ti].kind == TrackKind::Video
+                    && matches!(&self.tracks[ti].clips[ci].content, ClipContent::Media { asset_id, .. }
+                        if self.asset(asset_id).is_some_and(|a| a.kind != AssetKind::Audio));
+                ensure!(picture || effects.is_empty(), "Effects go on video and image clips");
+                ensure!(effects.len() <= MAX_CLIP_EFFECTS, "A clip has at most {MAX_CLIP_EFFECTS} effects");
+                self.tracks[ti].clips[ci].effects = effects;
+            }
+            _ => unreachable!("command dispatched to the wrong edit group"),
+        }
+        Ok(())
+    }
+
+    fn apply_tracks(&mut self, cmd: EditCmd) -> Result<()> {
+        match cmd {
+            EditCmd::UpdateTrack { track_id, muted, hidden, keep_in_place } => {
+                let i = self.track_index(&track_id).ok_or_else(|| anyhow!("Unknown track"))?;
+                let t = &mut self.tracks[i];
+                if let Some(m) = muted {
+                    t.muted = m;
+                }
+                if let Some(h) = hidden {
+                    t.hidden = h;
+                }
+                if let Some(k) = keep_in_place {
+                    // Keeping place across cuts is for music: a kept video or text track would drift
+                    // out of sync with the picture by every cut.
+                    ensure!(!k || t.kind == TrackKind::Audio, "Only audio tracks can keep their place while cutting");
+                    t.keep_in_place = k;
+                }
+            }
+            EditCmd::SetCanvas { width, height, background, background_blur } => {
+                if let Some(b) = background_blur {
+                    self.canvas.background_blur = b.clamp(0.0, 1.0);
+                }
+                if width < 16 || height < 16 || width > 7680 || height > 7680 {
+                    bail!("Unsupported canvas size");
+                }
+                self.canvas.width = width & !1;
+                self.canvas.height = height & !1;
+                if let Some(b) = background {
+                    self.canvas.background = b;
+                }
+            }
+            EditCmd::RenameProject { name } => {
+                let name = name.trim();
+                if !name.is_empty() {
+                    self.name = name.to_string();
+                }
+            }
+            _ => unreachable!("command dispatched to the wrong edit group"),
+        }
+        Ok(())
+    }
+
+    fn apply_captions(&mut self, cmd: EditCmd, out: &mut EditOutcome) -> Result<()> {
+        let min = min_duration(self);
+        match cmd {
+            EditCmd::AddCaptions { segments, style, anim_in, anim_out, transform } => {
+                let clips = caption_clips(segments, &style, [anim_in, anim_out], transform, &self.canvas, min)?;
+                out.select = clips.iter().map(|c| c.id.clone()).take(1).collect();
+                self.tracks.push(Track {
+                    id: new_id(),
+                    kind: TrackKind::Text,
+                    name: CAPTIONS_TRACK.into(),
+                    muted: false,
+                    hidden: false,
+                    keep_in_place: false,
+                    clips,
+                });
+            }
+            EditCmd::ReplaceCaptions { track_id, segments, style, anim_in, anim_out, transform } => {
+                let ti = self.caption_track(&track_id)?;
+                let clips = caption_clips(segments, &style, [anim_in, anim_out], transform, &self.canvas, min)?;
+                out.select = clips.iter().map(|c| c.id.clone()).take(1).collect();
+                self.tracks[ti].clips = clips;
+            }
+            EditCmd::RippleDeleteRanges { ranges, keep_track_ids } => {
+                // A mistyped id would silently cut the track the caller meant to keep.
+                if let Some(unknown) = keep_track_ids.iter().flatten().find(|id| self.track_index(id).is_none()) {
+                    bail!("Unknown track in keepTrackIds: {unknown}");
+                }
+                let kept: Vec<bool> = match &keep_track_ids {
+                    Some(ids) => self.tracks.iter().map(|t| ids.contains(&t.id)).collect(),
+                    // Only audio keeps its place, also in projects written before that was checked.
+                    None => self.tracks.iter().map(stays_in_place).collect(),
+                };
+                let mut ranges = merge_ranges(ranges);
+                if let Some(main) = self.track_index(MAIN_TRACK).filter(|&ti| !kept[ti]) {
+                    let mut slivers = Vec::new();
+                    for clip in &self.tracks[main].clips {
+                        let mut start = clip.start_us;
+                        for range in &ranges {
+                            let end = range.start_us.min(clip.end_us());
+                            if start < end && end - start < min {
+                                slivers.push(TimeRange { start_us: start, end_us: end });
+                            }
+                            start = start.max(range.end_us);
+                            if start >= clip.end_us() {
+                                break;
+                            }
+                        }
+                        if start < clip.end_us() && clip.end_us() - start < min {
+                            slivers.push(TimeRange { start_us: start, end_us: clip.end_us() });
+                        }
+                    }
+                    // Packing also removes these fragments; every moving track must lose that time.
+                    ranges.extend(slivers);
+                    ranges = merge_ranges(ranges);
+                    // A thumbnail's frame moves with the picture, so it keeps showing the same moment.
+                    for thumbnail in &mut self.thumbnails {
+                        let t = thumbnail.time_us;
+                        thumbnail.time_us -= ranges.iter().map(|r| (t.min(r.end_us) - r.start_us).max(0)).sum::<i64>();
+                    }
+                }
+                // Later ranges first, so earlier coordinates stay valid while cutting.
+                for range in ranges.into_iter().rev() {
+                    for ti in (0..self.tracks.len()).filter(|&ti| !kept[ti]) {
+                        self.ripple_delete_track(ti, range, min);
+                    }
+                }
+            }
+            _ => unreachable!("command dispatched to the wrong edit group"),
+        }
+        Ok(())
+    }
+
+    fn correct_words(&mut self, corrections: Vec<WordCorrection>) -> Result<()> {
+        for correction in corrections {
+            ensure!(self.asset(&correction.asset_id).is_some(), "Unknown media {}", correction.asset_id);
+            let same = |c: &WordCorrection| {
+                c.asset_id == correction.asset_id
+                    && c.source_start_us == correction.source_start_us
+                    && c.original == correction.original
+            };
+            self.word_corrections.retain(|c| !same(c));
+            let text = correction.text.trim().to_string();
+            if text != correction.original {
+                self.word_corrections.push(WordCorrection { text, ..correction });
+            }
+        }
+        Ok(())
+    }
+
+    /// Splits main-track clips at the range edges and scales the pieces inside. Each piece keeps
+    /// what it carries whole: the first piece of a clip its transition, entry animation and fade
+    /// in, the last its exit animation, fade out and the next clip's transition. Split halves play
+    /// their sound on as one, so the sound does not change.
+    fn zoom_ranges(&mut self, mut ranges: Vec<ZoomRange>, out: &mut EditOutcome) -> Result<()> {
+        ensure!(!ranges.is_empty(), "Give at least one range to zoom");
+        for r in &ranges {
+            ensure!(
+                r.start_us >= 0 && r.end_us > r.start_us,
+                "A zoom range must start at 0 or later and end after it starts"
+            );
+            ensure!(
+                r.scale.is_finite() && ZOOM_SCALES.contains(&r.scale),
+                "Zoom must be between {}x and {}x",
+                ZOOM_SCALES.start(),
+                ZOOM_SCALES.end()
+            );
+        }
+        ranges.sort_by_key(|r| r.start_us);
+        ensure!(ranges.windows(2).all(|pair| pair[0].end_us <= pair[1].start_us), "Zoom ranges must not overlap");
+        let Some(main) = self.track_index(MAIN_TRACK) else { return Ok(()) };
+        // Where the previous range's zoom ended, so a piece is never zoomed twice.
+        let mut zoomed_until = 0;
+        for range in ranges {
+            let start = range.start_us.max(zoomed_until);
+            let ids: Vec<String> = self.tracks[main]
+                .clips
+                .iter()
+                .filter(|c| c.start_us < range.end_us && c.end_us() > start)
+                .map(|c| c.id.clone())
+                .collect();
+            for id in ids {
+                let Some(ci) = self.tracks[main].clips.iter().position(|c| c.id == id) else { continue };
+                let clips = &self.tracks[main].clips;
+                let clip = &clips[ci];
+                if !matches!(clip.content, ClipContent::Media { .. }) {
+                    continue;
+                }
+                if !clip.keyframes.is_empty() {
+                    if !out.skipped.contains(&id) {
+                        out.skipped.push(id);
+                    }
+                    continue;
+                }
+                let (c0, c1) = (clip.start_us, clip.end_us());
+                let (fade_in, fade_out) = match &clip.content {
+                    ClipContent::Media { fade_in_us, fade_out_us, .. } => (*fade_in_us, *fade_out_us),
+                    ClipContent::Text { .. } => (0, 0),
+                };
+                let length = |a: Option<Animation>| a.map_or(0, |a| a.duration_us);
+                let transition = |c: Option<&Clip>| c.and_then(|c| c.transition_in).map_or(0, |t| t.duration_us);
+                let head = length(clip.anim_in).max(transition(Some(clip))).max(2 * fade_in);
+                let tail = length(clip.anim_out).max(transition(clips.get(ci + 1))).max(2 * fade_out);
+                let (mut a, mut b) = (start.max(c0), range.end_us.min(c1));
+                if a > c0 && a - c0 < MIN_ZOOM_PIECE_US.max(head) {
+                    a = c0;
+                }
+                if b < c1 && c1 - b < MIN_ZOOM_PIECE_US.max(tail) {
+                    b = c1;
+                }
+                // A sliver of a range at the edge of a clip is not worth a cut.
+                let whole = a == c0 && b == c1;
+                let needs = MIN_ZOOM_PIECE_US.max(if a == c0 { head } else { 0 }).max(if b == c1 { tail } else { 0 });
+                if !whole && b - a < needs {
+                    continue;
+                }
+                if b < c1 {
+                    self.split_clip(main, ci, b);
+                }
+                let zi = if a > c0 { self.split_clip(main, ci, a) } else { ci };
+                if let ClipContent::Media { transform, .. } = &mut self.tracks[main].clips[zi].content {
+                    transform.scale = (f64::from(transform.scale) * range.scale) as f32;
+                }
+                zoomed_until = zoomed_until.max(b);
+            }
+        }
+        Ok(())
+    }
+
+    /// Two keyframes on each clip the motion reaches, at the ends of the range.
+    fn apply_motion(
+        &mut self,
+        clip_id: Option<String>,
+        range: Option<TimeRange>,
+        kind: MotionKind,
+        strength: f64,
+        out: &mut EditOutcome,
+    ) -> Result<()> {
+        ensure!(
+            strength.is_finite() && MOTION_STRENGTHS.contains(&strength),
+            "Motion strength must be between {} and {}; 0.1 zooms 10 %",
+            MOTION_STRENGTHS.start(),
+            MOTION_STRENGTHS.end()
+        );
+        let picture = |p: &Project, c: &Clip| match &c.content {
+            ClipContent::Media { asset_id, .. } => p.asset(asset_id).is_some_and(|a| a.kind != AssetKind::Audio),
+            ClipContent::Text { .. } => false,
+        };
+        let targets: Vec<(usize, usize)> = match &clip_id {
+            Some(id) => {
+                let (ti, ci) = self.find_clip(id).ok_or_else(|| anyhow!("Unknown clip"))?;
+                ensure!(picture(self, &self.tracks[ti].clips[ci]), "Motion moves video and image clips only");
+                vec![(ti, ci)]
+            }
+            None => {
+                let r = range.ok_or_else(|| anyhow!("Give a clip or a range for the motion"))?;
+                let ti = self.track_index(MAIN_TRACK).ok_or_else(|| anyhow!("No main track"))?;
+                let under = |c: &Clip| c.start_us < r.end_us && c.end_us() > r.start_us && picture(self, c);
+                (0..self.tracks[ti].clips.len())
+                    .filter(|&ci| under(&self.tracks[ti].clips[ci]))
+                    .map(|ci| (ti, ci))
+                    .collect()
+            }
+        };
+        ensure!(!targets.is_empty(), "No video or image clip on the main track under the range");
+        let (start, end) = range.map_or_else(
+            || {
+                let c = &self.tracks[targets[0].0].clips[targets[0].1];
+                (c.start_us, c.end_us())
+            },
+            |r| (r.start_us, r.end_us),
+        );
+        // A clip keeps the range of a motion that reached beyond it, even once the clips before it are gone.
+        ensure!(
+            end > start && (start >= 0 || clip_id.is_some()),
+            "A motion range must start at 0 or later and end after it starts"
+        );
+        let min = min_duration(self);
+        let (fx, fy) = motion_centre(&self.canvas, kind);
+        let zoom = 1.0 + strength as f32;
+        for (ti, ci) in targets {
+            let clip = &mut self.tracks[ti].clips[ci];
+            let (a, b) = (start.max(clip.start_us), end.min(clip.end_us()));
+            if b - a < min {
+                ensure!(clip_id.is_none(), "The motion range lies outside the clip");
+                continue;
+            }
+            if !clip.keyframes.is_empty() {
+                out.skipped.push(clip.id.clone());
+                continue;
+            }
+            let base = match &clip.content {
+                ClipContent::Media { transform, .. } | ClipContent::Text { transform, .. } => *transform,
+            };
+            // Scaled about (fx, fy), so the picture there stays where it is.
+            let (x, y) = (base.x + (zoom - 1.0) * (base.x - fx), base.y + (zoom - 1.0) * (base.y - fy));
+            let zoomed = Transform { x, y, scale: base.scale * zoom, ..base };
+            let (from, to) = if kind == MotionKind::PullOut { (zoomed, base) } else { (base, zoomed) };
+            // At the ends of the whole range, outside the clip where it is only a part, so the clips
+            // under a range follow one curve.
+            let start_us = clip.start_us;
+            let at = |t: i64, transform| Keyframe { t_us: t - start_us, transform, ease: Ease::Smooth };
+            clip.keyframes = vec![at(start, from), at(end, to)];
+        }
+        Ok(())
+    }
+
+    fn paste_clips(&mut self, clips: Vec<CopiedClip>, at_us: i64, out: &mut EditOutcome) -> Result<()> {
+        ensure!(!clips.is_empty(), "Copy clips first");
+        for copied in &clips {
+            let kind_fits = match &copied.clip.content {
+                ClipContent::Text { .. } => copied.track_kind == TrackKind::Text,
+                ClipContent::Media { asset_id, background, .. } => {
+                    let gone = |id: &str| self.asset(id).is_none();
+                    ensure!(
+                        !gone(asset_id) && !matches!(background, Background::Image { asset_id } if gone(asset_id)),
+                        "The copied media is no longer in the project"
+                    );
+                    copied.track_kind != TrackKind::Text
+                }
+            };
+            ensure!(kind_fits, "A copied clip names a track of another kind");
+        }
+        let at = at_us.max(0);
+        let (mut main, rest): (Vec<_>, Vec<_>) =
+            clips.into_iter().partition(|c| c.track_id == MAIN_TRACK && c.track_kind == TrackKind::Video);
+        main.sort_by_key(|c| c.clip.start_us);
+        // Where each copied main-track clip was and where it goes.
+        let mut anchors: Vec<(i64, i64)> = Vec::new();
+        if !main.is_empty() {
+            let length: i64 = main.iter().map(|c| c.clip.duration_us).sum();
+            let clips = &self.tracks[0].clips;
+            // The cut nearest `at`, as when dragging: before the first clip whose middle is past it.
+            let cut = clips
+                .iter()
+                .find(|c| c.start_us + c.duration_us / 2 > at)
+                .map_or_else(|| clips.iter().map(Clip::end_us).max().unwrap_or(0), |c| c.start_us);
+            // The other tracks open the same time, so what follows stays over its picture, as when deleting.
+            self.ripple_others(cut, length, min_duration(self));
+            let track = &mut self.tracks[0];
+            for c in track.clips.iter_mut().filter(|c| c.start_us >= cut) {
+                c.start_us += length;
+            }
+            let (mut t, mut previous_end) = (cut, None);
+            for copied in main {
+                let mut clip = copied.clip;
+                // A transition stays only between clips that were next to each other.
+                if previous_end != Some(clip.start_us) {
+                    clip.transition_in = None;
+                }
+                previous_end = Some(clip.end_us());
+                anchors.push((clip.start_us, t));
+                clip.id = new_id();
+                clip.start_us = t;
+                t += clip.duration_us;
+                out.select.push(clip.id.clone());
+                track.clips.push(clip);
+            }
+        }
+        // Each other clip keeps its offset to the main-track clip it starts over, so a take's sound and titles stay
+        // on it when the pasted takes close a gap between them.
+        let earliest = rest.iter().map(|c| c.clip.start_us).min().unwrap_or(0);
+        let offset = |start: i64| match anchors.iter().rev().find(|(from, _)| *from <= start).or(anchors.first()) {
+            Some((from, to)) => to - from,
+            None => at - earliest,
+        };
+        let mut groups: Vec<(String, TrackKind, bool, Vec<Clip>)> = Vec::new();
+        for copied in rest {
+            // A clip copied from before the main-track clips never lands before the start.
+            let start = (copied.clip.start_us + offset(copied.clip.start_us)).max(0);
+            let clip = Clip { id: new_id(), start_us: start, transition_in: None, ..copied.clip };
+            match groups.iter_mut().find(|g| g.0 == copied.track_id) {
+                Some(group) => group.3.push(clip),
+                None => groups.push((copied.track_id, copied.track_kind, copied.keep_in_place, vec![clip])),
+            }
+        }
+        for (track_id, kind, keep, mut clips) in groups {
+            clips.sort_by_key(|c| c.start_us);
+            let start = clips.iter().map(|c| c.start_us).min().unwrap_or(0);
+            let end = clips.iter().map(Clip::end_us).max().unwrap_or(0);
+            let mut target = match self.track_index(&track_id).filter(|&i| i != 0 && self.tracks[i].kind == kind) {
+                Some(i) if clips.iter().all(|c| self.is_free(i, c.start_us, c.end_us(), None)) => i,
+                Some(i) => self.insert_track(i + 1, kind, keep),
+                None => self.free_track(kind, start, end, keep),
+            };
+            for clip in clips {
+                // Clips of one track that now overlap, as their takes closed a gap, go on a new track right above.
+                if !self.is_free(target, clip.start_us, clip.end_us(), None) {
+                    target = self.insert_track(target + 1, kind, keep);
+                }
+                out.select.push(clip.id.clone());
+                self.tracks[target].clips.push(clip);
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_main_clips(&mut self, clips: Vec<Clip>) -> Result<()> {
+        ensure!(!clips.is_empty(), "Give the main track at least one clip");
+        let min = min_duration(self);
+        for clip in &clips {
+            let picture = match &clip.content {
+                ClipContent::Media { asset_id, .. } => self.asset(asset_id).map(|a| a.kind != AssetKind::Audio),
+                ClipContent::Text { .. } => Some(false),
+            };
+            ensure!(picture.is_some(), "The media is no longer in the project");
+            ensure!(picture == Some(true), "The main track takes video and pictures only");
+            ensure!(clip.duration_us >= min, "A main-track clip must be at least one frame long");
+        }
+        let main = self.track_index(MAIN_TRACK).ok_or_else(|| anyhow!("No main track"))?;
+        let mut t = 0;
+        self.tracks[main].clips = clips
+            .into_iter()
+            .enumerate()
+            .map(|(i, clip)| {
+                let transition_in = if i == 0 { None } else { clip.transition_in };
+                let clip = Clip { id: new_id(), start_us: t, transition_in, ..clip };
+                t += clip.duration_us;
+                clip
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn paste_attributes(&mut self, source: CopiedClip, clip_ids: Vec<String>, out: &mut EditOutcome) -> Result<()> {
+        let min = min_duration(self);
+        let from = source.clip;
+        let mut pasted = 0;
+        for id in clip_ids {
+            let (ti, ci) = self.find_clip(&id).ok_or_else(|| anyhow!("Unknown clip"))?;
+            let track = &self.tracks[ti];
+            let (kind, caption) = (track.kind, track.is_captions());
+            let sound = match &track.clips[ci].content {
+                ClipContent::Media { asset_id, .. } => self.asset(asset_id).is_some_and(crate::audio::has_audio),
+                ClipContent::Text { .. } => false,
+            };
+            let clip = &mut self.tracks[ti].clips[ci];
+            let span = clip.duration_us;
+            let stretch = |t_us: i64| (t_us as f64 * span as f64 / from.duration_us.max(1) as f64).round() as i64;
+            match (&from.content, &mut clip.content) {
+                _ if kind != source.track_kind => {
+                    out.skipped.push(id);
+                    continue;
+                }
+                (ClipContent::Text { style, transform, .. }, ClipContent::Text { style: s, transform: t, .. }) => {
+                    let max_width = if caption { s.max_width } else { style.max_width };
+                    *s = TextStyle { max_width, ..style.clone() };
+                    *t = *transform;
+                    clip.keyframes = from.keyframes.iter().map(|k| Keyframe { t_us: stretch(k.t_us), ..*k }).collect();
+                }
+                (
+                    ClipContent::Media { adjust, background, shape, transform, .. },
+                    ClipContent::Media { adjust: a, background: b, shape: sh, transform: t, .. },
+                ) if kind == TrackKind::Video => {
+                    *a = *adjust;
+                    *b = background.clone();
+                    *sh = shape.clone();
+                    t.crop = transform.crop;
+                    clip.effects = from.effects.clone();
+                    let t = &*t;
+                    clip.keyframes = from
+                        .keyframes
+                        .iter()
+                        .map(|k| Keyframe {
+                            t_us: stretch(k.t_us),
+                            transform: follow(transform, &k.transform, t),
+                            ..*k
+                        })
+                        .collect();
+                }
+                (
+                    ClipContent::Media {
+                        volume,
+                        fade_in_us,
+                        fade_out_us,
+                        clean_voice,
+                        dereverb,
+                        normalize,
+                        leveler,
+                        duck_db,
+                        ..
+                    },
+                    ClipContent::Media {
+                        volume: v,
+                        fade_in_us: fi,
+                        fade_out_us: fo,
+                        clean_voice: cv,
+                        dereverb: dr,
+                        normalize: n,
+                        leveler: l,
+                        duck_db: d,
+                        ..
+                    },
+                ) if kind == TrackKind::Audio => {
+                    *v = *volume;
+                    *fi = (*fade_in_us).clamp(0, span / 2);
+                    *fo = (*fade_out_us).clamp(0, span / 2);
+                    *d = *duck_db;
+                    if sound {
+                        (*cv, *dr, *n, *l) = (*clean_voice, *dereverb, *normalize, *leveler);
+                    }
+                    pasted += 1;
+                    continue;
+                }
+                _ => {
+                    out.skipped.push(id);
+                    continue;
+                }
+            }
+            let fit = |a: Option<Animation>| a.map(|a| Animation { duration_us: a.duration_us.clamp(min, span), ..a });
+            clip.anim_in = fit(from.anim_in);
+            clip.anim_out = fit(from.anim_out);
+            clip.keyframes.dedup_by_key(|k| k.t_us);
+            pasted += 1;
+        }
+        ensure!(pasted > 0, "None of these clips is of the copied clip's kind");
+        Ok(())
+    }
+
+    fn restyle_track(
+        &mut self,
+        track_id: &str,
+        style: Option<TextStylePatch>,
+        transform: Option<TransformPatch>,
+        out: &mut EditOutcome,
+    ) -> Result<()> {
+        ensure!(style.is_some() || transform.is_some(), "restyleTrack needs a style or a transform to change");
+        let ti = self.track_index(track_id).ok_or_else(|| anyhow!("Unknown track"))?;
+        ensure!(self.tracks[ti].kind == TrackKind::Text, "Only a text track can be restyled");
+        for clip in &mut self.tracks[ti].clips {
+            let keyed = !clip.keyframes.is_empty();
+            let ClipContent::Text { style: s, transform: t, .. } = &mut clip.content else { continue };
+            if let Some(patch) = &style {
+                patch.apply(s);
+            }
+            match transform {
+                Some(_) if keyed => out.skipped.push(clip.id.clone()),
+                Some(patch) => patch.apply(t),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where `key` takes a clip framed as `to` when it takes one framed as `base` there: zoomed as much about the same
+/// canvas point, so a motion keeps zooming into what it zoomed into; shifted, turned and faded as much; with the
+/// key's crop.
+fn follow(base: &Transform, key: &Transform, to: &Transform) -> Transform {
+    let zoom = if base.scale > 0.0 { key.scale / base.scale } else { 1.0 };
+    Transform {
+        x: to.x + key.x - base.x + (zoom - 1.0) * (to.x - base.x),
+        y: to.y + key.y - base.y + (zoom - 1.0) * (to.y - base.y),
+        scale: to.scale * zoom,
+        rotation: to.rotation + key.rotation - base.rotation,
+        opacity: (to.opacity + key.opacity - base.opacity).clamp(0.0, 1.0),
+        crop: key.crop,
+    }
+}
+
+/// Clip ids added and removed between two versions, in timeline order.
+fn clip_changes(before: &Project, after: &Project) -> (Vec<String>, Vec<String>) {
+    let ids = |p: &Project| p.tracks.iter().flat_map(|t| t.clips.iter().map(|c| c.id.clone())).collect::<Vec<_>>();
+    let (old, new) = (ids(before), ids(after));
+    let created = new.iter().filter(|id| !old.contains(id)).cloned().collect();
+    let removed = old.iter().filter(|id| !new.contains(id)).cloned().collect();
+    (created, removed)
+}
+
+/// Sorted, non-empty, non-overlapping ranges.
+pub fn merge_ranges(mut ranges: Vec<TimeRange>) -> Vec<TimeRange> {
+    ranges.retain(|r| r.end_us > r.start_us.max(0));
+    ranges.sort_by_key(|r| r.start_us);
+    let mut out: Vec<TimeRange> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        let r = TimeRange { start_us: r.start_us.max(0), ..r };
+        match out.last_mut() {
+            Some(last) if r.start_us <= last.end_us => last.end_us = last.end_us.max(r.end_us),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// One text clip per segment, sorted and never overlapping: a segment starting inside the
+/// previous one ends it there, and one starting within a frame of it is merged into it.
+/// On vertical videos captions wrap inside the Reels and TikTok safe area unless the style says otherwise.
+fn caption_clips(
+    mut segments: Vec<CaptionSegment>,
+    style: &TextStyle,
+    [anim_in, anim_out]: [Option<Animation>; 2],
+    place: Option<TransformPatch>,
+    canvas: &Canvas,
+    min: i64,
+) -> Result<Vec<Clip>> {
+    // Where CapCut puts auto captions on a reel: a bit below the middle.
+    let mut transform = Transform { y: CAPTION_Y, ..Transform::default() };
+    if let Some(place) = place {
+        place.apply(&mut transform);
+    }
+    let mut style = style.clone();
+    if style.max_width.is_none() {
+        style.max_width = canvas.safe_area().map(|area| area.centered_width(canvas.width as f32));
+    }
+    segments.retain(|s| s.end_us > s.start_us && !s.text.trim().is_empty());
+    segments.sort_by_key(|s| s.start_us);
+    let mut merged: Vec<CaptionSegment> = Vec::with_capacity(segments.len());
+    for s in segments {
+        let text = s.text.trim().to_string();
+        // A highlight following other words than the ones shown would mark the wrong word.
+        ensure!(
+            s.words.is_empty() || s.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") == text,
+            "Caption words must be the caption text split at single spaces: {text:?}"
+        );
+        let start_us = s.start_us.max(0);
+        match merged.last_mut() {
+            Some(prev) if start_us < prev.start_us + min => {
+                prev.text = format!("{} {text}", prev.text);
+                prev.end_us = prev.end_us.max(s.end_us);
+                // Both or neither keep their words, so the merged text still matches them.
+                if prev.words.is_empty() || s.words.is_empty() {
+                    prev.words.clear();
+                } else {
+                    prev.words.extend(s.words);
+                }
+            }
+            Some(prev) => {
+                prev.end_us = prev.end_us.min(start_us);
+                merged.push(CaptionSegment { start_us, end_us: s.end_us, text, words: s.words });
+            }
+            None => merged.push(CaptionSegment { start_us, end_us: s.end_us, text, words: s.words }),
+        }
+    }
+    Ok(merged
+        .into_iter()
+        .map(|s| {
+            let words = s
+                .words
+                .into_iter()
+                .map(|w| CaptionWord {
+                    start_us: w.start_us.saturating_sub(s.start_us),
+                    end_us: w.end_us.saturating_sub(s.start_us),
+                    ..w
+                })
+                .collect();
+            let content = ClipContent::Text { text: s.text, style: style.clone(), transform, words };
+            Clip { anim_in, anim_out, ..Clip::new(new_id(), s.start_us, (s.end_us - s.start_us).max(min), content) }
+        })
+        .collect())
+}
+
+/// A caption corrected word for word keeps its timing: when its old text was its words and the new text
+/// has as many words (split at single spaces), each word takes its new text and keeps its times. A
+/// corrected word may hold a space ("na pivo"), so each takes as many as it had. Any other edit leaves
+/// the words as they were, so they no longer match and nothing is highlighted.
+fn retext_words(words: &mut [CaptionWord], old: &str, new: &str) {
+    let joined = words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+    if words.is_empty() || joined != old || new.split(' ').count() != old.split(' ').count() {
+        return;
+    }
+    let mut tokens = new.split(' ');
+    for word in words {
+        let size = word.text.split(' ').count();
+        word.text = tokens.by_ref().take(size).collect::<Vec<_>>().join(" ");
+    }
+}
+
+/// The words of a generated caption heard in it before `from` and from `to` on (clip time), each where its
+/// middle is; None for other text and for a caption whose text no longer is its words. Words a split or a
+/// trim left outside the clip are not heard there, so they go.
+fn heard_sides(clip: &Clip, from: i64, to: i64) -> Option<(Vec<CaptionWord>, Vec<CaptionWord>)> {
+    let ClipContent::Text { text, words, .. } = &clip.content else { return None };
+    if words.is_empty() || words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") != *text {
+        return None;
+    }
+    let heard: Vec<_> =
+        words.iter().filter(|w| (0..clip.duration_us).contains(&((w.start_us + w.end_us) / 2))).collect();
+    let side = |keep: &dyn Fn(i64) -> bool| {
+        heard.iter().filter(|w| keep((w.start_us + w.end_us) / 2)).map(|&w| w.clone()).collect()
+    };
+    Some((side(&|middle| middle < from), side(&|middle| middle >= to)))
+}
+
+/// Makes a generated caption say exactly `kept`.
+fn set_words(clip: &mut Clip, kept: Vec<CaptionWord>) {
+    if let ClipContent::Text { text, words, .. } = &mut clip.content {
+        *text = kept.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+        *words = kept;
+    }
+}
+
+/// Trims a text clip that `range` lies inside to the part before or after it.
+fn keep_side(clip: &mut Clip, before: bool, range: TimeRange) {
+    if before {
+        clip.duration_us = range.start_us - clip.start_us;
+        return;
+    }
+    // Keyframes and spoken words stay on the kept text, as when a split drops the first half.
+    for k in &mut clip.keyframes {
+        k.t_us -= range.end_us - clip.start_us;
+    }
+    shift_words(clip, range.end_us - clip.start_us);
+    clip.duration_us = clip.end_us() - range.end_us;
+    clip.start_us = range.end_us;
+}
+
+/// Keeps a text clip's spoken words on the same moments when its start moves `by` later.
+fn shift_words(clip: &mut Clip, by: i64) {
+    if let ClipContent::Text { words, .. } = &mut clip.content {
+        for word in words {
+            word.start_us = word.start_us.saturating_sub(by);
+            word.end_us = word.end_us.saturating_sub(by);
+        }
+    }
+}
+
+/// One undo or redo entry: the project to return to, the coalesce key that made it and what the
+/// step was called, for the UI to say what undo or redo will change.
+struct Step {
+    project: Project,
+    key: Option<String>,
+    label: String,
+}
+
+/// Where undo or redo would take the project, without going there.
+pub struct Peek<'a> {
+    pub project: &'a Project,
+    pub key: Option<&'a str>,
+    pub label: &'a str,
+}
+
+/// Owns the current project and its undo history.
+pub struct Editor {
+    pub project: Project,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
+    coalesce: Option<String>,
+    pub revision: u64,
+}
+
+impl Editor {
+    pub fn new(project: Project) -> Self {
+        Self { project, undo: Vec::new(), redo: Vec::new(), coalesce: None, revision: 0 }
+    }
+
+    /// Applies `cmd`. Consecutive edits with the same `coalesce` key form one undo step, so
+    /// callers scope keys to a gesture (one slider drag, one typing burst) or to an AI run.
+    pub fn apply(&mut self, cmd: EditCmd, coalesce: Option<String>) -> Result<EditOutcome> {
+        self.apply_batch(vec![cmd], coalesce)
+    }
+
+    /// Applies every command or none of them, as one undo step. The outcome selects
+    /// everything the commands selected, e.g. every second half of a multi-clip split.
+    pub fn apply_batch(&mut self, cmds: Vec<EditCmd>, coalesce: Option<String>) -> Result<EditOutcome> {
+        self.apply_batch_checked(cmds, coalesce, |_| Ok(()))
+    }
+
+    /// Validates the result before committing history. Rejection or unwinding restores the
+    /// project while preserving the current coalesce key and both history stacks.
+    pub fn apply_batch_checked(
+        &mut self,
+        cmds: Vec<EditCmd>,
+        coalesce: Option<String>,
+        check: impl FnOnce(&Project) -> Result<()>,
+    ) -> Result<EditOutcome> {
+        let before = self.project.clone();
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut outcome = EditOutcome::default();
+            // Each edit names every clip it left alone, so a long batch would repeat the same ids by the million.
+            let mut skipped = std::collections::HashSet::new();
+            for cmd in cmds {
+                let step = self.project.apply(cmd)?;
+                outcome.select.extend(step.select);
+                outcome.skipped.extend(step.skipped.into_iter().filter(|id| skipped.insert(id.clone())));
+            }
+            check(&self.project)?;
+            Ok(outcome)
+        }));
+        let mut outcome = match applied {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                self.project = before;
+                return Err(error);
+            }
+            Err(panic) => {
+                self.project = before;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        (outcome.created, outcome.removed) = clip_changes(&before, &self.project);
+        self.commit_project(before, coalesce);
+        Ok(outcome)
+    }
+
+    /// Replaces a validated project as one undo step, using the same grouping as batches.
+    pub fn replace_project_checked(
+        &mut self,
+        project: Project,
+        coalesce: Option<String>,
+        check: impl FnOnce(&Project) -> Result<()>,
+    ) -> Result<()> {
+        check(&project)?;
+        let before = std::mem::replace(&mut self.project, project);
+        self.commit_project(before, coalesce);
+        Ok(())
+    }
+
+    fn commit_project(&mut self, before: Project, coalesce: Option<String>) {
+        if self.project == before {
+            return;
+        }
+        let merge = coalesce.is_some() && coalesce == self.coalesce;
+        if !merge {
+            self.undo.push(Step { project: before, key: coalesce.clone(), label: String::new() });
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.coalesce = coalesce;
+        self.redo.clear();
+        self.revision += 1;
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(step) = self.undo.pop() else { return false };
+        let current = std::mem::replace(&mut self.project, step.project);
+        self.redo.push(Step { project: current, key: step.key, label: step.label });
+        self.coalesce = None;
+        self.revision += 1;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(step) = self.redo.pop() else { return false };
+        let current = std::mem::replace(&mut self.project, step.project);
+        self.undo.push(Step { project: current, key: step.key, label: step.label });
+        self.coalesce = None;
+        self.revision += 1;
+        true
+    }
+
+    /// Ends the current undo step, so the next edit starts a new one even with the same key.
+    pub fn seal(&mut self) {
+        self.coalesce = None;
+    }
+
+    /// The key an edit needs to merge into the newest undo step; none after a seal, undo or redo.
+    pub fn coalescing(&self) -> Option<&str> {
+        self.coalesce.as_deref()
+    }
+
+    /// The coalesce key of the newest undo step.
+    pub fn last_key(&self) -> Option<&str> {
+        self.undo.last().and_then(|step| step.key.as_deref())
+    }
+
+    /// Reverts the newest undo step if `key` made it, leaving nothing to redo: discarding an
+    /// AI run must not offer it back, and redo steps were made on top of it. False when the
+    /// newest step belongs to something else.
+    pub fn drop_last(&mut self, key: &str) -> bool {
+        if self.last_key() != Some(key) {
+            return false;
+        }
+        if let Some(step) = self.undo.pop() {
+            self.project = step.project;
+            self.redo.clear();
+            self.coalesce = None;
+            self.revision += 1;
+        }
+        true
+    }
+
+    /// Names the newest undo step; the label stays with it through undo and redo.
+    pub fn name_step(&mut self, label: &str) {
+        if let Some(step) = self.undo.last_mut() {
+            step.label = label.into();
+        }
+    }
+
+    /// The project undo (or with `redo`, redo) would restore, and the step's key and name.
+    pub fn peek(&self, redo: bool) -> Option<Peek<'_>> {
+        let step = if redo { self.redo.last() } else { self.undo.last() }?;
+        Some(Peek { project: &step.project, key: step.key.as_deref(), label: &step.label })
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::BOX_RADIUS;
+
+    fn asset(id: &str, kind: AssetKind, secs: i64) -> Asset {
+        Asset {
+            id: id.into(),
+            name: id.into(),
+            path: format!("/tmp/{id}"),
+            kind,
+            duration_us: secs * 1_000_000,
+            width: 1080,
+            height: 1920,
+            fps: 30.0,
+            has_audio: true,
+            rotation: 0,
+            mirror: false,
+            credit: None,
+            part: None,
+        }
+    }
+
+    /// A project saved before parts existed, and any file imported but a YouTube video's part, has no part:
+    /// its new clips read the whole file from its start, as before. With a part they read only the part.
+    #[test]
+    fn new_clips_read_the_whole_file_unless_the_asset_has_a_part() {
+        let saved = serde_json::json!({"id": "v", "name": "v", "path": "/tmp/v", "kind": "video", "durationUs": 9_000_000,
+            "width": 1080, "height": 1920, "fps": 30.0, "hasAudio": true, "rotation": 0});
+        let old: Asset = serde_json::from_value(saved).unwrap();
+        let mut part = old.clone();
+        part.id = "p".into();
+        part.part = Some(crate::model::Part { start_us: 3_000_000, end_us: 6_000_000 });
+        let mut p = Project::new("t");
+        p.apply(EditCmd::AddAssets { assets: vec![old, part] }).unwrap();
+        for (id, from, length) in [("v", 0, 9_000_000), ("p", 3_000_000, 3_000_000)] {
+            for cmd in [
+                EditCmd::AddClip { asset_id: id.into(), start_us: Some(0), track_id: None },
+                EditCmd::AddPictureInPicture { asset_id: id.into(), start_us: 0, duration_us: None },
+                EditCmd::AddOverlay { asset_id: id.into(), start_us: 0, duration_us: None },
+                EditCmd::AddSticker { asset_id: id.into(), start_us: 0, duration_us: None, transform: None },
+            ] {
+                let added = p.apply(cmd).unwrap().select[0].clone();
+                let clip = p.tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == added).unwrap();
+                let ClipContent::Media { source_in_us, .. } = clip.content else { unreachable!() };
+                assert_eq!((source_in_us, clip.duration_us), (from, length), "{id}");
+            }
+        }
+    }
+
+    fn project() -> Project {
+        let mut p = Project::new("t");
+        p.apply(EditCmd::AddAssets {
+            assets: vec![
+                asset("a", AssetKind::Video, 5),
+                asset("b", AssetKind::Video, 3),
+                asset("m", AssetKind::Audio, 20),
+            ],
+        })
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn a_clip_put_between_main_track_clips_opens_its_time_on_the_other_tracks() {
+        let mut p = project();
+        let add = |p: &mut Project, cmd| p.apply(cmd).unwrap().select[0].clone();
+        let first = add(&mut p, EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None });
+        add(&mut p, EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None });
+        let music = add(&mut p, EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None });
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let text = |start_us| EditCmd::AddText { start_us, text: "Hi".into(), style: style.clone() };
+        let title = add(&mut p, text(6_000_000));
+        let starts = |p: &Project| {
+            [&title, &music].map(|id| p.find_clip(id).map(|(ti, ci)| p.tracks[ti].clips[ci].start_us).unwrap())
+        };
+        // 3 s of b between the two 5 s clips: the second one and the title over it move on, the music stays.
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: Some(5_000_000), track_id: None }).unwrap();
+        assert_eq!((p.tracks[0].clips[2].start_us, starts(&p)), (8_000_000, [9_000_000, 0]));
+        // Appended at the end or moved along the main track, nothing else moves, also text after the end.
+        let end = add(&mut p, text(14_000_000));
+        let end_start = |p: &Project| p.find_clip(&end).map(|(ti, ci)| p.tracks[ti].clips[ci].start_us).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let along = EditCmd::MoveClip {
+            clip_id: first.clone(),
+            track_id: Some(MAIN_TRACK.into()),
+            start_us: 9_000_000,
+            new_track: None,
+        };
+        p.apply(along).unwrap();
+        assert_eq!((starts(&p), end_start(&p)), ([9_000_000, 0], 14_000_000));
+        // A duplicate goes in right after its original, now 3 to 8 s.
+        p.apply(EditCmd::DuplicateClip { clip_id: first }).unwrap();
+        assert_eq!((starts(&p), end_start(&p)), ([14_000_000, 0], 19_000_000));
+        // A picture in picture dragged down onto the main track keeps its detached sound under it.
+        let pip = add(&mut p, EditCmd::AddPictureInPicture { asset_id: "b".into(), start_us: 0, duration_us: None });
+        let sound = add(&mut p, EditCmd::DetachAudio { clip_id: pip.clone() });
+        let down = EditCmd::MoveClip { clip_id: pip, track_id: Some(MAIN_TRACK.into()), start_us: 0, new_track: None };
+        p.apply(down).unwrap();
+        let sound_start = p.find_clip(&sound).map(|(ti, ci)| p.tracks[ti].clips[ci].start_us).unwrap();
+        assert_eq!((p.tracks[0].clips[0].duration_us, sound_start), (3_000_000, 0));
+        assert_eq!((starts(&p), end_start(&p)), ([14_000_000, 0], 19_000_000));
+    }
+
+    /// A batch names each clip it left alone once, however many of its edits left it alone: 200 motions over clips
+    /// that already move would otherwise list every clip 200 times, and thousands of edits over thousands of clips
+    /// would fill memory with the same ids.
+    #[test]
+    fn a_batch_lists_each_skipped_clip_once() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        for at_us in (1..10).map(|i| i * 500_000) {
+            let clip_id =
+                p.tracks[0].clips.iter().find(|c| c.start_us < at_us && c.end_us() > at_us).unwrap().id.clone();
+            p.apply(EditCmd::SplitClip { clip_id, at_us }).unwrap();
+        }
+        let range = Some(TimeRange { start_us: 0, end_us: 5_000_000 });
+        let motion = || EditCmd::ApplyMotion { clip_id: None, range, kind: MotionKind::PushIn, strength: 0.1 };
+        p.apply(motion()).unwrap();
+        let moving = p.tracks[0].clips.iter().filter(|c| !c.keyframes.is_empty()).count();
+        assert!(moving >= 10, "{moving}");
+        let mut editor = Editor::new(p);
+        let outcome = editor.apply_batch((0..200).map(|_| motion()).collect(), None).unwrap();
+        assert_eq!(outcome.skipped.len(), moving);
+    }
+
+    #[test]
+    fn thumbnails_stay_one_per_format_and_keep_their_frame_through_cuts() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let thumbnail = |format, time_us| EditCmd::SetThumbnail {
+            thumbnail: Thumbnail {
+                format,
+                time_us,
+                image: None,
+                frame: Transform::default(),
+                background: Default::default(),
+                texts: Vec::new(),
+                outline: None,
+                overlays: Vec::new(),
+            },
+        };
+        p.apply(thumbnail(ThumbnailFormat::Youtube16x9, 1_000_000)).unwrap();
+        p.apply(thumbnail(ThumbnailFormat::Cover9x16, 4_500_000)).unwrap();
+        p.apply(thumbnail(ThumbnailFormat::Cover9x16, 4_000_000)).unwrap();
+        let times = |p: &Project| p.thumbnails.iter().map(|t| (t.format, t.time_us)).collect::<Vec<_>>();
+        assert_eq!(times(&p), [(ThumbnailFormat::Cover9x16, 4_000_000), (ThumbnailFormat::Youtube16x9, 1_000_000)]);
+        // A second before the cover's frame goes and half a second ends at it; the earlier frame stays.
+        let ranges = vec![
+            TimeRange { start_us: 2_000_000, end_us: 3_000_000 },
+            TimeRange { start_us: 3_500_000, end_us: 4_200_000 },
+        ];
+        p.apply(EditCmd::RippleDeleteRanges { ranges, keep_track_ids: None }).unwrap();
+        assert_eq!(times(&p), [(ThumbnailFormat::Cover9x16, 2_500_000), (ThumbnailFormat::Youtube16x9, 1_000_000)]);
+        p.apply(EditCmd::RemoveThumbnail { format: ThumbnailFormat::Youtube16x9 }).unwrap();
+        assert_eq!(times(&p), [(ThumbnailFormat::Cover9x16, 2_500_000)]);
+    }
+
+    fn main_layout(p: &Project) -> Vec<(i64, i64)> {
+        p.tracks[0].clips.iter().map(|c| (c.start_us / 1000, c.duration_us / 1000)).collect()
+    }
+
+    #[test]
+    fn checked_batch_rejection_preserves_project_history_and_coalescing() {
+        let mut editor = Editor::new(Project::new("original"));
+        let rename = |name: &str| EditCmd::RenameProject { name: name.into() };
+        editor.apply(rename("first"), Some("gesture".into())).unwrap();
+        let before = editor.project.clone();
+        assert!(editor.apply_batch_checked(vec![rename("rejected")], None, |_| bail!("invalid")).is_err());
+        assert_eq!(editor.project, before);
+        assert_eq!(editor.revision, 1);
+        editor.apply(rename("second"), Some("gesture".into())).unwrap();
+        editor.undo();
+        assert_eq!(editor.project.name, "original");
+        assert!(!editor.can_undo());
+        assert!(editor.apply_batch_checked(vec![rename("rejected")], None, |_| bail!("invalid")).is_err());
+        assert!(editor.can_redo());
+        editor.redo();
+        assert_eq!(editor.project.name, "second");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            editor.apply_batch_checked(vec![rename("panic")], None, |_| panic!("validator"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(editor.project.name, "second");
+        assert_eq!(editor.revision, 4);
+    }
+
+    #[test]
+    fn checked_replacement_shares_batch_history_and_coalescing() {
+        let original = Project::new("original");
+        let mut editor = Editor::new(original.clone());
+        editor.apply(EditCmd::RenameProject { name: "first".into() }, Some("gesture".into())).unwrap();
+        let replacement = project();
+        editor.replace_project_checked(replacement.clone(), Some("gesture".into()), |_| Ok(())).unwrap();
+        assert_eq!(editor.project, replacement);
+        assert_eq!(editor.revision, 2);
+        assert_eq!(editor.last_key(), Some("gesture"));
+        assert!(editor.undo());
+        assert_eq!(editor.project, original);
+        assert!(!editor.can_undo());
+        assert!(editor.redo());
+        assert_eq!(editor.project, replacement);
+        assert_eq!(editor.revision, 4);
+        editor.seal();
+        let next = Project::new("next");
+        editor.replace_project_checked(next.clone(), Some("gesture".into()), |_| Ok(())).unwrap();
+        assert!(editor.undo());
+        assert_eq!(editor.project, replacement);
+        editor.replace_project_checked(next.clone(), None, |_| Ok(())).unwrap();
+        assert!(!editor.can_redo());
+        assert_eq!(editor.revision, 7);
+        assert!(editor.undo());
+        assert_eq!(editor.project, replacement);
+        assert!(editor.redo());
+        assert_eq!(editor.project, next);
+    }
+
+    #[test]
+    fn checked_replacement_rejection_and_noop_preserve_history() {
+        let original = Project::new("original");
+        let mut editor = Editor::new(original.clone());
+        editor.replace_project_checked(original.clone(), None, |_| Ok(())).unwrap();
+        assert_eq!(editor.revision, 0);
+        assert!(!editor.can_undo());
+        editor.apply(EditCmd::RenameProject { name: "first".into() }, Some("gesture".into())).unwrap();
+        let before = editor.project.clone();
+        assert!(editor.replace_project_checked(project(), None, |_| bail!("invalid")).is_err());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            editor.replace_project_checked(project(), None, |_| panic!("validator"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(editor.project, before);
+        assert_eq!(editor.revision, 1);
+        editor.replace_project_checked(before, None, |_| Ok(())).unwrap();
+        let replacement = project();
+        editor.replace_project_checked(replacement.clone(), Some("gesture".into()), |_| Ok(())).unwrap();
+        assert!(editor.undo());
+        assert_eq!(editor.project, original);
+        assert!(!editor.can_undo());
+        assert!(editor.replace_project_checked(project(), None, |_| bail!("invalid")).is_err());
+        editor.replace_project_checked(original, None, |_| Ok(())).unwrap();
+        assert_eq!(editor.revision, 3);
+        assert!(!editor.can_undo());
+        assert!(editor.can_redo());
+        assert!(editor.redo());
+        assert_eq!(editor.project, replacement);
+    }
+
+    #[test]
+    fn clips_append_to_main_track_back_to_back() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 3000)]);
+    }
+
+    #[test]
+    fn the_video_ends_with_its_last_picture_and_music_past_it_is_cut() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        // Sound alone sets the length.
+        assert_eq!(p.duration_us(), 20_000_000);
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        assert_eq!(p.duration_us(), 5_000_000);
+    }
+
+    #[test]
+    fn music_stays_in_place_through_ripple_cuts_and_detached_sound_does_not() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        let video = p.tracks[0].clips[0].id.clone();
+        p.apply(EditCmd::DetachAudio { clip_id: video }).unwrap();
+        let music = p.tracks.iter().find(|t| t.keep_in_place).map(|t| t.id.clone()).unwrap();
+        let sound =
+            p.tracks.iter().find(|t| t.kind == TrackKind::Audio && !t.keep_in_place).map(|t| t.id.clone()).unwrap();
+        assert_eq!(
+            p.tracks.iter().filter(|t| t.kind == TrackKind::Audio).count(),
+            2,
+            "detached sound gets its own track"
+        );
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 0, end_us: 1_000_000 }],
+            keep_track_ids: None,
+        })
+        .unwrap();
+        let end = |p: &Project, id: &str| p.tracks.iter().find(|t| t.id == id).unwrap().clips[0].end_us();
+        assert_eq!((end(&p, &music), end(&p, &sound)), (20_000_000, 4_000_000));
+        p.apply(EditCmd::UpdateTrack {
+            track_id: music.clone(),
+            muted: None,
+            hidden: None,
+            keep_in_place: Some(false),
+        })
+        .unwrap();
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 0, end_us: 1_000_000 }],
+            keep_track_ids: None,
+        })
+        .unwrap();
+        assert_eq!(end(&p, &music), 19_000_000);
+    }
+
+    /// Only music keeps its place: a kept main track would leave the cut picture out of sync.
+    #[test]
+    fn only_audio_tracks_keep_their_place_through_ripple_cuts() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let keep = |id: &str| EditCmd::UpdateTrack {
+            track_id: id.into(),
+            muted: None,
+            hidden: None,
+            keep_in_place: Some(true),
+        };
+        let error = p.apply(keep(MAIN_TRACK)).unwrap_err();
+        assert!(error.to_string().contains("Only audio tracks"), "{error:#}");
+        // A project written before that was checked still cuts its main track.
+        p.tracks[0].keep_in_place = true;
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 0, end_us: 1_000_000 }],
+            keep_track_ids: None,
+        })
+        .unwrap();
+        assert_eq!(p.tracks[0].clips[0].duration_us, 4_000_000);
+    }
+
+    #[test]
+    fn audio_goes_to_its_own_track() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        assert_eq!(p.tracks.len(), 2);
+        assert_eq!(p.tracks[1].kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn split_keeps_source_continuity() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let id = p.tracks[0].clips[0].id.clone();
+        p.apply(EditCmd::SplitClip { clip_id: id, at_us: 2_000_000 }).unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 2000), (2000, 3000)]);
+        let ClipContent::Media { source_in_us, .. } = &p.tracks[0].clips[1].content else { panic!() };
+        assert_eq!(*source_in_us, 2_000_000);
+    }
+
+    /// A freeze holds the frame shown at the playhead, pushes what follows along, stretches when trimmed from either
+    /// side and never takes a speed or sound, which would make it play or divide by its speed of 0.
+    #[test]
+    fn a_freeze_frame_holds_the_frame_at_the_playhead_and_trims_like_a_picture() {
+        let mut p = project();
+        let add = |p: &mut Project, cmd| p.apply(cmd).unwrap().select[0].clone();
+        let clip = add(&mut p, EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None });
+        let change = |id: &str, field: &str, value: serde_json::Value| -> EditCmd {
+            serde_json::from_value(serde_json::json!({"type": "updateClip", "clipId": id, field: value})).unwrap()
+        };
+        p.apply(change(&clip, "speed", 2.0.into())).unwrap();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let title = add(&mut p, EditCmd::AddText { start_us: 2_000_000, text: "Hi".into(), style });
+        let freeze = |at_us| EditCmd::FreezeFrame { clip_id: clip.clone(), at_us, duration_us: None };
+        // At 1 s of a clip at 2x the picture is 2 s into the file.
+        let still = add(&mut p, freeze(1_000_000));
+        assert_eq!(main_layout(&p), vec![(0, 1000), (1000, 3000), (4000, 1500)]);
+        let source = |p: &Project, id: &str| match p.find_clip(id).map(|(ti, ci)| &p.tracks[ti].clips[ci].content) {
+            Some(ClipContent::Media { source_in_us, speed, volume, .. }) => (*source_in_us, *speed, *volume),
+            _ => panic!("no media clip {id}"),
+        };
+        assert_eq!(source(&p, &still), (2_000_000, 0.0, 0.0));
+        assert_eq!(p.find_clip(&title).map(|(ti, ci)| p.tracks[ti].clips[ci].start_us), Some(5_000_000));
+        // Within a frame of the clip's start it goes before it, holding the frame shown there.
+        let before = add(&mut p, freeze(10_000));
+        assert_eq!((source(&p, &before).0, main_layout(&p)[0]), (20_000, (0, 3000)));
+        // Trimmed from either edge it only gets longer or shorter.
+        let trim = |start_us, duration_us| EditCmd::TrimClip {
+            clip_id: still.clone(),
+            start_us,
+            duration_us,
+            source_in_us: Some(0),
+        };
+        p.apply(trim(4_000_000, 1_000_000)).unwrap();
+        p.apply(trim(4_000_000, 10_000_000)).unwrap();
+        assert_eq!((main_layout(&p)[2], source(&p, &still).0), ((4000, 10_000), 2_000_000));
+        p.apply(trim(3_500_000, 10_500_000)).unwrap();
+        assert_eq!((main_layout(&p)[2], source(&p, &still).0), ((4000, 10_500), 2_000_000));
+        for refused in [
+            change(&still, "speed", 1.0.into()),
+            change(&still, "volume", 1.0.into()),
+            change(&still, "cleanVoice", true.into()),
+            EditCmd::DetachAudio { clip_id: still.clone() },
+            EditCmd::ReplaceClip { clip_id: still.clone(), asset_id: "b".into() },
+            EditCmd::FreezeFrame { clip_id: still.clone(), at_us: 5_000_000, duration_us: None },
+        ] {
+            assert!(p.clone().apply(refused.clone()).is_err(), "{refused:?}");
+        }
+        // Split, it stays the same frame.
+        p.apply(EditCmd::SplitClip { clip_id: still.clone(), at_us: 6_000_000 }).unwrap();
+        assert_eq!(source(&p, &p.tracks[0].clips[3].id.clone()), (2_000_000, 0.0, 0.0));
+        // On an overlay track it pushes the rest of its clip along, also when stretched.
+        let pip = add(&mut p, EditCmd::AddPictureInPicture { asset_id: "b".into(), start_us: 0, duration_us: None });
+        let overlay = |p: &Project| {
+            let ti = p.find_clip(&pip).unwrap().0;
+            p.tracks[ti].clips.iter().map(|c| (c.start_us / 1000, c.duration_us / 1000)).collect::<Vec<_>>()
+        };
+        let held = add(&mut p, EditCmd::FreezeFrame { clip_id: pip.clone(), at_us: 1_000_000, duration_us: None });
+        assert_eq!(overlay(&p), [(0, 1000), (1000, 3000), (4000, 2000)]);
+        let stretch =
+            EditCmd::TrimClip { clip_id: held, start_us: 1_000_000, duration_us: 4_000_000, source_in_us: None };
+        p.apply(stretch).unwrap();
+        assert_eq!(overlay(&p), [(0, 1000), (1000, 4000), (5000, 2000)]);
+    }
+
+    #[test]
+    fn deleting_on_main_track_closes_the_gap() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        let style = TextStyle {
+            font_family: None,
+            font_size: 40.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        let seg =
+            |start_us, end_us, text: &str| CaptionSegment { start_us, end_us, text: text.into(), words: Vec::new() };
+        let segments = vec![seg(1_000_000, 2_000_000, "over a"), seg(6_000_000, 7_000_000, "over b")];
+        p.apply(EditCmd::AddCaptions { segments, style, anim_in: None, anim_out: None, transform: None }).unwrap();
+        let first = p.tracks[0].clips[0].id.clone();
+        let cut = copied(&p, &first);
+        p.apply(EditCmd::DeleteClips { clip_ids: vec![first] }).unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 3000)]);
+        // The caption over the deleted clip goes and the next one moves with its picture; kept music stays.
+        let spans = |p: &Project| -> Vec<_> {
+            let captions = p.tracks.iter().find(|t| t.is_captions()).unwrap();
+            captions.clips.iter().map(|c| (c.start_us, c.end_us())).collect()
+        };
+        assert_eq!(spans(&p), vec![(1_000_000, 2_000_000)]);
+        let music = p.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap();
+        assert_eq!((music.clips[0].start_us, music.clips[0].duration_us), (0, 20_000_000));
+        // Pasting the clip back opens its time again, so the caption returns over its picture.
+        p.apply(EditCmd::PasteClips { clips: vec![cut], at_us: 0 }).unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 3000)]);
+        assert_eq!(spans(&p), vec![(6_000_000, 7_000_000)]);
+    }
+
+    #[test]
+    fn moving_on_main_track_reorders() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let b = p.tracks[0].clips[1].id.clone();
+        p.apply(EditCmd::MoveClip {
+            clip_id: b.clone(),
+            track_id: Some(MAIN_TRACK.into()),
+            start_us: 0,
+            new_track: None,
+        })
+        .unwrap();
+        assert_eq!(p.tracks[0].clips[0].id, b);
+        assert_eq!(main_layout(&p), vec![(0, 3000), (3000, 5000)]);
+    }
+
+    #[test]
+    fn an_overlay_fills_the_frame_only_when_filling_does_not_enlarge_it() {
+        let canvas = Canvas { width: 1080, height: 1920, ..Project::new("t").canvas };
+        let sized = |width, height| Asset { width, height, ..asset("p", AssetKind::Image, 0) };
+        // 4K landscape over a vertical frame: cropped at the sides, still shrunk.
+        assert_eq!(overlay_transform(&canvas, &sized(3840, 2160)).scale, 3.16);
+        assert_eq!(overlay_transform(&canvas, &sized(1080, 1920)).scale, 1.0);
+        // A side shorter than the frame's would be enlarged by filling, so it stays fitted.
+        assert_eq!(overlay_transform(&canvas, &sized(1920, 1080)), Transform::default());
+        assert_eq!(overlay_transform(&canvas, &sized(1079, 4000)), Transform::default());
+    }
+
+    #[test]
+    fn picture_in_picture_sits_in_the_top_right_corner_above_the_main_track() {
+        let mut p = project();
+        let wide = Asset { width: 1920, height: 1080, ..asset("wide", AssetKind::Video, 4) };
+        let photo = Asset { width: 1000, height: 1000, ..asset("photo", AssetKind::Image, 0) };
+        p.apply(EditCmd::AddAssets { assets: vec![wide, photo] }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let pip = |p: &mut Project, asset: &str, start_us, duration_us| {
+            let cmd = EditCmd::AddPictureInPicture { asset_id: asset.into(), start_us, duration_us };
+            let id = p.apply(cmd).unwrap().select[0].clone();
+            let (ti, ci) = p.find_clip(&id).unwrap();
+            let clip = &p.tracks[ti].clips[ci];
+            let ClipContent::Media { shape, .. } = &clip.content else { panic!() };
+            assert_eq!(shape.as_ref().map(|s| (s.radius, s.shadow)), Some((PIP_RADIUS, PIP_SHADOW)));
+            let bounds = crate::render::layer_bounds(p, clip.start_us, &mut crate::text::TextRenderer::new());
+            let corners = bounds.iter().find(|b| b.0 == id).unwrap().1;
+            (ti, clip.start_us, clip.duration_us, corners)
+        };
+        // Vertical: inside the Reels and TikTok safe area, against its top right corner.
+        let (track, start, duration, [tl, tr, br, _]) = pip(&mut p, "wide", 1_000_000, None);
+        let area = p.canvas.safe_area().unwrap();
+        assert_eq!((track, start, duration), (1, 1_000_000, 4_000_000));
+        assert!((tr[0] - area.right).abs() < 0.01 && (tr[1] - area.top).abs() < 0.01, "{tr:?}");
+        assert!(
+            ((tr[0] - tl[0]) - 0.45 * 1080.0).abs() < 0.01
+                && ((br[1] - tr[1]) - 0.45 * 1080.0 * 9.0 / 16.0).abs() < 0.01
+        );
+        // Another one over the first goes on a new track above it; an image lasts 3 s or as asked.
+        assert_eq!(pip(&mut p, "photo", 2_000_000, None).0, 2);
+        assert_eq!(pip(&mut p, "photo", 6_000_000, Some(500_000)).2, 500_000);
+        // A video is never longer than its file.
+        assert_eq!(pip(&mut p, "wide", 9_000_000, Some(60_000_000)).2, 4_000_000);
+        // 16:9: a small gap from the top and right edges of the canvas.
+        p.apply(EditCmd::SetCanvas { width: 1920, height: 1080, background: None, background_blur: None }).unwrap();
+        let (.., [_, tr, ..]) = pip(&mut p, "photo", 20_000_000, None);
+        assert!((tr[0] - (1920.0 - 0.04 * 1080.0)).abs() < 0.01 && (tr[1] - 0.04 * 1080.0).abs() < 0.01, "{tr:?}");
+        let sound = EditCmd::AddPictureInPicture { asset_id: "m".into(), start_us: 0, duration_us: None };
+        assert!(p.apply(sound).is_err());
+    }
+
+    #[test]
+    fn stickers_use_free_overlays_and_keep_their_transform() {
+        for (width, height) in [(1080, 1920), (1920, 1080)] {
+            let mut p = project();
+            p.canvas.width = width;
+            p.canvas.height = height;
+            p.assets.push(Asset { width: 1024, height: 1024, ..asset("sticker", AssetKind::Image, 0) });
+            p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+            let main = p.tracks[0].clone();
+            let cmd = |asset_id: &str, transform| EditCmd::AddSticker {
+                asset_id: asset_id.into(),
+                start_us: 1_500_000,
+                duration_us: None,
+                transform,
+            };
+            let id = p.apply(cmd("sticker", None)).unwrap().select[0].clone();
+            let clip = &p.tracks[1].clips[0];
+            assert_eq!(clip.id, id);
+            assert_eq!(p.tracks[1].kind, TrackKind::Video);
+            assert_eq!((clip.start_us, clip.duration_us), (1_500_000, 3_000_000));
+            assert!(clip.anim_in.is_none() && clip.anim_out.is_none());
+            let ClipContent::Media { transform, shape, .. } = &clip.content else { panic!() };
+            assert_eq!(*transform, Transform { scale: 0.3, ..Transform::default() });
+            assert!(shape.is_none());
+            let custom =
+                Transform { x: 0.2, y: -0.1, scale: 0.7, rotation: 12.0, opacity: 0.6, ..Transform::default() };
+            p.apply(cmd("sticker", Some(custom))).unwrap();
+            let ClipContent::Media { transform, .. } = &p.tracks[2].clips[0].content else { panic!() };
+            assert_eq!(*transform, custom);
+            assert_eq!(p.tracks[0], main);
+            assert!(p.apply(cmd("m", None)).is_err());
+            p.assets.push(Asset { width: 0, height: 0, ..asset("empty", AssetKind::Image, 0) });
+            assert!(p.apply(cmd("empty", None)).is_err());
+            p.apply(cmd("a", None)).unwrap();
+            assert_eq!(p.tracks[3].clips[0].duration_us, 5_000_000);
+        }
+    }
+
+    #[test]
+    fn a_default_shape_is_no_shape_and_text_has_none() {
+        let mut p = project();
+        let id = p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap().select[0]
+            .clone();
+        let shape = |p: &Project| match &p.tracks[0].clips[0].content {
+            ClipContent::Media { shape, .. } => shape.clone(),
+            ClipContent::Text { .. } => unreachable!(),
+        };
+        let set = |clip_id: &str, shape: Shape| {
+            serde_json::from_value::<EditCmd>(
+                serde_json::json!({"type": "updateClip", "clipId": clip_id, "shape": shape}),
+            )
+            .unwrap()
+        };
+        let round = Shape { radius: 1.0, border_width: 6.0, ..Shape::default() };
+        p.apply(set(&id, round.clone())).unwrap();
+        assert_eq!(shape(&p), Some(round));
+        p.apply(set(&id, Shape::default())).unwrap();
+        assert_eq!(shape(&p), None);
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let text = p.apply(EditCmd::AddText { start_us: 0, text: "Hi".into(), style }).unwrap().select[0].clone();
+        assert!(p.apply(set(&text, Shape::default())).is_err());
+    }
+
+    #[test]
+    fn moving_off_main_creates_overlay_and_removes_empty_tracks() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let b = p.tracks[0].clips[1].id.clone();
+        p.apply(EditCmd::MoveClip { clip_id: b.clone(), track_id: None, start_us: 1_000_000, new_track: None })
+            .unwrap();
+        assert_eq!(p.tracks.len(), 2);
+        assert_eq!(p.tracks[1].clips[0].start_us, 1_000_000);
+        p.apply(EditCmd::MoveClip {
+            clip_id: b,
+            track_id: Some(MAIN_TRACK.into()),
+            start_us: 9_000_000,
+            new_track: None,
+        })
+        .unwrap();
+        assert_eq!(p.tracks.len(), 1);
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 3000)]);
+    }
+
+    #[test]
+    fn a_clip_moves_onto_a_new_track_below_or_above_another() {
+        let mut p = project();
+        let add = |p: &mut Project| {
+            p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap().select[0]
+                .clone()
+        };
+        add(&mut p);
+        let (low, high) = (add(&mut p), add(&mut p));
+        p.apply(EditCmd::MoveClip { clip_id: low.clone(), track_id: None, start_us: 0, new_track: None }).unwrap();
+        let low_track = p.tracks[1].id.clone();
+        // Dropped onto the overlay where it is taken, it goes on a new track above.
+        p.apply(EditCmd::MoveClip {
+            clip_id: high.clone(),
+            track_id: Some(low_track.clone()),
+            start_us: 0,
+            new_track: None,
+        })
+        .unwrap();
+        let layers = |p: &Project| p.tracks.iter().map(|t| t.clips.first().map(|c| c.id.clone())).collect::<Vec<_>>();
+        assert_eq!(layers(&p)[1..], [Some(low.clone()), Some(high.clone())]);
+        let move_to = |clip: &str, track: Option<String>, side| EditCmd::MoveClip {
+            clip_id: clip.into(),
+            track_id: track,
+            start_us: 0,
+            new_track: Some(side),
+        };
+
+        // Under the overlay below it, though it is free there.
+        p.apply(move_to(&high, Some(low_track.clone()), TrackSide::Below)).unwrap();
+        assert_eq!(layers(&p)[1..], [Some(high.clone()), Some(low.clone())]);
+        p.apply(move_to(&high, Some(low_track.clone()), TrackSide::Above)).unwrap();
+        assert_eq!(layers(&p)[1..], [Some(low.clone()), Some(high.clone())]);
+        assert!(p.apply(move_to(&high, Some(MAIN_TRACK.into()), TrackSide::Below)).is_err());
+    }
+
+    #[test]
+    fn moving_clips_keeps_the_group_together_and_rejects_main_track() {
+        let mut p = project();
+        let main = p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap().select
+            [0]
+        .clone();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let mut ids = Vec::new();
+        for start_us in [4_000_000, 10_000_000, 22_000_000, 10_000_000] {
+            ids.push(
+                p.apply(EditCmd::AddText { start_us, text: "Hi".into(), style: style.clone() }).unwrap().select[0]
+                    .clone(),
+            );
+        }
+        let tracks = [p.tracks[1].id.clone(), p.tracks[2].id.clone()];
+        let moving = vec![ids[0].clone(), ids[1].clone(), ids[3].clone()];
+        for (offset_us, starts) in [(1_000_000, [5, 11, 11]), (-20_000_000, [0, 6, 6])] {
+            p.apply(EditCmd::MoveClips { clip_ids: moving.clone(), offset_us }).unwrap();
+            assert_eq!(p.tracks.len(), 3);
+            for (id, track, start_s) in [(&ids[0], 0, starts[0]), (&ids[1], 0, starts[1]), (&ids[3], 1, starts[2])] {
+                let (ti, ci) = p.find_clip(id).unwrap();
+                let clip = &p.tracks[ti].clips[ci];
+                assert_eq!((&p.tracks[ti].id, clip.start_us), (&tracks[track], start_s * 1_000_000));
+            }
+        }
+        let hide = EditCmd::UpdateTrack {
+            track_id: tracks[0].clone(),
+            muted: Some(true),
+            hidden: Some(true),
+            keep_in_place: None,
+        };
+        p.apply(hide).unwrap();
+        p.apply(EditCmd::MoveClips { clip_ids: moving, offset_us: 16_000_000 }).unwrap();
+        assert_eq!(p.tracks.len(), 4);
+        assert_eq!((p.tracks[2].hidden, p.tracks[2].muted), (true, true), "the new track stays hidden like its own");
+        assert_eq!(p.tracks[1].id, tracks[0]);
+        assert_eq!(p.tracks[1].clips.len(), 1);
+        assert_eq!((&p.tracks[1].clips[0].id, p.tracks[1].clips[0].start_us), (&ids[2], 22_000_000));
+        assert_eq!(
+            p.tracks[2].clips.iter().map(|c| (&c.id, c.start_us)).collect::<Vec<_>>(),
+            vec![(&ids[0], 16_000_000), (&ids[1], 22_000_000)]
+        );
+        assert_eq!(p.tracks[3].id, tracks[1]);
+        assert_eq!((&p.tracks[3].clips[0].id, p.tracks[3].clips[0].start_us), (&ids[3], 22_000_000));
+        let before = p.clone();
+        let mut editor = Editor::new(p);
+        let refused = EditCmd::MoveClips { clip_ids: vec![ids[0].clone(), main], offset_us: 1_000_000 };
+        assert!(editor.apply(refused, None).is_err());
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn trim_is_clamped_to_source_length() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let id = p.tracks[0].clips[0].id.clone();
+        p.apply(EditCmd::TrimClip { clip_id: id.clone(), start_us: 0, duration_us: 60_000_000, source_in_us: None })
+            .unwrap();
+        assert_eq!(p.tracks[0].clips[0].duration_us, 3_000_000);
+        // Left edge trim by one second keeps the right edge, then the main track packs.
+        p.apply(EditCmd::TrimClip {
+            clip_id: id,
+            start_us: 1_000_000,
+            duration_us: 2_000_000,
+            source_in_us: Some(1_000_000),
+        })
+        .unwrap();
+        let c = &p.tracks[0].clips[0];
+        assert_eq!((c.start_us, c.duration_us), (0, 2_000_000));
+        let ClipContent::Media { source_in_us, .. } = &c.content else { panic!() };
+        assert_eq!(*source_in_us, 1_000_000);
+    }
+
+    #[test]
+    fn extending_a_main_clip_keeps_the_order() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let a = p.tracks[0].clips[0].id.clone();
+        p.apply(EditCmd::TrimClip { clip_id: a.clone(), start_us: 0, duration_us: 2_000_000, source_in_us: None })
+            .unwrap();
+        p.apply(EditCmd::TrimClip { clip_id: a.clone(), start_us: 0, duration_us: 5_000_000, source_in_us: None })
+            .unwrap();
+        assert_eq!(p.tracks[0].clips[0].id, a);
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 3000)]);
+    }
+
+    #[test]
+    fn trimming_a_main_clip_moves_the_other_tracks_with_its_edge() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let (a, b) = (p.tracks[0].clips[0].id.clone(), p.tracks[0].clips[1].id.clone());
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        for (start_us, text) in [(1_000_000, "over a"), (6_000_000, "over b")] {
+            p.apply(EditCmd::AddText { start_us, text: text.into(), style: style.clone() }).unwrap();
+        }
+        let music = 5_000_000;
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(music), track_id: None }).unwrap();
+        let starts = |p: &Project| {
+            let text = p.tracks.iter().find(|t| t.kind == TrackKind::Text).unwrap();
+            let music = p.tracks.iter().find(|t| t.keep_in_place).unwrap();
+            (text.clips.iter().map(|c| c.start_us).collect::<Vec<_>>(), music.clips[0].start_us)
+        };
+        let trim = |clip_id: &String, start_us, duration_us, source_in_us| EditCmd::TrimClip {
+            clip_id: clip_id.clone(),
+            start_us,
+            duration_us,
+            source_in_us,
+        };
+        for (cmd, texts, step) in [
+            (trim(&a, 0, 4_000_000, None), vec![1_000_000, 5_000_000], "right edge in"),
+            (trim(&a, 0, 5_000_000, None), vec![1_000_000, 6_000_000], "right edge out"),
+            (trim(&b, 6_000_000, 2_000_000, Some(1_000_000)), vec![1_000_000, 5_000_000], "left edge in"),
+            (trim(&b, 4_000_000, 3_000_000, Some(0)), vec![1_000_000, 6_000_000], "left edge out"),
+            (trim(&b, 5_000_000, 2_000_000, Some(1_000_000)), vec![1_000_000, 5_000_000], "left edge in, start kept"),
+            (trim(&a, 0, 4_000_000, Some(1_000_000)), vec![0, 4_000_000], "first clip's left edge in"),
+            (trim(&a, 0, 5_000_000, Some(0)), vec![1_000_000, 5_000_000], "first clip's left edge out, start kept"),
+        ] {
+            p.apply(cmd).unwrap();
+            assert_eq!(starts(&p), (texts, music), "{step}");
+        }
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 2000)]);
+    }
+
+    #[test]
+    fn opening_time_at_a_main_cut_splits_what_crosses_it() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let first = p.tracks[0].clips[0].id.clone();
+        p.apply(EditCmd::SplitClip { clip_id: first.clone(), at_us: 3_000_000 }).unwrap();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let word =
+            |text: &str, start_us| CaptionWord { text: text.into(), start_us, end_us: start_us + 400_000, key: false };
+        p.apply(EditCmd::AddCaptions {
+            segments: vec![CaptionSegment {
+                start_us: 2_000_000,
+                end_us: 4_000_000,
+                text: "one two".into(),
+                words: vec![word("one", 2_100_000), word("two", 3_200_000)],
+            }],
+            style: style.clone(),
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        })
+        .unwrap();
+        let title =
+            p.apply(EditCmd::AddText { start_us: 2_500_000, text: "title".into(), style }).unwrap().select[0].clone();
+        let key = |t_us| Keyframe { t_us, transform: Transform::default(), ease: Default::default() };
+        p.apply(EditCmd::SetKeyframes { clip_id: title.clone(), keyframes: vec![key(0), key(1_000_000)] }).unwrap();
+        // Sound cut with the picture, as detached sound is.
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(1_000_000), track_id: None }).unwrap();
+        let sound = p.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id.clone();
+        p.apply(EditCmd::UpdateTrack {
+            track_id: sound.clone(),
+            muted: None,
+            hidden: None,
+            keep_in_place: Some(false),
+        })
+        .unwrap();
+
+        // An edge dragged and put back changes nothing.
+        let before = p.clone();
+        p.apply(EditCmd::TrimClip { clip_id: first.clone(), start_us: 0, duration_us: 3_000_000, source_in_us: None })
+            .unwrap();
+        assert_eq!(p.tracks, before.tracks);
+
+        p.apply(EditCmd::TrimClip { clip_id: first, start_us: 0, duration_us: 4_000_000, source_in_us: None }).unwrap();
+        let spoken: Vec<_> = p
+            .tracks
+            .iter()
+            .find(|t| t.is_captions())
+            .unwrap()
+            .clips
+            .iter()
+            .map(|c| match &c.content {
+                ClipContent::Text { text, words, .. } => (text.clone(), c.start_us + words[0].start_us),
+                ClipContent::Media { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(spoken, vec![("one".to_string(), 2_100_000), ("two".to_string(), 4_200_000)]);
+        let (ti, ci) = p.find_clip(&title).unwrap();
+        let title = &p.tracks[ti].clips[ci];
+        assert_eq!(
+            (title.start_us, title.duration_us),
+            (2_500_000, 4_000_000),
+            "a title grows rather than showing twice"
+        );
+        let keys: Vec<_> = title.keyframes.iter().map(|k| k.t_us).collect();
+        assert_eq!(keys, vec![0, 2_000_000], "its motion after the edge moves with the picture");
+        let pieces: Vec<_> = p.tracks[p.track_index(&sound).unwrap()]
+            .clips
+            .iter()
+            .map(|c| match c.content {
+                ClipContent::Media { source_in_us, .. } => (c.start_us, source_in_us),
+                ClipContent::Text { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(pieces, vec![(1_000_000, 0), (4_000_000, 2_000_000)]);
+    }
+
+    #[test]
+    fn trimming_an_image_from_the_left_cuts_the_other_tracks_at_its_start() {
+        let mut p = project();
+        p.apply(EditCmd::AddAssets { assets: vec![asset("i", AssetKind::Image, 0)] }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "i".into(), start_us: None, track_id: None }).unwrap();
+        let image = p.tracks[0].clips[1].clone();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        p.apply(EditCmd::AddText { start_us: 7_000_000, text: "over the image".into(), style }).unwrap();
+        p.apply(EditCmd::TrimClip {
+            clip_id: image.id,
+            start_us: 6_000_000,
+            duration_us: image.duration_us - 1_000_000,
+            source_in_us: None,
+        })
+        .unwrap();
+        let text = p.tracks.iter().find(|t| t.kind == TrackKind::Text).unwrap();
+        assert_eq!(text.clips[0].start_us, 6_000_000);
+    }
+
+    #[test]
+    fn rejected_edit_leaves_the_project_untouched() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }, None).unwrap();
+        let track = e.project.tracks[1].id.clone();
+        let first = e.project.tracks[1].clips[0].id.clone();
+        e.apply(
+            EditCmd::TrimClip { clip_id: first.clone(), start_us: 0, duration_us: 5_000_000, source_in_us: None },
+            None,
+        )
+        .unwrap();
+        e.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(10_000_000), track_id: Some(track) }, None)
+            .unwrap();
+        assert_eq!(e.project.tracks[1].clips.len(), 2);
+        let before = e.project.clone();
+        let overlap = EditCmd::TrimClip { clip_id: first, start_us: 0, duration_us: 15_000_000, source_in_us: None };
+        assert!(e.apply(overlap, None).is_err());
+        assert_eq!(e.project, before);
+    }
+
+    fn update(id: &str) -> EditCmd {
+        EditCmd::UpdateClip {
+            clip_id: id.into(),
+            transform: None,
+            volume: None,
+            text: None,
+            style: None,
+            speed: None,
+            keep_pitch: None,
+            adjust: None,
+            fade_in_us: None,
+            fade_out_us: None,
+            clean_voice: None,
+            dereverb: None,
+            normalize: None,
+            leveler: None,
+            shape: None,
+            duck_db: None,
+            background: None,
+        }
+    }
+
+    #[test]
+    fn speed_changes_length_and_split_keeps_source() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let id = p.tracks[0].clips[0].id.clone();
+        let EditCmd::UpdateClip { clip_id, transform, volume, text, style, adjust, fade_in_us, fade_out_us, .. } =
+            update(&id)
+        else {
+            unreachable!()
+        };
+        p.apply(EditCmd::UpdateClip {
+            clip_id,
+            transform,
+            volume,
+            text,
+            style,
+            speed: Some(2.0),
+            keep_pitch: None,
+            adjust,
+            fade_in_us,
+            fade_out_us,
+            clean_voice: None,
+            dereverb: None,
+            normalize: None,
+            leveler: None,
+            shape: None,
+            duck_db: None,
+            background: None,
+        })
+        .unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 2500)]);
+        p.apply(EditCmd::SplitClip { clip_id: id, at_us: 1_000_000 }).unwrap();
+        let ClipContent::Media { source_in_us, .. } = &p.tracks[0].clips[1].content else { panic!() };
+        assert_eq!(*source_in_us, 2_000_000);
+    }
+
+    #[test]
+    fn slowing_down_an_overlay_clip_cannot_overlap_its_neighbour() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }, None).unwrap();
+        let track = e.project.tracks[1].id.clone();
+        let first = e.project.tracks[1].clips[0].id.clone();
+        e.apply(
+            EditCmd::TrimClip { clip_id: first.clone(), start_us: 0, duration_us: 5_000_000, source_in_us: None },
+            None,
+        )
+        .unwrap();
+        e.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(5_000_000), track_id: Some(track) }, None)
+            .unwrap();
+        let before = e.project.clone();
+        let EditCmd::UpdateClip { clip_id, transform, volume, text, style, adjust, fade_in_us, fade_out_us, .. } =
+            update(&first)
+        else {
+            unreachable!()
+        };
+        let slower = EditCmd::UpdateClip {
+            clip_id,
+            transform,
+            volume,
+            text,
+            style,
+            speed: Some(0.5),
+            keep_pitch: None,
+            adjust,
+            fade_in_us,
+            fade_out_us,
+            clean_voice: None,
+            dereverb: None,
+            normalize: None,
+            leveler: None,
+            shape: None,
+            duck_db: None,
+            background: None,
+        };
+        assert!(e.apply(slower, None).is_err());
+        assert_eq!(e.project, before);
+    }
+
+    #[test]
+    fn trim_at_high_speed_stays_inside_the_source() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let id = p.tracks[0].clips[0].id.clone();
+        let EditCmd::UpdateClip { clip_id, transform, volume, text, style, adjust, fade_in_us, fade_out_us, .. } =
+            update(&id)
+        else {
+            unreachable!()
+        };
+        p.apply(EditCmd::UpdateClip {
+            clip_id,
+            transform,
+            volume,
+            text,
+            style,
+            speed: Some(10.0),
+            keep_pitch: None,
+            adjust,
+            fade_in_us,
+            fade_out_us,
+            clean_voice: None,
+            dereverb: None,
+            normalize: None,
+            leveler: None,
+            shape: None,
+            duck_db: None,
+            background: None,
+        })
+        .unwrap();
+        p.apply(EditCmd::TrimClip { clip_id: id, start_us: 0, duration_us: 33_334, source_in_us: Some(4_966_666) })
+            .unwrap();
+        let c = &p.tracks[0].clips[0];
+        let ClipContent::Media { source_in_us, speed, .. } = &c.content else { panic!() };
+        let source_end = source_in_us + (c.duration_us as f64 * *speed as f64).round() as i64;
+        assert!(source_end <= 5_000_000, "source ends at {source_end}");
+    }
+
+    #[test]
+    fn duplicate_lands_right_after_the_original() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let a = p.tracks[0].clips[0].id.clone();
+        let out = p.apply(EditCmd::DuplicateClip { clip_id: a }).unwrap();
+        assert_eq!(p.tracks[0].clips[1].id, out.select[0]);
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 5000), (10000, 3000)]);
+    }
+
+    #[test]
+    fn detach_audio_silences_the_video_clip() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let a = p.tracks[0].clips[0].id.clone();
+        let sound = p.apply(EditCmd::DetachAudio { clip_id: a.clone() }).unwrap().select[0].clone();
+        let ClipContent::Media { volume, .. } = &p.tracks[0].clips[0].content else { panic!() };
+        assert_eq!(*volume, 0.0);
+        assert_eq!(p.tracks[1].kind, TrackKind::Audio);
+        assert!(p.apply(EditCmd::DetachAudio { clip_id: a }).is_err());
+        // The detached sound is audio: it cannot be detached again and moves along audio tracks.
+        assert!(p.apply(EditCmd::DetachAudio { clip_id: sound.clone() }).is_err());
+        p.apply(EditCmd::MoveClip { clip_id: sound.clone(), track_id: None, start_us: 1_000_000, new_track: None })
+            .unwrap();
+        let track = p.tracks.iter().find(|t| t.clips.iter().any(|c| c.id == sound)).unwrap();
+        assert_eq!(track.kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn transitions_only_between_main_clips() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let (a, b) = (p.tracks[0].clips[0].id.clone(), p.tracks[0].clips[1].id.clone());
+        let t = Transition { kind: crate::model::TransitionKind::Dissolve, duration_us: 9_000_000 };
+        assert!(p.apply(EditCmd::SetTransition { clip_id: a, transition: Some(t) }).is_err());
+        p.apply(EditCmd::SetTransition { clip_id: b, transition: Some(t) }).unwrap();
+        assert_eq!(p.tracks[0].clips[1].transition_in.unwrap().duration_us, 2_000_000);
+    }
+
+    #[test]
+    fn cuts_keep_the_fade_in_on_the_first_piece_and_the_fade_out_on_the_last() {
+        let fades = |p: &Project, ti: usize| {
+            p.tracks[ti]
+                .clips
+                .iter()
+                .map(|c| match &c.content {
+                    ClipContent::Media { fade_in_us, fade_out_us, .. } => (*fade_in_us / 1000, *fade_out_us / 1000),
+                    ClipContent::Text { .. } => panic!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        // Music with 2 s fades split in the middle keeps playing through the split.
+        let mut p = project();
+        let id = p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap().select
+            [0]
+        .clone();
+        let fade: EditCmd = serde_json::from_value(serde_json::json!({
+            "type":"updateClip", "clipId":id, "fadeInUs":2_000_000, "fadeOutUs":2_000_000
+        }))
+        .unwrap();
+        p.apply(fade).unwrap();
+        p.apply(EditCmd::SplitClip { clip_id: id, at_us: 10_000_000 }).unwrap();
+        assert_eq!(fades(&p, 1), vec![(2000, 0), (0, 2000)]);
+        // Silence cuts on a clip with short fades do not fade every piece in and out.
+        let mut p = project();
+        let id = p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap().select[0]
+            .clone();
+        let fade: EditCmd = serde_json::from_value(serde_json::json!({
+            "type":"updateClip", "clipId":id, "fadeInUs":300_000, "fadeOutUs":300_000
+        }))
+        .unwrap();
+        p.apply(fade).unwrap();
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![
+                TimeRange { start_us: 1_000_000, end_us: 1_500_000 },
+                TimeRange { start_us: 3_000_000, end_us: 3_500_000 },
+            ],
+            keep_track_ids: None,
+        })
+        .unwrap();
+        assert_eq!(fades(&p, 0), vec![(300, 0), (0, 0), (0, 300)]);
+    }
+
+    #[test]
+    fn duration_edits_reclamp_both_audio_fades_on_every_track() {
+        for asset_id in ["a", "m"] {
+            for operation in ["trim", "speed", "split", "ripple"] {
+                let mut p = project();
+                let id = p
+                    .apply(EditCmd::AddClip { asset_id: asset_id.into(), start_us: None, track_id: None })
+                    .unwrap()
+                    .select[0]
+                    .clone();
+                let (ti, ci) = p.find_clip(&id).unwrap();
+                let duration = p.tracks[ti].clips[ci].duration_us;
+                let fade: EditCmd = serde_json::from_value(serde_json::json!({
+                    "type":"updateClip", "clipId":id, "fadeInUs":duration / 2, "fadeOutUs":duration / 2
+                }))
+                .unwrap();
+                p.apply(fade).unwrap();
+                let cmd = match operation {
+                    "trim" => {
+                        EditCmd::TrimClip { clip_id: id, start_us: 0, duration_us: 1_000_000, source_in_us: None }
+                    }
+                    "speed" => {
+                        serde_json::from_value(serde_json::json!({"type":"updateClip", "clipId":id, "speed":10.0}))
+                            .unwrap()
+                    }
+                    "split" => EditCmd::SplitClip { clip_id: id, at_us: 1_000_000 },
+                    _ => EditCmd::RippleDeleteRanges {
+                        ranges: vec![TimeRange { start_us: 1_000_000, end_us: duration - 1_000_000 }],
+                        keep_track_ids: Some(vec![]),
+                    },
+                };
+                p.apply(cmd).unwrap();
+                // Cut pieces lose the fade at the cut and keep the clamped fade at the outer edge.
+                let clips: Vec<_> = p.tracks.iter().flat_map(|track| &track.clips).collect();
+                for (index, clip) in clips.iter().enumerate() {
+                    let ClipContent::Media { fade_in_us, fade_out_us, .. } = &clip.content else { panic!() };
+                    let half = clip.duration_us / 2;
+                    assert_eq!(
+                        (*fade_in_us, *fade_out_us),
+                        (if index == 0 { half } else { 0 }, if index == clips.len() - 1 { half } else { 0 }),
+                        "{asset_id}: {operation}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duration_edits_reclamp_both_adjacent_transitions() {
+        for operation in ["trim", "speed", "split_left", "split_right", "ripple"] {
+            let mut p = project();
+            for _ in 0..3 {
+                p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+            }
+            for ci in [1, 2] {
+                p.apply(EditCmd::SetTransition {
+                    clip_id: p.tracks[0].clips[ci].id.clone(),
+                    transition: Some(Transition {
+                        kind: crate::model::TransitionKind::Dissolve,
+                        duration_us: 2_000_000,
+                    }),
+                })
+                .unwrap();
+            }
+            let clip_id = p.tracks[0].clips[1].id.clone();
+            let cmd = match operation {
+                "trim" => EditCmd::TrimClip { clip_id, start_us: 5_000_000, duration_us: 500_000, source_in_us: None },
+                "speed" => EditCmd::UpdateClip {
+                    clip_id,
+                    speed: Some(10.0),
+                    keep_pitch: None,
+                    transform: None,
+                    volume: None,
+                    text: None,
+                    style: None,
+                    adjust: None,
+                    fade_in_us: None,
+                    fade_out_us: None,
+                    clean_voice: None,
+                    dereverb: None,
+                    normalize: None,
+                    leveler: None,
+                    shape: None,
+                    duck_db: None,
+                    background: None,
+                },
+                "split_left" => EditCmd::SplitClip { clip_id, at_us: 5_500_000 },
+                "split_right" => EditCmd::SplitClip { clip_id, at_us: 9_500_000 },
+                _ => EditCmd::RippleDeleteRanges {
+                    ranges: vec![TimeRange { start_us: 5_500_000, end_us: 9_500_000 }],
+                    keep_track_ids: None,
+                },
+            };
+            p.apply(cmd).unwrap();
+            let clips = &p.tracks[0].clips;
+            for pair in clips.windows(2) {
+                if let Some(transition) = pair[1].transition_in {
+                    assert!(transition.duration_us <= pair[0].duration_us.min(pair[1].duration_us), "{operation}");
+                }
+            }
+            assert!(clips.iter().any(|c| c.transition_in.is_some_and(|t| t.duration_us == 500_000)), "{operation}");
+        }
+    }
+
+    #[test]
+    fn outcome_reports_created_and_removed_clips() {
+        let mut e = Editor::new(project());
+        let added = e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        let id = e.project.tracks[0].clips[0].id.clone();
+        assert_eq!((added.created, added.removed), (vec![id.clone()], vec![]));
+        let split = e.apply(EditCmd::SplitClip { clip_id: id.clone(), at_us: 1_000_000 }, None).unwrap();
+        assert_eq!(split.created, split.select);
+        let gone = e.apply(EditCmd::DeleteClips { clip_ids: vec![id.clone()] }, None).unwrap();
+        assert_eq!(gone.removed, vec![id]);
+    }
+
+    #[test]
+    fn batches_are_atomic_and_one_undo_step() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        let id = e.project.tracks[0].clips[0].id.clone();
+        let split = |at_us| EditCmd::SplitClip { clip_id: id.clone(), at_us };
+        let before = e.project.clone();
+        // The second split is outside the clip, so nothing may change.
+        assert!(e.apply_batch(vec![split(1_000_000), split(60_000_000)], None).is_err());
+        assert_eq!(e.project, before);
+        e.apply_batch(vec![split(1_000_000), split(500_000)], None).unwrap();
+        assert_eq!(e.project.tracks[0].clips.len(), 3);
+        assert!(e.undo());
+        assert_eq!(e.project, before);
+    }
+
+    #[test]
+    fn undo_redo_and_coalescing() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        let id = e.project.tracks[0].clips[0].id.clone();
+        for v in [0.5, 0.6, 0.7] {
+            let cmd = EditCmd::UpdateClip {
+                clip_id: id.clone(),
+                transform: None,
+                volume: Some(v),
+                text: None,
+                style: None,
+                speed: None,
+                keep_pitch: None,
+                adjust: None,
+                fade_in_us: None,
+                fade_out_us: None,
+                clean_voice: None,
+                dereverb: None,
+                normalize: None,
+                leveler: None,
+                shape: None,
+                duck_db: None,
+                background: None,
+            };
+            e.apply(cmd, Some("vol".into())).unwrap();
+        }
+        assert!(e.undo());
+        let ClipContent::Media { volume, .. } = &e.project.tracks[0].clips[0].content else { panic!() };
+        assert_eq!(*volume, 1.0);
+        assert!(e.undo());
+        assert!(e.project.tracks[0].clips.is_empty());
+        assert!(e.redo());
+        assert_eq!(e.project.tracks[0].clips.len(), 1);
+    }
+
+    #[test]
+    fn a_run_is_one_sealed_step_that_can_be_dropped_without_redo() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, Some("user".into()))
+            .unwrap();
+        let after_user = e.project.clone();
+        e.seal();
+        let run = "run:1";
+        for asset in ["b", "a"] {
+            e.apply(EditCmd::AddClip { asset_id: asset.into(), start_us: None, track_id: None }, Some(run.into()))
+                .unwrap();
+        }
+        e.seal();
+        assert_eq!(e.last_key(), Some(run));
+        // After sealing, the same key starts a new step instead of joining the run.
+        e.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }, Some(run.into())).unwrap();
+        assert!(e.undo());
+        assert_eq!(e.project.tracks[0].clips.len(), 3);
+        assert!(!e.drop_last("run:2"));
+        assert!(e.drop_last(run));
+        assert_eq!(e.project, after_user);
+        assert!(!e.can_redo());
+        assert_eq!(e.last_key(), Some("user"));
+        // A whole run comes back with one redo.
+        e.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }, Some(run.into())).unwrap();
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, Some(run.into())).unwrap();
+        assert!(e.undo());
+        assert_eq!(e.project, after_user);
+        assert!(e.redo());
+        assert_eq!(e.project.tracks[0].clips.len(), 3);
+        assert_eq!(e.last_key(), Some(run));
+    }
+
+    #[test]
+    fn captions_replace_previous_caption_track() {
+        let mut p = project();
+        let style = TextStyle {
+            font_family: None,
+            font_size: 70.0,
+            color: "#fff".into(),
+            bold: true,
+            stroke_width: 5.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        let seg = |s, e, t: &str| CaptionSegment { start_us: s, end_us: e, text: t.into(), words: Vec::new() };
+        p.apply(EditCmd::AddCaptions {
+            segments: vec![seg(0, 1_200_000, "Ahoj"), seg(1_000_000, 2_000_000, "světe")],
+            style: style.clone(),
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        })
+        .unwrap();
+        let track = p.tracks.iter().find(|t| t.name == "Captions").unwrap().id.clone();
+        p.apply(EditCmd::ReplaceCaptions {
+            track_id: track,
+            segments: vec![seg(0, 1_000_000, "Znovu")],
+            style: style.clone(),
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        })
+        .unwrap();
+        let caption_tracks: Vec<_> = p.tracks.iter().filter(|t| t.name == "Captions").collect();
+        assert_eq!(caption_tracks.len(), 1);
+        assert_eq!(caption_tracks[0].clips.len(), 1);
+        // Adding never removes an existing captions track.
+        p.apply(EditCmd::AddCaptions {
+            segments: vec![seg(0, 1_000_000, "Druhá")],
+            style: style.clone(),
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        })
+        .unwrap();
+        assert_eq!(p.tracks.iter().filter(|t| t.name == "Captions").count(), 2);
+        // A title added where a captions track is free still gets its own track, so replacing
+        // the captions never removes it.
+        p.apply(EditCmd::AddText { start_us: 5_000_000, text: "Title".into(), style: style.clone() }).unwrap();
+        let titles = p.tracks.iter().find(|t| t.kind == TrackKind::Text && !t.is_captions()).unwrap().id.clone();
+        let replace = EditCmd::ReplaceCaptions {
+            track_id: titles.clone(),
+            segments: vec![seg(0, 1_000_000, "X")],
+            style: style.clone(),
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        };
+        assert!(p.apply(replace).is_err());
+        let captions = p.tracks.iter().find(|t| t.is_captions()).unwrap().id.clone();
+        p.apply(EditCmd::ReplaceCaptions {
+            track_id: captions,
+            segments: vec![seg(0, 1_000_000, "Y")],
+            style,
+            anim_in: None,
+            anim_out: None,
+            transform: None,
+        })
+        .unwrap();
+        let title = &p.tracks.iter().find(|t| t.id == titles).unwrap().clips[0].content;
+        assert!(matches!(title, ClipContent::Text { text, .. } if text == "Title"));
+    }
+
+    #[test]
+    fn every_caption_gets_the_animations_of_its_style() {
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 95.0, "color": "#ffffff"})).unwrap();
+        let seg = |s, e, t: &str| CaptionSegment { start_us: s, end_us: e, text: t.into(), words: Vec::new() };
+        let pop = Some(Animation { kind: crate::model::AnimationKind::Pop, duration_us: 200_000 });
+        let clips = caption_clips(
+            vec![seg(0, 1_000_000, "first"), seg(1_000_000, 2_000_000, "second")],
+            &style,
+            [pop, None],
+            None,
+            &Project::new("c").canvas,
+            33_334,
+        )
+        .unwrap();
+        assert!(clips.iter().all(|c| c.anim_in == pop && c.anim_out.is_none()));
+        // An older command without animations reads as none.
+        let old: EditCmd = serde_json::from_value(serde_json::json!({
+            "type": "addCaptions", "segments": [], "style": style
+        }))
+        .unwrap();
+        assert!(matches!(old, EditCmd::AddCaptions { anim_in: None, anim_out: None, transform: None, .. }));
+    }
+
+    #[test]
+    fn captions_with_equal_starts_merge_instead_of_overlapping() {
+        let style = TextStyle {
+            font_family: None,
+            font_size: 40.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        let seg = |s, e, t: &str| CaptionSegment { start_us: s, end_us: e, text: t.into(), words: Vec::new() };
+        let clips = caption_clips(
+            vec![seg(0, 1_000_000, "first"), seg(0, 2_000_000, "second"), seg(1_500_000, 3_000_000, "third")],
+            &style,
+            [None, None],
+            None,
+            &Project::new("c").canvas,
+            33_334,
+        )
+        .unwrap();
+        let spans: Vec<_> = clips.iter().map(|c| (c.start_us, c.end_us())).collect();
+        assert_eq!(spans, vec![(0, 1_500_000), (1_500_000, 3_000_000)]);
+        let ClipContent::Text { text, .. } = &clips[0].content else { panic!() };
+        assert_eq!(text, "first second");
+    }
+
+    #[test]
+    fn ripple_delete_rejects_unknown_kept_tracks() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let before = p.clone();
+        let cut = EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 0, end_us: 500_000 }],
+            keep_track_ids: Some(vec!["musci".into()]),
+        };
+        assert!(p.apply(cut).unwrap_err().to_string().contains("Unknown track in keepTrackIds: musci"));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn ripple_delete_keeps_all_tracks_in_sync() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        let style = TextStyle {
+            font_family: None,
+            font_size: 40.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        p.apply(EditCmd::AddText { start_us: 2_000_000, text: "hi".into(), style }).unwrap();
+        let music = p.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().id.clone();
+        let ranges = vec![
+            TimeRange { start_us: 3_000_000, end_us: 3_500_000 },
+            TimeRange { start_us: 1_000_000, end_us: 2_000_000 },
+            TimeRange { start_us: 1_500_000, end_us: 2_000_000 },
+        ];
+        p.apply(EditCmd::RippleDeleteRanges { ranges, keep_track_ids: Some(vec![music.clone()]) }).unwrap();
+        // Main: 5 s minus 1.5 s, cut into three pieces with continuous source.
+        assert_eq!(main_layout(&p), vec![(0, 1000), (1000, 1000), (2000, 1500)]);
+        let sources: Vec<i64> = p.tracks[0]
+            .clips
+            .iter()
+            .map(|c| match &c.content {
+                ClipContent::Media { source_in_us, .. } => *source_in_us / 1000,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(sources, vec![0, 2000, 3500]);
+        // The text clip [2 s, 5 s) loses [3, 3.5); its longer later part [3.5, 5) stays (one
+        // copy of the text) and moves left by both cuts, staying over the same video frames.
+        let text = p.tracks.iter().find(|t| t.kind == TrackKind::Text).unwrap();
+        let spans: Vec<_> = text.clips.iter().map(|c| (c.start_us / 1000, c.end_us() / 1000)).collect();
+        assert_eq!(spans, vec![(2000, 3500)]);
+        // Kept music is untouched.
+        let music = p.tracks.iter().find(|t| t.id == music).unwrap();
+        assert_eq!((music.clips[0].start_us, music.clips[0].duration_us), (0, 20_000_000));
+    }
+
+    #[test]
+    fn ripple_delete_inside_a_caption_keeps_one_copy_of_its_text() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let style = TextStyle {
+            font_family: None,
+            font_size: 40.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        let seg = CaptionSegment { start_us: 1_000_000, end_us: 3_000_000, text: "jsem se".into(), words: Vec::new() };
+        p.apply(EditCmd::AddCaptions { segments: vec![seg], style, anim_in: None, anim_out: None, transform: None })
+            .unwrap();
+        let clip_id = p.tracks.iter().find(|t| t.is_captions()).unwrap().clips[0].id.clone();
+        // A keyframe at 2.5 s on the timeline, inside the part that stays.
+        let keyframes = vec![Keyframe { t_us: 1_500_000, transform: Transform::default(), ease: Ease::Linear }];
+        p.apply(EditCmd::SetKeyframes { clip_id, keyframes }).unwrap();
+        // Cutting [1.5, 2.2) leaves 0.5 s before and 0.8 s after: the later part stays.
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 1_500_000, end_us: 2_200_000 }],
+            keep_track_ids: Some(vec![]),
+        })
+        .unwrap();
+        let captions = p.tracks.iter().find(|t| t.is_captions()).unwrap();
+        let spans: Vec<_> = captions.clips.iter().map(|c| (c.start_us, c.end_us())).collect();
+        assert_eq!(spans, vec![(1_500_000, 2_300_000)]);
+        // The keyframe moved with the cut to 1.8 s, 0.3 s into the kept text.
+        assert_eq!(captions.clips[0].keyframes.iter().map(|k| k.t_us).collect::<Vec<_>>(), vec![300_000]);
+    }
+
+    #[test]
+    fn ripple_slivers_shift_captions_and_overlay_with_main() {
+        for ranges in [
+            vec![TimeRange { start_us: 10_000, end_us: 1_000_000 }],
+            vec![TimeRange { start_us: 0, end_us: 500_000 }, TimeRange { start_us: 510_000, end_us: 1_000_000 }],
+        ] {
+            let mut p = project();
+            p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+            let style = TextStyle {
+                font_family: None,
+                font_size: 40.0,
+                color: "#fff".into(),
+                bold: false,
+                stroke_width: 0.0,
+                stroke_color: "#000".into(),
+                background: None,
+                max_width: None,
+                highlight: None,
+                keywords: None,
+                shadow: None,
+                letter_case: Default::default(),
+                letter_spacing: 0.0,
+                line_spacing: 0.0,
+                align: TextAlign::Center,
+                box_radius: BOX_RADIUS,
+            };
+            p.apply(EditCmd::AddCaptions {
+                segments: vec![CaptionSegment {
+                    start_us: 2_000_000,
+                    end_us: 3_000_000,
+                    text: "aligned".into(),
+                    words: Vec::new(),
+                }],
+                style,
+                anim_in: None,
+                anim_out: None,
+                transform: None,
+            })
+            .unwrap();
+            let mut overlay = p.tracks[0].clone();
+            overlay.id = "overlay".into();
+            overlay.clips[0].id = "overlay-clip".into();
+            overlay.clips[0].start_us = 2_000_000;
+            overlay.clips[0].duration_us = 1_000_000;
+            p.tracks.push(overlay);
+            p.apply(EditCmd::RippleDeleteRanges { ranges, keep_track_ids: Some(vec![]) }).unwrap();
+            assert_eq!(main_layout(&p), vec![(0, 4000)]);
+            let ClipContent::Media { source_in_us, .. } = p.tracks[0].clips[0].content else { panic!() };
+            assert_eq!(source_in_us, 1_000_000);
+            for track in &p.tracks[1..] {
+                assert_eq!(track.clips[0].start_us, 1_000_000, "{}", track.id);
+            }
+        }
+    }
+
+    #[test]
+    fn ripple_delete_drops_slivers_shorter_than_a_frame() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        // Leaves 10 ms of the clip before the cut, less than one 30 fps frame.
+        p.apply(EditCmd::RippleDeleteRanges {
+            ranges: vec![TimeRange { start_us: 10_000, end_us: 1_000_000 }],
+            keep_track_ids: Some(vec![]),
+        })
+        .unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 4000)]);
+    }
+
+    /// The word a karaoke caption marks at timeline time `t_us`.
+    fn spoken_at(p: &Project, t_us: i64) -> Option<String> {
+        let clip = p.tracks.iter().filter(|t| t.is_captions()).flat_map(|t| &t.clips).find(|c| c.contains(t_us))?;
+        let ClipContent::Text { text, words, .. } = &clip.content else { return None };
+        crate::model::spoken_word(text, words, t_us - clip.start_us).map(|r| text[r].to_string())
+    }
+
+    /// Five seconds of video with one karaoke caption over [1 s, 4 s): "Dneska vám ukážu jak", the words
+    /// spoken at 1.0–1.4, 1.5–1.9, 2.4–2.9 and 3.2–3.8 s.
+    fn karaoke() -> (Project, String) {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        let word = |text: &str, start_ms: i64, end_ms: i64| CaptionWord {
+            text: text.into(),
+            start_us: start_ms * 1000,
+            end_us: end_ms * 1000,
+            key: false,
+        };
+        let style: TextStyle = serde_json::from_value(serde_json::json!({
+            "fontSize": 95.0, "color": "#ffffff", "strokeWidth": 7.5, "highlight": "#ffe14d"
+        }))
+        .unwrap();
+        let segment = CaptionSegment {
+            start_us: 1_000_000,
+            end_us: 4_000_000,
+            text: "Dneska vám ukážu jak".into(),
+            words: vec![
+                word("Dneska", 1000, 1400),
+                word("vám", 1500, 1900),
+                word("ukážu", 2400, 2900),
+                word("jak", 3200, 3800),
+            ],
+        };
+        let out = p
+            .apply(EditCmd::AddCaptions {
+                segments: vec![segment],
+                style,
+                anim_in: None,
+                anim_out: None,
+                transform: None,
+            })
+            .unwrap();
+        (p, out.select[0].clone())
+    }
+
+    fn spoken(p: &Project) -> Vec<Option<String>> {
+        (0..5_000_000).step_by(50_000).map(|t| spoken_at(p, t)).collect()
+    }
+
+    #[test]
+    fn karaoke_words_stay_on_their_moments_through_split_trim_duplicate_and_cuts() {
+        let (p, id) = karaoke();
+        let before = spoken(&p);
+        assert_eq!(before[20].as_deref(), Some("Dneska"));
+        assert_eq!(before[50].as_deref(), Some("ukážu"));
+        assert_eq!(before[42], None, "the gap between vám and ukážu");
+        // A split keeps every word where it was, in both halves.
+        let mut split = p.clone();
+        split.apply(EditCmd::SplitClip { clip_id: id.clone(), at_us: 2_200_000 }).unwrap();
+        assert_eq!(split.tracks[1].clips.len(), 2);
+        assert_eq!(spoken(&split), before, "split");
+        // Trimming the left edge keeps the words over the same moments.
+        let mut trimmed = p.clone();
+        let trim =
+            EditCmd::TrimClip { clip_id: id.clone(), start_us: 1_450_000, duration_us: 2_550_000, source_in_us: None };
+        trimmed.apply(trim).unwrap();
+        let expected: Vec<_> =
+            before.iter().enumerate().map(|(i, w)| if i * 50_000 < 1_450_000 { None } else { w.clone() }).collect();
+        assert_eq!(spoken(&trimmed), expected, "left trim");
+        // A copy says the same words at the same offsets.
+        let mut copied = p.clone();
+        let copy = copied.apply(EditCmd::DuplicateClip { clip_id: id }).unwrap().select[0].clone();
+        let copy_start = copied.tracks[1].clips.iter().find(|c| c.id == copy).unwrap().start_us;
+        for offset in (0..3_000_000).step_by(50_000) {
+            assert_eq!(spoken_at(&copied, copy_start + offset), spoken_at(&p, 1_000_000 + offset), "copy at {offset}");
+        }
+        // Ripple cuts inside the caption and across its start: every word left on the timeline moves with the
+        // picture, in whichever caption keeps it.
+        for (cut_start, cut_end) in [(1_300_000, 2_000_000), (3_000_000, 3_500_000), (500_000, 1_600_000)] {
+            let mut cut = p.clone();
+            let ranges = vec![TimeRange { start_us: cut_start, end_us: cut_end }];
+            cut.apply(EditCmd::RippleDeleteRanges { ranges, keep_track_ids: None }).unwrap();
+            let length = cut_end - cut_start;
+            for (i, word) in before.iter().enumerate() {
+                let t = i as i64 * 50_000;
+                let at = if t < cut_start {
+                    t
+                } else if t >= cut_end {
+                    t - length
+                } else {
+                    continue;
+                };
+                if cut.tracks[1].clips.iter().any(|c| c.contains(at)) {
+                    assert_eq!(spoken_at(&cut, at), *word, "cut [{cut_start}, {cut_end}) at {t}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_takes_its_words_out_of_the_captions() {
+        let (p, id) = karaoke();
+        let cut = |p: &Project, start_ms: i64, end_ms: i64| -> Vec<(i64, i64, String)> {
+            let mut cut = p.clone();
+            let ranges = vec![TimeRange { start_us: start_ms * 1000, end_us: end_ms * 1000 }];
+            cut.apply(EditCmd::RippleDeleteRanges { ranges, keep_track_ids: None }).unwrap();
+            let captions = cut.tracks.iter().filter(|t| t.is_captions()).flat_map(|t| &t.clips);
+            captions
+                .map(|c| {
+                    let ClipContent::Text { text, .. } = &c.content else { panic!() };
+                    (c.start_us / 1000, c.end_us() / 1000, text.clone())
+                })
+                .collect()
+        };
+        // A cut inside the caption leaves a caption on each side, each saying its own words.
+        assert_eq!(cut(&p, 1300, 2000), [(1000, 1300, "Dneska".into()), (1300, 3300, "ukážu jak".into())]);
+        // Across its start, the words after the cut are left; a word cut in the middle goes.
+        assert_eq!(cut(&p, 500, 1950), [(500, 2550, "ukážu jak".into())]);
+        // With every word cut, the caption goes too, though a moment of it is left after the cut.
+        assert_eq!(cut(&p, 900, 3900), []);
+        // After a split each half carries every word, but a half a cut reaches says only those heard in it;
+        // the other half keeps the whole text, as the split left it.
+        let mut split = p.clone();
+        split.apply(EditCmd::SplitClip { clip_id: id.clone(), at_us: 2_200_000 }).unwrap();
+        let halves = [(1000, 1950, "Dneska vám".into()), (2000, 3800, "Dneska vám ukážu jak".into())];
+        assert_eq!(cut(&split, 1950, 2150), halves);
+        // Typed text is no longer the words: it keeps its longer side whole, as before.
+        let mut typed = p.clone();
+        typed
+            .apply(
+                serde_json::from_value(serde_json::json!({"type": "updateClip", "clipId": id, "text": "Ahoj"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(cut(&typed, 1300, 2000), [(1300, 3300, "Ahoj".into())]);
+    }
+
+    #[test]
+    fn a_caption_corrected_word_for_word_keeps_its_highlight() {
+        let (mut p, id) = karaoke();
+        let before = spoken(&p);
+        let retext = |text: &str| -> EditCmd {
+            serde_json::from_value(serde_json::json!({"type": "updateClip", "clipId": id, "text": text})).unwrap()
+        };
+        // A word correction replaces one word: the corrected word lights up exactly when the old one did.
+        p.apply(retext("Dneska vám ukážu kam")).unwrap();
+        let corrected: Vec<_> =
+            before.iter().map(|w| w.as_ref().map(|w| if w == "jak" { "kam".into() } else { w.clone() })).collect();
+        assert_eq!(spoken(&p), corrected);
+        // Typing in the inspector passes through a trailing space: still four words, the last one empty for now.
+        p.apply(retext("Dneska vám ukážu ")).unwrap();
+        p.apply(retext("Dneska vám ukážu, jak")).unwrap();
+        assert_eq!(spoken_at(&p, 2_600_000).as_deref(), Some("ukážu,"));
+        assert_eq!(spoken_at(&p, 3_500_000).as_deref(), Some("jak"));
+        // A word more or less: the words no longer match, so nothing lights up, and nothing guesses.
+        p.apply(retext("Dneska vám ukážu, jak na to")).unwrap();
+        assert!(spoken(&p).iter().all(Option::is_none));
+        let ClipContent::Text { words, .. } = &p.tracks[1].clips[0].content else { panic!() };
+        assert_eq!(words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), ["Dneska", "vám", "ukážu,", "jak"]);
+        // Back to the words they were: lit again.
+        p.apply(retext("Dneska vám ukážu, jak")).unwrap();
+        assert_eq!(spoken_at(&p, 2_600_000).as_deref(), Some("ukážu,"));
+        // A word corrected into two before captions were made stays one timed word, and fixing
+        // another word keeps the caption lit.
+        let timed = |text: &str, start_us: i64| CaptionWord {
+            text: text.into(),
+            start_us,
+            end_us: start_us + 200_000,
+            key: false,
+        };
+        let mut words = vec![timed("na pivo", 0), CaptionWord { key: true, ..timed("teď", 300_000) }];
+        retext_words(&mut words, "na pivo teď", "na pivo hned");
+        assert_eq!(words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>(), ["na pivo", "hned"]);
+        // A corrected key word stays key.
+        assert_eq!(words.iter().map(|w| w.key).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(crate::model::spoken_word("na pivo hned", &words, 350_000), Some(8..12));
+    }
+
+    #[test]
+    fn caption_words_must_spell_the_caption_and_survive_merging() {
+        let word = |text: &str, start_us: i64| CaptionWord {
+            text: text.into(),
+            start_us,
+            end_us: start_us + 200_000,
+            key: false,
+        };
+        let segment = |start_us: i64, text: &str, words: Vec<CaptionWord>| CaptionSegment {
+            start_us,
+            end_us: start_us + 500_000,
+            text: text.into(),
+            words,
+        };
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 95.0, "color": "#ffffff", "highlight": "#ffe14d"}))
+                .unwrap();
+        let mut p = project();
+        let wrong = segment(0, "Ahoj světe", vec![word("Ahoj", 0), word("svete", 250_000)]);
+        let error = p
+            .apply(EditCmd::AddCaptions {
+                segments: vec![wrong],
+                style: style.clone(),
+                anim_in: None,
+                anim_out: None,
+                transform: None,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("Caption words must be the caption text"), "{error}");
+        // Segments starting within a frame merge; the words of both stay, at their times.
+        let merged = vec![
+            segment(0, " Ahoj ", vec![word("Ahoj", 0)]),
+            segment(10_000, "světe", vec![word("světe", 250_000)]),
+            segment(1_000_000, "bez", vec![word("bez", 1_000_000)]),
+            segment(1_010_000, "slov", Vec::new()),
+        ];
+        p.apply(EditCmd::AddCaptions { segments: merged, style, anim_in: None, anim_out: None, transform: None })
+            .unwrap();
+        let captions = &p.tracks.iter().find(|t| t.is_captions()).unwrap().clips;
+        let ClipContent::Text { text, words, .. } = &captions[0].content else { panic!() };
+        assert_eq!(
+            (text.as_str(), words.iter().map(|w| w.start_us).collect::<Vec<_>>()),
+            ("Ahoj světe", vec![0, 250_000])
+        );
+        assert_eq!(spoken_at(&p, 300_000).as_deref(), Some("světe"));
+        // A merged caption with only some of its words cannot highlight the right one, so it highlights none.
+        let ClipContent::Text { text, words, .. } = &captions[1].content else { panic!() };
+        assert_eq!((text.as_str(), words.len()), ("bez slov", 0));
+    }
+
+    #[test]
+    fn correct_words_sets_replaces_and_removes_and_undoes_in_one_step() {
+        let fix = |start_us: i64, original: &str, text: &str| WordCorrection {
+            asset_id: "a".into(),
+            source_start_us: start_us,
+            original: original.into(),
+            text: text.into(),
+        };
+        let mut editor = Editor::new(project());
+        let before = editor.project.clone();
+        editor
+            .apply(
+                EditCmd::CorrectWords { corrections: vec![fix(500_000, "oka", " okna "), fix(900_000, "to", "tu")] },
+                None,
+            )
+            .unwrap();
+        assert_eq!(editor.project.word_corrections, [fix(500_000, "oka", "okna"), fix(900_000, "to", "tu")]);
+        // The same word again replaces its correction; its recognised text removes it.
+        editor.apply(EditCmd::CorrectWords { corrections: vec![fix(500_000, "oka", "okno")] }, None).unwrap();
+        editor.apply(EditCmd::CorrectWords { corrections: vec![fix(900_000, "to", "to")] }, None).unwrap();
+        assert_eq!(editor.project.word_corrections, [fix(500_000, "oka", "okno")]);
+        // Another word with the same start is another correction.
+        editor.apply(EditCmd::CorrectWords { corrections: vec![fix(500_000, "okno", "okna")] }, None).unwrap();
+        assert_eq!(editor.project.word_corrections.len(), 2);
+        let unknown = WordCorrection { asset_id: "gone".into(), ..fix(0, "a", "b") };
+        let kept = editor.project.clone();
+        assert!(editor.apply(EditCmd::CorrectWords { corrections: vec![unknown] }, None).is_err());
+        assert_eq!(editor.project, kept);
+        for _ in 0..4 {
+            editor.undo();
+        }
+        assert_eq!(editor.project, before);
+    }
+
+    #[test]
+    fn projects_without_corrections_read_and_write_as_before() {
+        let mut p = project();
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(json.get("wordCorrections").is_none());
+        assert_eq!(serde_json::from_value::<Project>(json).unwrap(), p);
+        p.apply(EditCmd::CorrectWords {
+            corrections: vec![WordCorrection {
+                asset_id: "a".into(),
+                source_start_us: 1,
+                original: "oka".into(),
+                text: "okna".into(),
+            }],
+        })
+        .unwrap();
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            json["wordCorrections"],
+            serde_json::json!([{"assetId": "a", "sourceStartUs": 1, "original": "oka", "text": "okna"}])
+        );
+        assert_eq!(serde_json::from_value::<Project>(json).unwrap(), p);
+    }
+
+    /// Main-track pieces as (start ms, end ms, scale).
+    fn zoom_layout(p: &Project) -> Vec<(i64, i64, f32)> {
+        p.tracks[0]
+            .clips
+            .iter()
+            .map(|c| {
+                let ClipContent::Media { transform, .. } = &c.content else { panic!() };
+                (c.start_us / 1000, c.end_us() / 1000, (transform.scale * 1000.0).round() / 1000.0)
+            })
+            .collect()
+    }
+
+    fn changes(id: &str, fields: serde_json::Value) -> EditCmd {
+        let mut cmd = serde_json::json!({"type": "updateClip", "clipId": id});
+        cmd.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(cmd).unwrap()
+    }
+
+    fn zoom(ranges: &[(i64, i64, f64)]) -> EditCmd {
+        EditCmd::ZoomRanges {
+            ranges: ranges.iter().map(|&(start_us, end_us, scale)| ZoomRange { start_us, end_us, scale }).collect(),
+        }
+    }
+
+    #[test]
+    fn zoom_ranges_split_at_the_edges_and_scale_only_inside() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap();
+        let style = TextStyle {
+            font_family: None,
+            font_size: 64.0,
+            color: "#fff".into(),
+            bold: false,
+            stroke_width: 0.0,
+            stroke_color: "#000".into(),
+            background: None,
+            max_width: None,
+            highlight: None,
+            keywords: None,
+            shadow: None,
+            letter_case: Default::default(),
+            letter_spacing: 0.0,
+            line_spacing: 0.0,
+            align: TextAlign::Center,
+            box_radius: BOX_RADIUS,
+        };
+        p.apply(EditCmd::AddText { start_us: 500_000, text: "Title".into(), style }).unwrap();
+        let first = p.tracks[0].clips[0].id.clone();
+        let framed = Transform { x: 0.1, y: -0.05, scale: 1.1, rotation: 5.0, ..Transform::default() };
+        p.apply(changes(&first, serde_json::json!({"transform": framed}))).unwrap();
+        let before = p.clone();
+        // The second range starts 0.2 s before the cut: too little of the first clip to zoom, so
+        // the punch-in starts at the cut.
+        p.apply(zoom(&[(1_000_000, 2_500_000, 1.2), (4_800_000, 6_000_000, 1.25)])).unwrap();
+        assert_eq!(
+            zoom_layout(&p),
+            [(0, 1000, 1.1), (1000, 2500, 1.32), (2500, 5000, 1.1), (5000, 6000, 1.25), (6000, 8000, 1.0)]
+        );
+        let ClipContent::Media { transform, .. } = &p.tracks[0].clips[1].content else { panic!() };
+        assert_eq!((transform.x, transform.y, transform.rotation), (0.1, -0.05, 5.0));
+        // Nothing but the main track changed, and its pieces play the same source back to back.
+        assert_eq!(p.tracks[1..], before.tracks[1..]);
+        let sources: Vec<i64> = p.tracks[0]
+            .clips
+            .iter()
+            .map(|c| match &c.content {
+                ClipContent::Media { source_in_us, .. } => *source_in_us,
+                ClipContent::Text { .. } => panic!(),
+            })
+            .collect();
+        assert_eq!(sources, [0, 1_000_000, 2_500_000, 0, 1_000_000]);
+    }
+
+    #[test]
+    fn zoom_edges_move_to_the_clip_edge_instead_of_leaving_a_sliver() {
+        let mut p = project();
+        for _ in 0..2 {
+            p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        }
+        let (first, second) = (p.tracks[0].clips[0].id.clone(), p.tracks[0].clips[1].id.clone());
+        let dissolve = Transition { kind: crate::model::TransitionKind::Dissolve, duration_us: 500_000 };
+        p.apply(EditCmd::SetTransition { clip_id: second, transition: Some(dissolve) }).unwrap();
+        p.apply(changes(&first, serde_json::json!({"fadeInUs": 1_000_000}))).unwrap();
+        let fade = |p: &Project| match p.tracks[0].clips[0].content {
+            ClipContent::Media { fade_in_us, .. } => fade_in_us,
+            ClipContent::Text { .. } => panic!(),
+        };
+        // 0.1 s after a clip starts, and 0.2 s before it ends: both edges go to the cuts.
+        let mut q = p.clone();
+        q.apply(zoom(&[(5_100_000, 9_800_000, 1.2)])).unwrap();
+        assert_eq!(zoom_layout(&q), [(0, 5000, 1.0), (5000, 10000, 1.2)]);
+        // 1.5 s into a clip that fades in over 1 s would halve the fade, and 0.4 s before a 0.5 s
+        // dissolve would shorten it: the zoom takes those pieces in.
+        let mut q = p.clone();
+        q.apply(zoom(&[(1_500_000, 4_600_000, 1.2)])).unwrap();
+        assert_eq!(zoom_layout(&q), [(0, 5000, 1.2), (5000, 10000, 1.0)]);
+        assert_eq!(fade(&q), 1_000_000);
+        assert_eq!(q.tracks[0].clips[1].transition_in.unwrap().duration_us, 500_000);
+        // A range that barely reaches into a clip leaves that clip alone.
+        let mut q = p.clone();
+        q.apply(zoom(&[(2_000_000, 5_150_000, 1.2)])).unwrap();
+        assert_eq!(zoom_layout(&q), [(0, 2000, 1.0), (2000, 5000, 1.2), (5000, 10000, 1.0)]);
+        assert_eq!(fade(&q), 1_000_000);
+    }
+
+    #[test]
+    fn zoom_leaves_clips_with_keyframes_alone_and_names_them() {
+        let mut e = Editor::new(project());
+        for _ in 0..2 {
+            e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        }
+        let keyed = e.project.tracks[0].clips[0].id.clone();
+        let keyframes = vec![
+            Keyframe { t_us: 0, transform: Transform::default(), ease: Ease::Linear },
+            Keyframe {
+                t_us: 4_000_000,
+                transform: Transform { scale: 1.5, ..Transform::default() },
+                ease: Ease::Linear,
+            },
+        ];
+        e.apply(EditCmd::SetKeyframes { clip_id: keyed.clone(), keyframes }, None).unwrap();
+        let before = e.project.clone();
+        let outcome = e.apply(zoom(&[(1_000_000, 2_000_000, 1.2), (6_000_000, 8_000_000, 1.2)]), None).unwrap();
+        assert_eq!(outcome.skipped, std::slice::from_ref(&keyed));
+        assert_eq!(e.project.tracks[0].clips[0], before.tracks[0].clips[0]);
+        assert_eq!(zoom_layout(&e.project), [(0, 5000, 1.0), (5000, 6000, 1.0), (6000, 8000, 1.2), (8000, 10000, 1.0)]);
+        assert_eq!(serde_json::to_value(&outcome).unwrap()["skipped"], serde_json::json!([keyed]));
+        // Two ranges, three new pieces: one undo step takes all of it back.
+        assert!(e.undo());
+        assert_eq!(e.project, before);
+    }
+
+    #[test]
+    fn zoom_rejects_overlapping_or_unusable_ranges_and_changes_nothing() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        let before = e.project.clone();
+        for bad in [
+            zoom(&[]),
+            zoom(&[(1_000_000, 3_000_000, 1.2), (2_000_000, 4_000_000, 1.2)]),
+            zoom(&[(2_000_000, 1_000_000, 1.2)]),
+            zoom(&[(-1, 1_000_000, 1.2)]),
+            zoom(&[(1_000_000, 2_000_000, f64::NAN)]),
+            zoom(&[(1_000_000, 2_000_000, 0.0)]),
+            zoom(&[(1_000_000, 2_000_000, 9.0)]),
+        ] {
+            assert!(e.apply(bad.clone(), None).is_err(), "{bad:?}");
+            assert_eq!(e.project, before);
+        }
+        assert!(!e.can_redo() && e.can_undo());
+    }
+
+    fn motion(clip_id: Option<&str>, range: Option<(i64, i64)>, kind: MotionKind, strength: f64) -> EditCmd {
+        let range = range.map(|(start_us, end_us)| TimeRange { start_us, end_us });
+        EditCmd::ApplyMotion { clip_id: clip_id.map(Into::into), range, kind, strength }
+    }
+
+    /// (time, zoom against the clip's own scale, x, y) of each keyframe of main-track clip `i`.
+    fn motion_keys(p: &Project, i: usize) -> Vec<(i64, f32, f32, f32)> {
+        let clip = &p.tracks[0].clips[i];
+        assert!(clip.keyframes.iter().all(|k| k.ease == Ease::Smooth));
+        let ClipContent::Media { transform: base, .. } = &clip.content else { panic!() };
+        clip.keyframes.iter().map(|k| (k.t_us, k.transform.scale / base.scale, k.transform.x, k.transform.y)).collect()
+    }
+
+    fn assert_keys(found: Vec<(i64, f32, f32, f32)>, expected: [(i64, f32, f32, f32); 2]) {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert!(
+            found.len() == 2
+                && found
+                    .iter()
+                    .zip(&expected)
+                    .all(|(f, e)| f.0 == e.0 && close(f.1, e.1) && close(f.2, e.2) && close(f.3, e.3)),
+            "{found:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn motion_zooms_about_the_safe_area_centre_on_a_smooth_curve_and_skips_keyed_clips() {
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let (first, second) = (p.tracks[0].clips[0].id.clone(), p.tracks[0].clips[1].id.clone());
+        let framed = Transform { x: 0.1, y: -0.05, scale: 1.2, rotation: 5.0, opacity: 0.9, crop: None };
+        p.apply(changes(&first, serde_json::json!({"transform": framed}))).unwrap();
+
+        p.apply(motion(Some(&first), None, MotionKind::PushIn, 0.1)).unwrap();
+        let keys = &p.tracks[0].clips[0].keyframes;
+        assert_eq!(keys.iter().map(|k| k.t_us).collect::<Vec<_>>(), [0, 5_000_000]);
+        assert_eq!(keys[0].transform, framed);
+        let end = keys[1].transform;
+        assert!((end.scale - 1.32).abs() < 1e-6 && end.rotation == 5.0 && end.opacity == 0.9);
+        // The middle of the 1080×1920 safe area (60–900 px across, 250–1420 px down) stays where
+        // it is: the same point of the picture lies there before and after the zoom.
+        let (fx, fy) = (480.0 / 1080.0 - 0.5, 835.0 / 1920.0 - 0.5);
+        let under = |t: Transform| ((fx - t.x) / t.scale, (fy - t.y) / t.scale);
+        let (before, after) = (under(framed), under(end));
+        assert!((before.0 - after.0).abs() < 1e-6 && (before.1 - after.1).abs() < 1e-6, "{before:?} {after:?}");
+
+        // A clip with keyframes keeps them and is named.
+        let keyed = p.tracks[0].clips[0].keyframes.clone();
+        let out = p.apply(motion(Some(&first), None, MotionKind::KenBurns, 0.15)).unwrap();
+        assert_eq!((out.skipped, &p.tracks[0].clips[0].keyframes), (vec![first.clone()], &keyed));
+
+        // Pull out over part of a clip: zoomed in at the start of the range, the clip's own framing at its end.
+        p.apply(motion(Some(&second), Some((6_000_000, 7_000_000)), MotionKind::PullOut, 0.15)).unwrap();
+        assert_keys(motion_keys(&p, 1), [(1_000_000, 1.15, fx * -0.15, fy * -0.15), (2_000_000, 1.0, 0.0, 0.0)]);
+
+        // Without a clip, every main-track clip under the range moves as one motion: both get
+        // keyframes at the ends of the range, so halfway through it, at the cut, the first clip
+        // ends half zoomed in and the second starts there. Ken Burns zooms about the right edge
+        // of the safe area.
+        let mut p = project();
+        p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap();
+        p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap();
+        let out = p.apply(motion(None, Some((4_000_000, 6_000_000)), MotionKind::KenBurns, 0.1)).unwrap();
+        assert!(out.skipped.is_empty());
+        let right = 900.0 / 1080.0 - 0.5;
+        let zoomed = (1.1, right * -0.1, fy * -0.1);
+        assert_keys(motion_keys(&p, 0), [(4_000_000, 1.0, 0.0, 0.0), (6_000_000, zoomed.0, zoomed.1, zoomed.2)]);
+        assert_keys(motion_keys(&p, 1), [(-1_000_000, 1.0, 0.0, 0.0), (1_000_000, zoomed.0, zoomed.1, zoomed.2)]);
+        let (last, first) = (&p.tracks[0].clips[0], &p.tracks[0].clips[1]);
+        let at = |clip: &Clip, t: i64| crate::effects::transform_at(clip, t).0;
+        let (ending, starting) = (at(last, last.end_us() - 1), at(first, first.start_us));
+        assert!((ending.scale - 1.05).abs() < 1e-4 && (starting.scale - 1.05).abs() < 1e-4, "{ending:?} {starting:?}");
+        assert!((at(last, 4_500_000).scale - 1.015625).abs() < 1e-6, "one smooth curve over the whole range");
+        // Once the clip before is gone, the second clip's range starts before 0 and still rewrites.
+        let id = first.id.clone();
+        p.apply(EditCmd::DeleteClips { clip_ids: vec![last.id.clone()] }).unwrap();
+        p.apply(EditCmd::SetKeyframes { clip_id: id.clone(), keyframes: vec![] }).unwrap();
+        p.apply(motion(Some(&id), Some((-1_000_000, 1_000_000)), MotionKind::PushIn, 0.06)).unwrap();
+        assert_eq!(p.tracks[0].clips[0].keyframes.iter().map(|k| k.t_us).collect::<Vec<_>>(), [-1_000_000, 1_000_000]);
+
+        // Other canvases have no safe area: the canvas centre, and its right edge for Ken Burns.
+        p.apply(EditCmd::SetCanvas { width: 1920, height: 1080, background: None, background_blur: None }).unwrap();
+        p.apply(EditCmd::SetKeyframes { clip_id: id.clone(), keyframes: vec![] }).unwrap();
+        p.apply(motion(Some(&id), None, MotionKind::KenBurns, 0.1)).unwrap();
+        assert_keys(motion_keys(&p, 0), [(0, 1.0, 0.0, 0.0), (3_000_000, 1.1, -0.05, 0.0)]);
+    }
+
+    #[test]
+    fn motion_refuses_text_sound_and_bad_ranges_and_changes_nothing() {
+        let mut e = Editor::new(project());
+        e.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }, None).unwrap();
+        e.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }, None).unwrap();
+        let style: TextStyle = serde_json::from_value(serde_json::json!({"fontSize":64.0,"color":"#ffffff"})).unwrap();
+        e.apply(EditCmd::AddText { start_us: 0, text: "Title".into(), style }, None).unwrap();
+        let id =
+            |e: &Editor, kind: TrackKind| e.project.tracks.iter().find(|t| t.kind == kind).unwrap().clips[0].id.clone();
+        let (video, sound, text) = (id(&e, TrackKind::Video), id(&e, TrackKind::Audio), id(&e, TrackKind::Text));
+        let before = e.project.clone();
+        for bad in [
+            motion(Some(&text), None, MotionKind::PushIn, 0.1),
+            motion(Some(&sound), None, MotionKind::PushIn, 0.1),
+            motion(Some("missing"), None, MotionKind::PushIn, 0.1),
+            motion(Some(&video), Some((6_000_000, 7_000_000)), MotionKind::PushIn, 0.1),
+            motion(Some(&video), Some((2_000_000, 1_000_000)), MotionKind::PushIn, 0.1),
+            motion(None, None, MotionKind::PushIn, 0.1),
+            motion(None, Some((6_000_000, 7_000_000)), MotionKind::PushIn, 0.1),
+            motion(Some(&video), None, MotionKind::PushIn, 0.0),
+            motion(Some(&video), None, MotionKind::PushIn, 10.0),
+            motion(Some(&video), None, MotionKind::PushIn, f64::NAN),
+        ] {
+            assert!(e.apply(bad.clone(), None).is_err(), "{bad:?}");
+            assert_eq!(e.project, before);
+        }
+    }
+
+    /// Split halves play on from each other, so zooming changes no sample of the mix, fades,
+    /// volume and the dissolve into the next clip included.
+    #[test]
+    fn zoom_keeps_the_sound_sample_for_sample() {
+        use crate::audio::{Mixer, pcm_path};
+        use crate::model::CHANNELS;
+        let cache = std::env::temp_dir().join(format!("nuzky-zoom-sound-{}", new_id()));
+        std::fs::create_dir_all(cache.join("pcm")).unwrap();
+        let mut p = project();
+        for id in ["a", "b"] {
+            let asset = p.asset(id).unwrap().clone();
+            let frames = (asset.duration_us * 48 / 1000) as usize;
+            // A chirp, so any shift or step between pieces shows.
+            let samples: Vec<f32> = (0..frames)
+                .flat_map(|i| {
+                    let t = i as f32 / 48_000.0;
+                    [0.4 * (t * (300.0 + 200.0 * t) * std::f32::consts::TAU).sin(); CHANNELS]
+                })
+                .collect();
+            std::fs::write(pcm_path(&cache, &asset), bytemuck::cast_slice(&samples)).unwrap();
+            p.apply(EditCmd::AddClip { asset_id: id.into(), start_us: None, track_id: None }).unwrap();
+        }
+        let (first, second) = (p.tracks[0].clips[0].id.clone(), p.tracks[0].clips[1].id.clone());
+        p.apply(changes(&first, serde_json::json!({"volume": 0.8, "fadeInUs": 300_000, "fadeOutUs": 200_000})))
+            .unwrap();
+        let dissolve = Transition { kind: crate::model::TransitionKind::Dissolve, duration_us: 400_000 };
+        p.apply(EditCmd::SetTransition { clip_id: second, transition: Some(dissolve) }).unwrap();
+        let mix = |p: &Project| {
+            let mut out = vec![0.0; 8 * 48_000 * CHANNELS];
+            Mixer::new(cache.clone()).mix(p, 0, &mut out);
+            out
+        };
+        let before = mix(&p);
+        p.apply(zoom(&[(1_234_567, 2_345_678, 1.2), (4_100_000, 5_900_000, 1.3), (6_500_000, 7_000_000, 1.15)]))
+            .unwrap();
+        assert_eq!(p.tracks[0].clips.len(), 8, "{:?}", zoom_layout(&p));
+        let after = mix(&p);
+        std::fs::remove_dir_all(&cache).unwrap();
+        let difference = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(before.iter().any(|s| s.abs() > 0.1), "the mix is silent");
+        assert!(difference < 1e-6, "zooming changed the sound by {difference}");
+    }
+
+    fn copied(p: &Project, id: &str) -> CopiedClip {
+        let (ti, ci) = p.find_clip(id).unwrap();
+        let t = &p.tracks[ti];
+        CopiedClip {
+            clip: t.clips[ci].clone(),
+            track_id: t.id.clone(),
+            track_kind: t.kind,
+            keep_in_place: t.keep_in_place,
+        }
+    }
+
+    #[test]
+    fn paste_keeps_offsets_and_tracks_and_puts_main_clips_in_at_the_nearest_cut() {
+        let mut p = project();
+        let a = p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap().select[0]
+            .clone();
+        let b = p.apply(EditCmd::AddClip { asset_id: "b".into(), start_us: None, track_id: None }).unwrap().select[0]
+            .clone();
+        let dissolve = Transition { kind: crate::model::TransitionKind::Dissolve, duration_us: 500_000 };
+        p.apply(EditCmd::SetTransition { clip_id: b.clone(), transition: Some(dissolve) }).unwrap();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let title =
+            p.apply(EditCmd::AddText { start_us: 1_000_000, text: "Hook".into(), style }).unwrap().select[0].clone();
+        let text_track = p.tracks[1].id.clone();
+
+        // The take and its title, pasted at 6.4 s: the take goes in at the cut at 5 s and the title keeps its 1 s from it.
+        let clips = vec![copied(&p, &a), copied(&p, &title)];
+        let out = p.apply(EditCmd::PasteClips { clips: clips.clone(), at_us: 6_400_000 }).unwrap();
+        assert_eq!(main_layout(&p), vec![(0, 5000), (5000, 5000), (10000, 3000)]);
+        assert_eq!(p.tracks[0].clips[2].id, b);
+        assert!(p.tracks[0].clips[1].transition_in.is_none());
+        assert_eq!(p.tracks[1].id, text_track);
+        assert_eq!(p.tracks[1].clips.iter().map(|c| c.start_us).collect::<Vec<_>>(), [1_000_000, 6_000_000]);
+        assert_eq!(out.select, [p.tracks[0].clips[1].id.clone(), p.tracks[1].clips[1].id.clone()]);
+
+        // Pasted there again, the title's track is taken: it goes on a new text track right above.
+        p.apply(EditCmd::PasteClips { clips: clips[1..].to_vec(), at_us: 6_000_000 }).unwrap();
+        assert_eq!((p.tracks[2].kind, p.tracks[2].clips[0].start_us), (TrackKind::Text, 6_000_000));
+
+        // Clips that were next to each other keep the transition between them; the block's first one has none.
+        let ab = vec![copied(&p, &a), copied(&p, &p.tracks[0].clips[1].id.clone())];
+        p.apply(EditCmd::PasteClips { clips: ab, at_us: i64::MAX / 4 }).unwrap();
+        let last = &p.tracks[0].clips[3..];
+        assert!(last[0].transition_in.is_none() && last[1].transition_in.is_none());
+        let ab = vec![copied(&p, &p.tracks[0].clips[1].id.clone()), copied(&p, &b)];
+        p.apply(EditCmd::PasteClips { clips: ab, at_us: 0 }).unwrap();
+        assert_eq!(main_layout(&p)[..2], [(0, 5000), (5000, 3000)]);
+        assert_eq!(p.tracks[0].clips[1].transition_in, Some(dissolve));
+
+        // A cut emptied the title's track, so the paste makes a new one; a removed file pastes nothing.
+        let only = copied(&p, &p.tracks[2].clips[0].id.clone());
+        p.apply(EditCmd::DeleteClips { clip_ids: vec![only.clip.id.clone()] }).unwrap();
+        let tracks = p.tracks.len();
+        p.apply(EditCmd::PasteClips { clips: vec![only], at_us: 9_000_000 }).unwrap();
+        assert_eq!(p.tracks.len(), tracks + 1);
+        let before = p.clone();
+        p.apply(EditCmd::RemoveAsset { asset_id: "b".into() }).unwrap();
+        let gone = before.tracks[0].clips.iter().find(|c| c.id == b).unwrap().id.clone();
+        assert!(p.apply(EditCmd::PasteClips { clips: vec![copied(&before, &gone)], at_us: 0 }).is_err());
+    }
+
+    #[test]
+    fn a_pasted_title_stays_on_its_take_when_the_pasted_takes_close_a_gap() {
+        let mut p = project();
+        let takes: Vec<String> = ["a", "b", "a"]
+            .into_iter()
+            .map(|a| {
+                p.apply(EditCmd::AddClip { asset_id: a.into(), start_us: None, track_id: None }).unwrap().select[0]
+                    .clone()
+            })
+            .collect();
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        // 1 s into the third take, which starts at 8 s.
+        let title =
+            p.apply(EditCmd::AddText { start_us: 9_000_000, text: "Hook".into(), style }).unwrap().select[0].clone();
+        let clips = vec![copied(&p, &takes[0]), copied(&p, &takes[2]), copied(&p, &title)];
+        p.apply(EditCmd::PasteClips { clips, at_us: i64::MAX / 4 }).unwrap();
+        // The takes go in at 13 s and 18 s, back to back; the title keeps its second into the second one.
+        assert_eq!(main_layout(&p)[3..], [(13000, 5000), (18000, 5000)]);
+        assert_eq!(p.tracks[1].clips.iter().map(|c| c.start_us).collect::<Vec<_>>(), [9_000_000, 19_000_000]);
+
+        // A title from 4.5 s, over the first take, lands 0.5 s before the end of its pasted copy and over the third
+        // take's title there, so it goes on a track of its own; one from before the third take, pasted at the
+        // start, starts at 0 while that take's own title keeps its second.
+        let style: TextStyle =
+            serde_json::from_value(serde_json::json!({"fontSize": 60.0, "color": "#ffffff"})).unwrap();
+        let early =
+            p.apply(EditCmd::AddText { start_us: 4_500_000, text: "Early".into(), style }).unwrap().select[0].clone();
+        let clips = vec![copied(&p, &takes[0]), copied(&p, &takes[2]), copied(&p, &early), copied(&p, &title)];
+        let out = p.apply(EditCmd::PasteClips { clips, at_us: i64::MAX / 4 }).unwrap();
+        let start =
+            |p: &Project, id: &str| p.find_clip(id).map(|(ti, ci)| (ti, p.tracks[ti].clips[ci].start_us)).unwrap();
+        let ((early_track, early_at), (title_track, title_at)) = (start(&p, &out.select[2]), start(&p, &out.select[3]));
+        assert_eq!((early_at, title_at), (27_500_000, 29_000_000));
+        assert_ne!(early_track, title_track);
+        let clips = vec![copied(&p, &takes[2]), copied(&p, &early), copied(&p, &title)];
+        let out = p.apply(EditCmd::PasteClips { clips, at_us: 0 }).unwrap();
+        assert_eq!((start(&p, &out.select[1]).1, start(&p, &out.select[2]).1), (0, 1_000_000));
+    }
+
+    #[test]
+    fn paste_attributes_carries_the_look_of_its_kind_and_moves_each_clip_from_its_own_framing() {
+        let mut p = project();
+        p.assets.push(asset("still", AssetKind::Image, 0));
+        let source = p.apply(EditCmd::AddClip { asset_id: "a".into(), start_us: None, track_id: None }).unwrap().select
+            [0]
+        .clone();
+        let target = p
+            .apply(EditCmd::AddPictureInPicture { asset_id: "still".into(), start_us: 0, duration_us: Some(3_000_000) })
+            .unwrap()
+            .select[0]
+            .clone();
+        let crop = crate::model::Crop { left: 0.1, ..crate::model::Crop::default() };
+        let adjust = Adjust { contrast: 0.4, ..Adjust::default() };
+        let round = Shape { radius: 0.3, ..Shape::default() };
+        let look = serde_json::json!({
+            "transform": Transform { crop: Some(crop), ..Transform::default() },
+            "adjust": adjust,
+            "shape": round,
+            "background": Background::Blur { strength: 0.5 },
+        });
+        p.apply(changes(&source, look)).unwrap();
+        let motion = |id: &str| EditCmd::ApplyMotion {
+            clip_id: Some(id.into()),
+            range: None,
+            kind: MotionKind::PushIn,
+            strength: 0.1,
+        };
+        p.apply(motion(&source)).unwrap();
+        let fade = Animation { kind: crate::model::AnimationKind::Fade, duration_us: 4_000_000 };
+        p.apply(EditCmd::SetAnimation { clip_id: source.clone(), slot: AnimationSlot::In, animation: Some(fade) })
+            .unwrap();
+        let framing = |p: &Project| match &p.tracks[1].clips[0].content {
+            ClipContent::Media { transform, .. } => *transform,
+            ClipContent::Text { .. } => unreachable!(),
+        };
+        let own = framing(&p);
+
+        let out =
+            p.apply(EditCmd::PasteAttributes { source: copied(&p, &source), clip_ids: vec![target.clone()] }).unwrap();
+        assert!(out.skipped.is_empty());
+        let clip = &p.tracks[1].clips[0];
+        let ClipContent::Media { adjust: a, background, shape, transform, .. } = &clip.content else { panic!() };
+        assert_eq!((*a, background, shape), (adjust, &Background::Blur { strength: 0.5 }, &Some(round)));
+        // The window keeps its place and size, takes the crop, and zooms in over its own 3 s as the motion would.
+        assert_eq!(*transform, Transform { crop: Some(crop), ..own });
+        let mut expected = p.clone();
+        expected.tracks[1].clips[0].keyframes.clear();
+        expected.apply(motion(&target)).unwrap();
+        for (k, e) in clip.keyframes.iter().zip(&expected.tracks[1].clips[0].keyframes) {
+            assert_eq!((k.t_us, k.ease), (e.t_us, e.ease));
+            for (x, y) in
+                [(k.transform.x, e.transform.x), (k.transform.y, e.transform.y), (k.transform.scale, e.transform.scale)]
+            {
+                assert!((x - y).abs() < 1e-5, "{k:?} is not {e:?}");
+            }
+        }
+        assert_eq!(clip.keyframes.len(), 2);
+        assert_eq!(clip.anim_in, Some(Animation { duration_us: 3_000_000, ..fade }));
+
+        // Text takes the style and keeps its words; sound clips are another kind and stay as they were.
+        let style = |size: f32| {
+            serde_json::from_value::<TextStyle>(serde_json::json!({"fontSize": size, "color": "#ffcc00"})).unwrap()
+        };
+        let big = p.apply(EditCmd::AddText { start_us: 0, text: "Big".into(), style: style(120.0) }).unwrap().select[0]
+            .clone();
+        let small =
+            p.apply(EditCmd::AddText { start_us: 5_000_000, text: "small".into(), style: style(40.0) }).unwrap().select
+                [0]
+            .clone();
+        let music =
+            p.apply(EditCmd::AddClip { asset_id: "m".into(), start_us: Some(0), track_id: None }).unwrap().select[0]
+                .clone();
+        let out = p
+            .apply(EditCmd::PasteAttributes { source: copied(&p, &big), clip_ids: vec![small.clone(), music.clone()] })
+            .unwrap();
+        assert_eq!(out.skipped, std::slice::from_ref(&music));
+        let (ti, ci) = p.find_clip(&small).unwrap();
+        let ClipContent::Text { text, style: s, .. } = &p.tracks[ti].clips[ci].content else { panic!() };
+        assert_eq!((text.as_str(), s), ("small", &style(120.0)));
+        assert!(p.apply(EditCmd::PasteAttributes { source: copied(&p, &big), clip_ids: vec![music] }).is_err());
+    }
+}

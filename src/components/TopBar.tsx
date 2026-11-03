@@ -1,0 +1,353 @@
+import { useState } from "react";
+import { AlertCircle, ChevronLeft, Download, FolderOpen, History, Loader2, Puzzle, Redo2, Sparkles, Undo2 } from "lucide-react";
+import { useAgent } from "../lib/agent";
+import { api, errorText } from "../lib/api";
+import { togglePanel, useDock } from "../lib/dock";
+import { closeCover, exportCover, openCover, useCover } from "../lib/cover";
+import { useReels } from "../lib/reels";
+import { useStyle } from "../lib/style";
+import { when } from "../lib/time";
+import { AI_EDITING, PLUGIN_RUN, openExport, projectDuration, restoreVersion, stopAiRun, useAiLocked, useEditor, whenIdle } from "../lib/store";
+import type { ProjectVersion } from "../lib/types";
+import { Button, IconButton, Menu, ProgressBar } from "./ui";
+import { UpdateButton } from "./Updates";
+import { FeedbackButton } from "./Feedback";
+import { useWindowButtons } from "../lib/window";
+
+function SaveStatus() {
+  const saveState = useEditor((s) => s.saveState);
+  if (saveState === "error")
+    return (
+      <span className="flex shrink-0 items-center gap-1 text-[12px] text-danger" role="status">
+        <AlertCircle size={13} /> Neukládáno, další úprava ukládání zopakuje
+      </span>
+    );
+  if (saveState === "saving")
+    return (
+      <span className="flex shrink-0 items-center gap-1 text-[12px] text-muted" role="status">
+        <Loader2 size={12} className="animate-spin" /> Ukládání…
+      </span>
+    );
+  return (
+    <span className="flex shrink-0 items-center gap-1.5 text-[12px] text-muted" role="status">
+      <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-ok" /> Uloženo
+    </span>
+  );
+}
+
+function ProjectName() {
+  const name = useEditor((s) => s.snap?.project.name ?? "");
+  const edit = useEditor((s) => s.edit);
+  const locked = useAiLocked();
+  const [draft, setDraft] = useState<string | null>(null);
+
+  if (draft === null)
+    return (
+      <button
+        type="button"
+        title={locked ? AI_EDITING : "Přejmenovat projekt"}
+        aria-disabled={locked || undefined}
+        onClick={locked ? undefined : () => setDraft(name)}
+        className="max-w-[260px] truncate rounded-md px-1.5 py-0.5 text-[13px] font-semibold text-fg hover:bg-white/[.08] aria-disabled:cursor-not-allowed aria-disabled:hover:bg-transparent"
+      >
+        {name === "Untitled project" ? "Nepojmenovaný projekt" : name}
+      </button>
+    );
+  const commit = () => {
+    if (draft.trim() && draft !== name) edit({ type: "renameProject", name: draft });
+    setDraft(null);
+  };
+  return (
+    <input
+      autoFocus
+      aria-label="Název projektu"
+      value={draft}
+      onFocus={(e) => e.currentTarget.select()}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") setDraft(null);
+      }}
+      className="h-7 w-[260px] rounded-md border border-accent bg-white/[.06] px-1.5 text-center text-[13px] font-semibold text-fg"
+    />
+  );
+}
+
+/** Opens the launcher: recent projects, new ones and search (Ctrl+K). */
+function ProjectsButton() {
+  const open = useEditor((s) => s.launcherOpen);
+  return (
+    <Button variant="bar" pill aria-haspopup="dialog" aria-expanded={open} title="Projects (Ctrl+K)" onClick={() => useEditor.setState({ launcherOpen: !open })} className={open ? "bg-white/[.13]" : ""}>
+      <FolderOpen size={15} /> Projekty
+    </Button>
+  );
+}
+
+/** Background work. A model download shows first, with its Stop; export reopens its dialog; captions and transcripts open their tab; a preview proxy and work an AI agent started can be stopped. */
+export function JobIndicator() {
+  const jobs = useEditor((s) => s.jobs);
+  const running = Object.values(jobs).filter((j) => j.status === "running");
+  if (running.length === 0) return null;
+  const j =
+    // Its Stop is here (and in Get set up for the download it started); an export and recognition have theirs in their dialog and tab.
+    running.find((x) => x.kind === "speech-model" || x.kind === "vision-models") ??
+    running.find((x) => x.kind === "export") ??
+    running.find((x) => x.kind === "captions" || x.kind === "transcript") ??
+    // Ahead of the audio prepared beside them, so their Stop is there.
+    running.find((x) => x.kind === "proxy" || x.kind === "agent" || x.kind === "beats") ??
+    running[0];
+  // Finding the beat waits while the song's sound is prepared by its own job; that is most of the wait.
+  const progress = j.kind === "beats" && j.progress === 0 ? (jobs[j.id.replace("beats:", "audio:")]?.progress ?? 0) * 0.95 : j.progress;
+  const pct = progress > 0 ? `${Math.round(progress * 100)}%` : null;
+  const body = (
+    <>
+      <Loader2 size={14} className="shrink-0 animate-spin text-accent" />
+      <span className="max-w-[220px] truncate">{j.kind === "export" ? "Exporting" : (j.phase ?? j.label)}</span>
+      {pct && <span className="tabular text-muted">{pct}</span>}
+      {j.kind === "export" && <ProgressBar value={j.progress} label={j.label} className="w-16" />}
+      {running.length > 1 && <span className="text-muted">+{running.length - 1}</span>}
+    </>
+  );
+  // A reframe shows its progress and Stop on the preview, making reels beside their button.
+  if (j.kind === "audio" || j.kind === "matte" || j.kind === "reframe" || j.kind === "reels")
+    return (
+      <span className="bar flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] font-medium text-fg" role="status">
+        {body}
+      </span>
+    );
+  if (j.kind === "proxy" || j.kind === "agent" || j.kind === "beats")
+    return (
+      <span className="bar flex h-8 items-center gap-1.5 rounded-full pl-3 pr-1 text-[12px] font-medium text-fg" role="status">
+        {body}
+        <Button
+          pill
+          className="h-6 shrink-0 px-2.5 text-[12px]"
+          title={
+            j.kind === "agent"
+              ? `Stop ${j.label.toLowerCase()}. The AI sees that it was stopped.`
+              : j.kind === "beats"
+                ? "Stop finding the beat. Nothing in the video changes."
+                : "Stop preparing the preview. It keeps playing the original file, which can stutter."
+          }
+          onClick={() => void api.cancelJob(j.id)}
+        >
+          Stop
+        </Button>
+      </span>
+    );
+  if (j.kind === "speech-model" || j.kind === "vision-models") {
+    const stop = j.kind === "speech-model" ? "Stop downloading the speech model" : "Stop downloading the face and person models";
+    return (
+      <span className="bar flex h-8 items-center gap-1.5 rounded-full pl-3 pr-1 text-[12px] font-medium text-fg" role="status">
+        {body}
+        <Button pill className="h-6 shrink-0 px-2.5 text-[12px]" aria-label={stop} title={stop} onClick={() => void api.cancelJob(j.id)}>
+          Stop
+        </Button>
+      </span>
+    );
+  }
+  // A cover export reopens the Export dialog; picking frames and masks open the cover editor.
+  const coverExport = j.id.startsWith("cover-export:");
+  const cover = j.kind === "cover" && !coverExport;
+  return (
+    <button
+      type="button"
+      title={j.kind === "export" || coverExport ? "Show export progress" : cover ? "Show the cover" : j.kind === "transcript" ? "Show transcript" : j.kind === "style" ? "Show learning" : "Show captions"}
+      onClick={() =>
+        j.kind === "export" || coverExport
+          ? useEditor.setState({ view: "editor", exportOpen: true })
+          : cover
+            ? (useEditor.setState({ view: "editor" }), useCover.getState().open || openCover())
+            : j.kind === "style"
+              ? useStyle.setState(({ projectsLearning }) => ({ learnOpen: true, learnTab: projectsLearning?.jobId === j.id ? projectsLearning.tab : "videos" }))
+              : useEditor.setState({ view: "editor", panelTab: j.kind === "transcript" ? "transcript" : "captions" })
+      }
+      className="bar flex h-8 items-center rounded-full px-3 text-[12px] font-medium text-fg transition-colors duration-[120ms] hover:bg-white/[.13]"
+    >
+      <span className="flex items-center gap-1.5" role="status">
+        {body}
+      </span>
+    </button>
+  );
+}
+
+/** Opens and closes the AI panel; it stays open or closed across launches. */
+function AiToggle() {
+  const open = useDock((s) => s.open);
+  const working = useAgent((s) => s.status !== "idle");
+  return (
+    <Button
+      variant="bar"
+      pill
+      aria-pressed={open}
+      title={open ? "Close AI (Ctrl+J)" : working ? "Open AI (Ctrl+J). It is still working." : "Open AI (Ctrl+J)"}
+      onClick={togglePanel}
+      className={open ? "bg-white/[.15]" : ""}
+    >
+      {working && !open ? <Loader2 size={15} className="animate-spin text-accent" /> : <Sparkles size={15} />} AI
+    </Button>
+  );
+}
+
+/** While an agent edits, what it is doing and a way to take over. */
+export function AiRunBar() {
+  const label = useEditor((s) => (s.lockShown ? s.aiRun : null));
+  if (!label) return null;
+  const plugin = label.startsWith(PLUGIN_RUN) ? label.slice(PLUGIN_RUN.length) : null;
+  return (
+    <div data-tour="run-bar" className="bar flex h-8 min-w-0 max-w-[420px] items-center gap-2 rounded-full pl-3 pr-1 text-[12px] font-medium text-fg" role="status">
+      {plugin ? <Puzzle size={14} className="shrink-0 text-accent" /> : <Sparkles size={14} className="shrink-0 text-accent" />}
+      <span className="truncate">
+        {plugin ? (
+          <>
+            {plugin} <span className="font-normal text-muted">is running</span>
+          </>
+        ) : (
+          <>
+            AI is editing <span className="font-normal text-muted">· {label}</span>
+          </>
+        )}
+      </span>
+      <Button
+        pill
+        className="h-6 shrink-0 px-2.5 text-[12px]"
+        title="Stop the AI, keep what it did so far, and edit yourself"
+        // The backend stops the AI panel's agent too, so it does not go on editing.
+        onClick={() => void stopAiRun().then(() => useEditor.setState({ view: "editor", launcherOpen: false }))}
+      >
+        Stop and edit
+      </Button>
+    </div>
+  );
+}
+
+/** Versions listed in the menu, so it fits the smallest window. */
+const VERSIONS_SHOWN = 20;
+
+/** The kept versions of the project, newest first; choosing one restores it as one undo step. */
+function VersionsButton() {
+  const aiRun = useEditor((s) => s.aiRun);
+  const [menu, setMenu] = useState<{ versions: ProjectVersion[]; at: { x: number; y: number; align: "end" }; keyboard: boolean; back: HTMLElement } | null>(null);
+  return (
+    <>
+      <IconButton
+        round
+        aria-haspopup="menu"
+        aria-expanded={!!menu}
+        label={aiRun ? "Versions are available when the AI is done" : "Versions"}
+        disabled={!!aiRun}
+        onClick={async (e) => {
+          const back = e.currentTarget;
+          const keyboard = e.detail === 0;
+          try {
+            // The list then holds the edits made just before.
+            await whenIdle();
+            const versions = await api.listVersions(VERSIONS_SHOWN);
+            const r = back.getBoundingClientRect();
+            setMenu({ versions, at: { x: r.right, y: r.bottom + 6, align: "end" }, keyboard, back });
+          } catch (error) {
+            useEditor.getState().toast({ kind: "error", text: errorText(error) });
+          }
+        }}
+      >
+        <History size={16} />
+      </IconButton>
+      {menu && (
+        <Menu
+          label="Versions"
+          minWidth={280}
+          at={menu.at}
+          keyboard={menu.keyboard}
+          items={menu.versions.map((version) => ({
+            label: version.label,
+            icon: version.runId ? <Sparkles size={14} /> : undefined,
+            shortcut: when(version.atMs),
+            checked: version.current,
+            run: version.current ? undefined : () => void restoreVersion(version),
+          }))}
+          onClose={(chose) => {
+            const back = menu.back;
+            setMenu(null);
+            if (!chose) back.focus();
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+export function TopBar() {
+  const snap = useEditor((s) => s.snap);
+  const { undo, redo } = useEditor.getState();
+  const aiRun = useEditor((s) => s.aiRun);
+  const cover = useCover((s) => !!s.open);
+  const empty = !snap || projectDuration(snap.project) === 0;
+  // Choosing reels makes them, each a project to export on its own; the long video is not exported there.
+  const reels = useReels((s) => s.open);
+  const buttonsInBar = useWindowButtons((s) => s.inBar);
+  return (
+    <header data-tauri-drag-region="deep" className={`flex h-12 shrink-0 items-center gap-2 px-1.5 ${buttonsInBar ? "pl-[78px]" : ""}`}>
+      {/* The cover editor takes over the panes, so its way back is where the eye starts. */}
+      {cover ? (
+        <Button variant="bar" pill title="Back to the video (Esc)" onClick={closeCover}>
+          <ChevronLeft size={15} /> Back to video
+        </Button>
+      ) : (
+        <>
+          <ProjectsButton />
+          <FeedbackButton />
+          <UpdateButton />
+        </>
+      )}
+      {/* The name sits in the middle of the space the two sides leave, so a long AI label never covers it.
+          The save state hangs off its right edge, so "Saving…" and "Saved" never move the name; the room kept at
+          its right holds it, so it never runs under the AI run capsule in a narrow window. */}
+      <div className="flex min-w-0 flex-1 justify-center pr-[72px]">
+        <div className="relative flex min-w-0 items-center">
+          {cover ? (
+            <span className="flex min-w-0 items-center gap-1.5 text-[13px]">
+              <span className="shrink-0 font-semibold text-fg">Cover</span>
+              <span className="truncate text-muted">· {snap?.project.name}</span>
+            </span>
+          ) : (
+            <ProjectName />
+          )}
+          <div className="absolute left-full ml-2 whitespace-nowrap">
+            <SaveStatus />
+          </div>
+        </div>
+      </div>
+      <AiRunBar />
+      <JobIndicator />
+      <AiToggle />
+      <div className="bar flex items-center rounded-full">
+        {/* Undo and Redo lead the timeline's toolbar; the cover editor and the reels list have none. */}
+        {(cover || reels) && (
+          <>
+            <IconButton round label={aiRun ? "Undo is available when the AI is done" : "Undo (Ctrl+Z)"} disabled={!snap?.canUndo || !!aiRun} onClick={undo}>
+              <Undo2 size={16} />
+            </IconButton>
+            <IconButton round label={aiRun ? "Redo is available when the AI is done" : "Redo (Ctrl+Shift+Z)"} disabled={!snap?.canRedo || !!aiRun} onClick={redo}>
+              <Redo2 size={16} />
+            </IconButton>
+          </>
+        )}
+        <VersionsButton />
+      </div>
+      {!reels && (
+        <Button
+          data-tour="export"
+          variant="primary"
+          pill
+          disabled={empty}
+          disabledReason="Add a clip to the timeline to export"
+          title={cover ? "Export cover (Ctrl+E)" : "Export video (Ctrl+E)"}
+          onClick={cover ? () => void exportCover() : openExport}
+        >
+          <Download size={15} /> {cover ? "Export cover" : "Export"}
+        </Button>
+      )}
+    </header>
+  );
+}

@@ -1,0 +1,25 @@
+[package]
+name = "madman-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local YouTube discovery and original production planning for MadMan Cut"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+ureq = "3.4.2"
+url = "2.5.8"
+dirs = "6"
+keyring = "4.2.0"
+sha2 = "0.11.0"
+jiff = { version = "0.2.37", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+ts-rs.workspace = true
+
+[[bin]]
+name = "madman-discovery"
+path = "src/main.rs"

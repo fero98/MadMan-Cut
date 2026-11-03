@@ -1,0 +1,574 @@
+//! Versions of the project, kept in `<project>.history.jsonl` beside it so they outlive the session.
+//! A version is the project after one step: an agent's run, one of the user's edits (a whole drag or
+//! typing burst), an undo, a redo or a restore. Its hash is the SHA-256 of the project's compact JSON.
+//! The file holds one version per line and grows by appending; a line leaves out a project an earlier
+//! line holds. Once it holds twice what is kept, it is written again with only the kept versions.
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, ensure};
+use nuzky_engine::{Project, edit::EditCmd, model::ReelStatus};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
+
+use super::*;
+
+pub const HISTORY_SUFFIX: &str = ".history.jsonl";
+/// The newest versions kept.
+pub const MAX_VERSIONS: usize = 200;
+/// Project JSON kept over all versions, each distinct project counted once.
+pub const MAX_BYTES: usize = 32 << 20;
+/// A longer file is not ours to read; it is started anew.
+const READ_LIMIT: u64 = 4 * MAX_BYTES as u64;
+/// Hex digits of a hash shown; `undo_to` takes any prefix of four or more.
+const SHORT: usize = 12;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VersionInfo {
+    /// Stays with the version across restarts and as older versions go.
+    pub index: u64,
+    pub hash: String,
+    pub label: String,
+    /// Unix time in milliseconds.
+    pub at_ms: u64,
+    /// The agent's run that made it; none for the user's own steps.
+    pub run_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryList {
+    /// The hash of the project as it is now; a version with it is the current one.
+    pub current_hash: String,
+    /// Newest first.
+    pub versions: Vec<VersionInfo>,
+    /// Older versions kept but not listed.
+    pub older: usize,
+}
+
+#[derive(Clone, Debug)]
+pub enum Target {
+    Index(u64),
+    /// A prefix of the hash.
+    Hash(String),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Restored {
+    #[serde(flatten)]
+    pub stamp: Stamp,
+    pub restored: VersionInfo,
+    /// False when the project already was that version.
+    pub changed: bool,
+}
+
+#[derive(Clone)]
+struct Version {
+    index: u64,
+    hash: String,
+    label: String,
+    at_ms: u64,
+    run_id: Option<String>,
+    json: Arc<str>,
+}
+
+impl Version {
+    fn info(&self) -> VersionInfo {
+        VersionInfo {
+            index: self.index,
+            hash: self.hash[..SHORT].to_owned(),
+            label: self.label.clone(),
+            at_ms: self.at_ms,
+            run_id: self.run_id.clone(),
+        }
+    }
+}
+
+/// How the project as it is now came about, until it is kept as a version.
+pub(crate) struct Tip {
+    pub label: String,
+    pub run_id: Option<String>,
+    /// When it last changed the project.
+    pub at_ms: u64,
+}
+
+impl Tip {
+    pub(crate) fn new(label: impl Into<String>, run_id: Option<String>) -> Self {
+        Self { label: label.into(), run_id, at_ms: now_ms() }
+    }
+
+    pub(crate) fn user(label: impl Into<String>) -> Self {
+        Self::new(label, None)
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+pub(crate) enum Write {
+    Append(String),
+    Replace(String),
+}
+
+#[derive(Default)]
+pub(crate) struct History {
+    versions: Vec<Version>,
+    pub(crate) tip: Option<Tip>,
+    next: u64,
+    /// Hashes whose project the file holds, so a later line may leave it out.
+    stored: HashSet<String>,
+    lines: usize,
+    bytes: usize,
+    /// Set when the file is torn or a write failed: the next write replaces it whole.
+    pub(crate) broken: Arc<AtomicBool>,
+}
+
+#[derive(Serialize)]
+struct LineOut<'a> {
+    index: u64,
+    hash: &'a str,
+    label: &'a str,
+    at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct Line<'a> {
+    index: u64,
+    hash: String,
+    label: String,
+    at_ms: u64,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(borrow, default)]
+    project: Option<&'a RawValue>,
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn line(version: &Version, with_project: bool) -> String {
+    let meta = LineOut {
+        index: version.index,
+        hash: &version.hash,
+        label: &version.label,
+        at_ms: version.at_ms,
+        run_id: version.run_id.as_deref(),
+    };
+    let mut line = serde_json::to_string(&meta).expect("plain fields serialize");
+    if with_project {
+        // Verbatim, so the bytes read back are the bytes hashed.
+        line.pop();
+        line.push_str(",\"project\":");
+        line.push_str(&version.json);
+        line.push('}');
+    }
+    line.push('\n');
+    line
+}
+
+/// What a batch of edits did, for the log: each command's type with its number and yes-or-no fields, never text.
+pub(crate) fn action(cmds: &[EditCmd]) -> String {
+    let mut commands: Vec<String> = cmds
+        .iter()
+        .take(5)
+        .map(|cmd| {
+            let value = serde_json::to_value(cmd).unwrap_or_default();
+            let mut line = value["type"].as_str().unwrap_or("edit").to_owned();
+            let fields = value.as_object().into_iter().flatten().filter(|(_, v)| v.is_number() || v.is_boolean());
+            for (key, value) in fields.take(6) {
+                line.push_str(&format!(" {key}={value}"));
+            }
+            line
+        })
+        .collect();
+    if cmds.len() > 5 {
+        commands.push(format!("+{} more", cmds.len() - 5));
+    }
+    commands.join(", ")
+}
+
+#[cfg(test)]
+#[test]
+fn action_summary_omits_private_text_and_limits_fields_and_commands() {
+    let command = |value| serde_json::from_value::<EditCmd>(value).unwrap();
+    let split = command(serde_json::json!({"type":"splitClip", "clipId":"private", "atUs":12400000}));
+    let track = command(serde_json::json!({"type":"updateTrack", "trackId":"private", "muted":true}));
+    let text = command(serde_json::json!({"type":"renameProject", "name":"private title"}));
+    let assets = command(serde_json::json!({"type":"addAssets", "assets":[]}));
+    assert_eq!(
+        action(&[split, track, text, assets]),
+        "splitClip atUs=12400000, updateTrack muted=true, renameProject, addAssets"
+    );
+    let many = command(serde_json::json!({
+        "type":"updateClip", "clipId":"private", "text":"secret caption", "background":{"type":"none"},
+        "volume":0.5, "speed":2.0, "keepPitch":true, "fadeInUs":100,
+        "fadeOutUs":200, "cleanVoice":false, "dereverb":0.5, "normalize":true
+    }));
+    let line = action(&vec![many; 7]);
+    assert_eq!(line.matches("updateClip").count(), 5);
+    assert!(line.ends_with(", +2 more"));
+    for cmd in line.split(", ").take(5) {
+        assert_eq!(cmd.matches('=').count(), 6);
+    }
+    assert!(!line.contains("private") && !line.contains("secret"));
+    assert_eq!(action(&[]), "");
+}
+
+/// What a batch of the user's edits did, named by its first command.
+pub(crate) fn label(cmds: &[EditCmd]) -> &'static str {
+    let Some(cmd) = cmds.first() else { return "Edit" };
+    // Motion from the inspector first clears the keyframes it replaces.
+    if cmds.iter().any(|c| matches!(c, EditCmd::ApplyMotion { .. })) {
+        return "Motion";
+    }
+    // A sticker the project did not have yet comes after the import of its picture.
+    if cmds.iter().any(|c| matches!(c, EditCmd::AddSticker { .. })) {
+        return "Sticker";
+    }
+    // So does media picked to replace a clip.
+    if cmds.iter().any(|c| matches!(c, EditCmd::ReplaceClip { .. })) {
+        return "Replace clip";
+    }
+    // A cut to the beat first keeps the song's track in place.
+    if cmds.iter().any(|c| matches!(c, EditCmd::ReplaceMainClips { .. })) {
+        return "Cut to beat";
+    }
+    match cmd {
+        EditCmd::AddSticker { .. } => "Sticker",
+        EditCmd::AddAssets { .. } => "Import media",
+        EditCmd::RemoveAsset { .. } => "Remove media",
+        EditCmd::AddClip { .. } => "Add clip",
+        EditCmd::ReplaceClip { .. } => "Replace clip",
+        EditCmd::AddText { .. } => "Add text",
+        EditCmd::AddPictureInPicture { .. } => "Picture in picture",
+        EditCmd::AddOverlay { .. } => "Overlay",
+        EditCmd::MoveClip { .. } => "Move clip",
+        EditCmd::MoveClips { .. } => "Move clips",
+        EditCmd::TrimClip { .. } => "Trim clip",
+        EditCmd::SplitClip { .. } => "Split",
+        EditCmd::FreezeFrame { .. } => "Freeze frame",
+        EditCmd::DeleteClips { .. } => "Delete",
+        EditCmd::UpdateClip { .. } => "Change clip",
+        EditCmd::SetAnimation { .. } => "Animation",
+        EditCmd::SetTransition { .. } => "Transition",
+        EditCmd::SetKeyframes { .. } => "Keyframes",
+        EditCmd::SetEffects { .. } => "Effects",
+        EditCmd::DuplicateClip { .. } => "Duplicate",
+        EditCmd::PasteClips { .. } => "Paste",
+        EditCmd::ReplaceMainClips { .. } => "Cut to beat",
+        EditCmd::PasteAttributes { .. } => "Paste attributes",
+        EditCmd::DetachAudio { .. } => "Detach audio",
+        EditCmd::UpdateTrack { .. } => "Change track",
+        EditCmd::RestyleTrack { .. } => "Restyle text",
+        EditCmd::SetCanvas { .. } => "Change format",
+        EditCmd::AddCaptions { .. } => "Add captions",
+        EditCmd::ReplaceCaptions { .. } => "Replace captions",
+        EditCmd::RippleDeleteRanges { .. } => "Cut",
+        EditCmd::RenameProject { .. } => "Rename project",
+        EditCmd::CorrectWords { .. } => "Correct words",
+        EditCmd::ZoomRanges { .. } => "Zoom",
+        EditCmd::ApplyMotion { .. } => "Motion",
+        EditCmd::SetThumbnail { .. } => "Thumbnail",
+        EditCmd::RemoveThumbnail { .. } => "Remove thumbnail",
+        EditCmd::SetReelCandidates { .. } => "Propose reels",
+        EditCmd::UpdateReelCandidate { candidate } if candidate.status == ReelStatus::Made => "Make reels",
+        EditCmd::UpdateReelCandidate { .. } => "Change reel",
+    }
+}
+
+impl History {
+    /// What the file holds. Lines that cannot be read are left out, and the next write replaces them.
+    pub(crate) fn load(path: &Path) -> Self {
+        let mut history = Self::default();
+        // A link could point at another project's versions or outside the project; the first write replaces it.
+        let text = match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return history,
+            Ok(meta) if !meta.is_file() => Err(anyhow::anyhow!("not a plain file")),
+            Ok(meta) if meta.len() > READ_LIMIT => Err(anyhow::anyhow!("{} bytes", meta.len())),
+            _ => fs::read_to_string(path).context("Reading"),
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("Cannot read the versions in {}, keeping new ones only: {error:#}", path.display());
+                history.broken.store(true, Ordering::Relaxed);
+                return history;
+            }
+        };
+        let mut clean = text.is_empty() || text.ends_with('\n');
+        let mut projects: HashMap<String, Arc<str>> = HashMap::new();
+        for text in text.lines() {
+            history.lines += 1;
+            let line = serde_json::from_str::<Line>(text).ok().filter(|line| {
+                line.hash.len() == 64 && line.hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+            let json = line.as_ref().and_then(|line| match line.project {
+                // A project changed in the file no longer matches its hash, and nothing may reuse it.
+                Some(raw) if sha256(raw.get().as_bytes()) != line.hash => None,
+                Some(raw) => {
+                    let json: Arc<str> = Arc::from(raw.get());
+                    projects.insert(line.hash.clone(), json.clone());
+                    history.stored.insert(line.hash.clone());
+                    Some(json)
+                }
+                None => projects.get(&line.hash).cloned(),
+            });
+            let (Some(line), Some(json)) = (line, json) else {
+                clean = false;
+                continue;
+            };
+            history.next = history.next.max(line.index.saturating_add(1));
+            history.versions.push(Version {
+                index: line.index,
+                hash: line.hash,
+                label: line.label,
+                at_ms: line.at_ms,
+                run_id: line.run_id,
+                json,
+            });
+        }
+        history.bytes = text.len();
+        history.evict();
+        if !clean {
+            history.broken.store(true, Ordering::Relaxed);
+        }
+        history
+    }
+
+    /// Keeps `project` as the newest version unless it already is; returns what the file needs.
+    pub(crate) fn push(&mut self, project: &Project, tip: Tip) -> Option<Write> {
+        let json = serde_json::to_string(project).ok()?;
+        let hash = sha256(json.as_bytes());
+        if self.versions.last().is_some_and(|v| v.hash == hash) {
+            return None;
+        }
+        let json = self.versions.iter().find(|v| v.hash == hash).map_or_else(|| Arc::from(json), |v| v.json.clone());
+        let label = tip.label.chars().take(200).collect();
+        self.versions.push(Version { index: self.next, hash, label, at_ms: tip.at_ms, run_id: tip.run_id, json });
+        self.next += 1;
+        self.evict();
+        let version = self.versions.last().expect("just pushed");
+        if self.broken.swap(false, Ordering::Relaxed)
+            || self.lines >= 2 * MAX_VERSIONS
+            || self.bytes + version.json.len() > 2 * MAX_BYTES
+        {
+            self.stored.clear();
+            let mut text = String::new();
+            for version in &self.versions {
+                text.push_str(&line(version, self.stored.insert(version.hash.clone())));
+            }
+            (self.lines, self.bytes) = (self.versions.len(), text.len());
+            return Some(Write::Replace(text));
+        }
+        let line = line(version, self.stored.insert(version.hash.clone()));
+        self.lines += 1;
+        self.bytes += line.len();
+        Some(Write::Append(line))
+    }
+
+    fn evict(&mut self) {
+        let kept = |versions: &[Version]| {
+            let mut seen = HashSet::new();
+            versions.iter().filter(|v| seen.insert(v.hash.as_str())).map(|v| v.json.len()).sum::<usize>()
+        };
+        while self.versions.len() > 1 && (self.versions.len() > MAX_VERSIONS || kept(&self.versions) > MAX_BYTES) {
+            self.versions.remove(0);
+        }
+    }
+
+    /// With `tip`, the user's step that is not a version yet (a drag may still go on) leads the list
+    /// under the index it will get, so reading never splits one step into several versions.
+    pub(crate) fn list(&self, project: &Project, limit: usize, tip: Option<&Tip>) -> HistoryList {
+        let current: String = serde_json::to_string(project)
+            .map(|json| sha256(json.as_bytes()))
+            .unwrap_or_default()
+            .chars()
+            .take(SHORT)
+            .collect();
+        let tip =
+            tip.filter(|_| self.versions.last().is_none_or(|v| !v.hash.starts_with(&current))).map(|tip| VersionInfo {
+                index: self.next,
+                hash: current.clone(),
+                label: tip.label.clone(),
+                at_ms: tip.at_ms,
+                run_id: tip.run_id.clone(),
+            });
+        let versions: Vec<_> = tip.into_iter().chain(self.versions.iter().rev().map(Version::info)).collect();
+        HistoryList {
+            current_hash: current,
+            older: versions.len().saturating_sub(limit),
+            versions: versions.into_iter().take(limit).collect(),
+        }
+    }
+
+    fn find(&self, target: &Target) -> Result<&Version> {
+        match target {
+            Target::Index(index) => self.versions.iter().rev().find(|v| v.index == *index).with_context(|| {
+                format!("UNKNOWN_VERSION: version {index} is not kept; list_history shows those that are")
+            }),
+            Target::Hash(prefix) => {
+                let prefix = prefix.trim().to_ascii_lowercase();
+                ensure!(
+                    prefix.len() >= 4 && prefix.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "INVALID_ARGUMENTS: give 4 or more hex digits of the hash"
+                );
+                let mut found = self.versions.iter().rev().filter(|v| v.hash.starts_with(&prefix));
+                let first =
+                    found.next().with_context(|| format!("UNKNOWN_VERSION: no kept version has hash {prefix}"))?;
+                ensure!(
+                    found.all(|v| v.hash == first.hash),
+                    "UNKNOWN_VERSION: {prefix} starts several versions' hashes; give more of it"
+                );
+                Ok(first)
+            }
+        }
+    }
+
+    /// The project after the newest kept AI run, and the version before that run.
+    fn run_versions(&self) -> Result<Option<(Project, Option<Project>)>> {
+        let Some(at) = self.versions.iter().rposition(|v| v.run_id.is_some()) else { return Ok(None) };
+        let read = |v: &Version| {
+            serde_json::from_str::<Project>(&v.json)
+                .with_context(|| format!("HISTORY_CORRUPT: version {} cannot be read", v.index))
+        };
+        let before = at.checked_sub(1).map(|i| read(&self.versions[i])).transpose()?;
+        Ok(Some((read(&self.versions[at])?, before)))
+    }
+
+    /// The label of the newest version a run made.
+    fn run_label(&self, run_id: &str) -> Option<&str> {
+        self.versions.iter().rev().find(|v| v.run_id.as_deref() == Some(run_id)).map(|v| v.label.as_str())
+    }
+}
+
+/// Whether the versions beside `path` hold anything but `project`, or cannot all be read: then
+/// deleting them could lose work, even when the project itself is empty now.
+pub fn other_versions(path: &Path, project: &Project) -> bool {
+    let history = History::load(&storage::sidecar(path, HISTORY_SUFFIX));
+    let current = serde_json::to_string(project).map(|json| sha256(json.as_bytes())).unwrap_or_default();
+    history.broken.load(Ordering::Relaxed) || history.versions.iter().any(|v| v.hash != current)
+}
+
+impl ProjectSession {
+    /// The newest `limit` versions, with the user's last step first; an agent's open run becomes a
+    /// version only when it ends.
+    pub fn list_history(&self, limit: usize) -> Result<HistoryList> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.mode == Mode::ReadOnly {
+            inner.refresh()?;
+            let history = History::load(&storage::sidecar(&inner.path, HISTORY_SUFFIX));
+            return Ok(history.list(&inner.editor.project, limit, None));
+        }
+        let tip = inner.history.tip.as_ref().filter(|_| inner.run.is_none());
+        Ok(inner.history.list(&inner.editor.project, limit, tip))
+    }
+
+    /// The project as the newest kept AI run left it and as it was just before that run; none
+    /// when no AI run was kept. Telling them from the project now shows what the user changed.
+    pub fn run_versions(&self) -> Result<Option<(Project, Option<Project>)>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.mode == Mode::ReadOnly {
+            return History::load(&storage::sidecar(&inner.path, HISTORY_SUFFIX)).run_versions();
+        }
+        inner.history.run_versions()
+    }
+
+    /// The project just before an AI run and as the run left it, from the kept versions.
+    pub fn run_pair(&self, run_id: &str) -> Result<(Project, Project)> {
+        let versions = {
+            let inner = self.inner.lock().unwrap();
+            let disk =
+                (inner.mode == Mode::ReadOnly).then(|| History::load(&storage::sidecar(&inner.path, HISTORY_SUFFIX)));
+            let history = disk.as_ref().unwrap_or(&inner.history);
+            let first = history.versions.iter().position(|v| v.run_id.as_deref() == Some(run_id));
+            let last = history.versions.iter().rposition(|v| v.run_id.as_deref() == Some(run_id));
+            let before = first.and_then(|i| i.checked_sub(1));
+            match (before, last) {
+                (Some(before), Some(after)) => {
+                    (history.versions[before].json.clone(), history.versions[after].json.clone())
+                }
+                _ => anyhow::bail!("RUN_UNAVAILABLE: the run or its before-project is no longer kept"),
+            }
+        };
+        let read = |json: &str| serde_json::from_str(json).context("RUN_UNAVAILABLE: the run's project cannot be read");
+        Ok((read(&versions.0)?, read(&versions.1)?))
+    }
+
+    /// The files the main track plays in any kept version, in the order they first appear and as the newest of
+    /// those versions describes them, so a take dropped since the import, even from the library, is still known.
+    pub fn kept_main_assets(&self) -> Result<Vec<nuzky_engine::model::Asset>> {
+        let versions: Vec<_> = {
+            let inner = self.inner.lock().unwrap();
+            let disk =
+                (inner.mode == Mode::ReadOnly).then(|| History::load(&storage::sidecar(&inner.path, HISTORY_SUFFIX)));
+            let history = disk.as_ref().unwrap_or(&inner.history);
+            history.versions.iter().map(|v| v.json.clone()).collect()
+        };
+        let mut assets: Vec<nuzky_engine::model::Asset> = Vec::new();
+        for json in versions {
+            let project: Project =
+                serde_json::from_str(&json).context("HISTORY_CORRUPT: a kept project cannot be read")?;
+            for clip in project.tracks.iter().filter(|t| t.id == nuzky_engine::edit::MAIN_TRACK).flat_map(|t| &t.clips)
+            {
+                if let nuzky_engine::model::ClipContent::Media { asset_id, .. } = &clip.content
+                    && let Some(asset) = project.asset(asset_id)
+                {
+                    match assets.iter_mut().find(|a| a.id == asset.id) {
+                        Some(known) => *known = asset.clone(),
+                        None => assets.push(asset.clone()),
+                    }
+                }
+            }
+        }
+        Ok(assets)
+    }
+
+    /// Restores a kept version as a new undo step. The project as it was stays a version too.
+    pub fn undo_to(&self, target: Target) -> Result<Restored> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.user_editable()?;
+        inner.record();
+        let version = inner.history.find(&target)?.clone();
+        let project: Project = serde_json::from_str(&version.json)
+            .with_context(|| format!("HISTORY_CORRUPT: version {} cannot be read", version.index))?;
+        let revision = inner.editor.revision;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.editor.replace_project_checked(project, None, validate)
+        }))
+        .map_err(|_| {
+            anyhow::anyhow!("EDIT_REJECTED: engine failed while restoring the version; project unchanged")
+        })??;
+        let changed = inner.editor.revision != revision;
+        if changed {
+            inner.changed(Origin::Restore);
+            let label = format!("Restore: {}", version.label.strip_prefix("Restore: ").unwrap_or(&version.label));
+            inner.editor.name_step(&label);
+            inner.history.tip = Some(Tip::user(label));
+            inner.record();
+        }
+        inner.flush()?;
+        Ok(Restored { stamp: inner.stamp(), restored: version.info(), changed })
+    }
+}
+
+impl Inner {
+    /// Keeps the step that made the project as it is now as a version.
+    pub(crate) fn record(&mut self) {
+        let Some(tip) = self.history.tip.take() else { return };
+        if let (Some(writer), Some(write)) = (&self.writer, self.history.push(&self.editor.project, tip)) {
+            writer.history(write);
+        }
+    }
+
+    pub(crate) fn undo_label(&self, run_id: &str) -> String {
+        format!("Undo: {}", self.history.run_label(run_id).unwrap_or("AI edit"))
+    }
+}

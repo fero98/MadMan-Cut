@@ -1,0 +1,739 @@
+//! What an agent's run changed, in a few plain lines, from the project before and after it.
+//! The panel shows them under the run, so the user sees exactly what happened without
+//! trusting the agent's own account.
+
+use nuzky_engine::Project;
+use nuzky_engine::edit::MAIN_TRACK;
+use nuzky_engine::model::{Background, Clip, ClipContent, Crop, ReelStatus, Thumbnail, ThumbnailFormat, TrackKind};
+use nuzky_engine::recap::duration_text;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChange {
+    pub text: String,
+    /// Clips of the project after the run that the line is about, to select them.
+    pub clip_ids: Vec<String>,
+    /// Where on the timeline to look.
+    pub at_us: Option<i64>,
+}
+
+fn line(text: String, clips: &[&Clip]) -> RunChange {
+    RunChange {
+        text,
+        clip_ids: clips.iter().map(|c| c.id.clone()).collect(),
+        at_us: clips.iter().map(|c| c.start_us).min(),
+    }
+}
+
+fn secs(us: i64) -> String {
+    format!("{:.1} s", us as f64 / 1e6)
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
+}
+
+fn quote(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short: String = flat.chars().take(40).collect();
+    if short.len() < flat.len() { format!("“{short}…”") } else { format!("“{short}”") }
+}
+
+/// Source time a media clip plays: [in, in + duration × speed).
+fn source(clip: &Clip) -> Option<(&str, i64, i64)> {
+    match &clip.content {
+        ClipContent::Media { asset_id, source_in_us, speed, .. } => {
+            Some((asset_id, *source_in_us, source_in_us + (clip.duration_us as f64 * *speed as f64).round() as i64))
+        }
+        ClipContent::Text { .. } => None,
+    }
+}
+
+/// Merged source ranges each asset plays on the main track.
+fn coverage(project: &Project) -> HashMap<String, Vec<(i64, i64)>> {
+    let mut map: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for clip in project.tracks.iter().filter(|t| t.id == MAIN_TRACK).flat_map(|t| &t.clips) {
+        if let Some((asset, a, b)) = source(clip) {
+            map.entry(asset.to_owned()).or_default().push((a, b));
+        }
+    }
+    for ranges in map.values_mut() {
+        ranges.sort();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for &(a, b) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        *ranges = merged;
+    }
+    map
+}
+
+/// Parts of `before` not in `after`, ignoring slivers under a frame that rounding leaves.
+fn removed(before: &[(i64, i64)], after: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for &(a, b) in before {
+        let mut at = a;
+        for &(c, d) in after.iter().filter(|(c, d)| *d > a && *c < b) {
+            if c > at {
+                out.push((at, c));
+            }
+            at = at.max(d);
+        }
+        if at < b {
+            out.push((at, b));
+        }
+    }
+    out.retain(|(a, b)| b - a >= 20_000);
+    out
+}
+
+/// What a cut took out of the main track: the lengths, the source passages it removed from each file, and the
+/// files it dropped altogether.
+pub struct Cut {
+    pub before_us: i64,
+    pub after_us: i64,
+    pub passages: HashMap<String, Vec<(i64, i64)>>,
+    pub gone_assets: Vec<String>,
+}
+
+pub fn cut(before: &Project, after: &Project) -> Cut {
+    let (was, now) = (coverage(before), coverage(after));
+    let mut cut = Cut {
+        before_us: before.duration_us(),
+        after_us: after.duration_us(),
+        passages: HashMap::new(),
+        gone_assets: Vec::new(),
+    };
+    for (asset, ranges) in was {
+        match now.get(&asset) {
+            None => cut.gone_assets.push(asset),
+            Some(left) => {
+                let ranges = removed(&ranges, left);
+                if !ranges.is_empty() {
+                    cut.passages.insert(asset, ranges);
+                }
+            }
+        }
+    }
+    cut.gone_assets.sort();
+    cut
+}
+
+/// The clip of the earlier project that a clip of the later one comes from: the same clip, or
+/// the one playing most of the same source (a split piece gets a new id).
+fn origins<'a>(before: &'a Project, after: &'a Project) -> Vec<(&'a Clip, Option<&'a Clip>)> {
+    let old: HashMap<&str, &Clip> = before.tracks.iter().flat_map(|t| &t.clips).map(|c| (c.id.as_str(), c)).collect();
+    let media: Vec<&Clip> = before.tracks.iter().flat_map(|t| &t.clips).filter(|c| source(c).is_some()).collect();
+    after
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .map(|clip| {
+            let origin = old.get(clip.id.as_str()).copied().or_else(|| {
+                let (asset, a, b) = source(clip)?;
+                media
+                    .iter()
+                    .filter_map(|c| {
+                        let (asset2, c0, c1) = source(c)?;
+                        let overlap = b.min(c1) - a.max(c0);
+                        (asset2 == asset && overlap > 0).then_some((overlap, *c))
+                    })
+                    .max_by_key(|(overlap, _)| *overlap)
+                    .map(|(_, c)| c)
+            });
+            (clip, origin)
+        })
+        .collect()
+}
+
+fn scale(clip: &Clip) -> f32 {
+    match &clip.content {
+        ClipContent::Media { transform, .. } | ClipContent::Text { transform, .. } => transform.scale,
+    }
+}
+
+fn crop(clip: &Clip) -> Option<Crop> {
+    match &clip.content {
+        ClipContent::Media { transform, .. } | ClipContent::Text { transform, .. } => transform.crop,
+    }
+}
+
+/// The file and the time in it the main track shows at `t_us`, to the millisecond.
+fn shown_source(project: &Project, t_us: i64) -> Option<(&str, i64)> {
+    let clip = project.tracks.iter().find(|t| t.id == MAIN_TRACK)?.clips.iter().find(|c| c.contains(t_us))?;
+    let (asset, from, to) = source(clip)?;
+    let at = from as f64 + (t_us - clip.start_us) as f64 * (to - from) as f64 / clip.duration_us as f64;
+    Some((asset, (at / 1000.0).round() as i64))
+}
+
+pub fn summarize(before: &Project, after: &Project) -> Vec<RunChange> {
+    let mut out = Vec::new();
+    let asset_name =
+        |id: &str| after.asset(id).or_else(|| before.asset(id)).map_or("a file".to_owned(), |a| a.name.clone());
+
+    // Length.
+    let cut = cut(before, after);
+    let (was, now) = (cut.before_us, cut.after_us);
+    if (was - now).abs() >= 50_000 {
+        let verb = if now < was { "Shortened" } else { "Lengthened" };
+        out.push(RunChange {
+            text: format!("{verb} the video from {} to {}", duration_text(was), duration_text(now)),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+
+    // What was cut out of the main track, and takes that left it entirely.
+    let passages: Vec<_> = cut.passages.values().flatten().collect();
+    if !passages.is_empty() {
+        let total: i64 = passages.iter().map(|(a, b)| b - a).sum();
+        out.push(RunChange {
+            text: format!("Cut out {}, {} in total", count(passages.len(), "passage", "passages"), secs(total)),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+    let mut gone_takes: Vec<_> = cut.gone_assets.iter().map(|id| asset_name(id)).collect();
+    gone_takes.sort();
+    for name in gone_takes {
+        out.push(RunChange { text: format!("Removed {name} from the main track"), clip_ids: Vec::new(), at_us: None });
+    }
+
+    let pairs = origins(before, after);
+    let track_of: HashMap<&str, (&str, TrackKind, bool)> = after
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().map(move |c| (c.id.as_str(), (t.id.as_str(), t.kind, t.is_captions()))))
+        .collect();
+
+    // Media placed on the timeline that was not there before (split pieces are not new).
+    let added: Vec<&Clip> = pairs.iter().filter(|(c, o)| o.is_none() && source(c).is_some()).map(|(c, _)| *c).collect();
+    let mut by_asset: Vec<(String, bool, Vec<&Clip>)> = Vec::new();
+    for clip in added {
+        let (name, freeze) = (asset_name(source(clip).unwrap().0), clip.is_freeze());
+        match by_asset.iter_mut().find(|(n, f, _)| *n == name && *f == freeze) {
+            Some((_, _, clips)) => clips.push(clip),
+            None => by_asset.push((name, freeze, vec![clip])),
+        }
+    }
+    for (name, freeze, clips) in &by_asset {
+        let place = match track_of.get(clips[0].id.as_str()) {
+            Some((_, TrackKind::Audio, _)) => " on an audio track",
+            Some((id, _, _)) if *id == MAIN_TRACK => "",
+            _ => " as an overlay",
+        };
+        let what = if *freeze { "Froze a frame of" } else { "Added" };
+        out.push(line(format!("{what} {name}{place}"), clips));
+    }
+
+    // Captions and titles.
+    let text_clips = |p: &'_ Project, captions: bool| -> Vec<Clip> {
+        p.tracks
+            .iter()
+            .filter(|t| t.kind == TrackKind::Text && t.is_captions() == captions)
+            .flat_map(|t| t.clips.clone())
+            .collect()
+    };
+    let (caps_before, caps_after) = (text_clips(before, true), text_clips(after, true));
+    let new_caps: Vec<&Clip> = caps_after.iter().filter(|c| !caps_before.iter().any(|b| b.id == c.id)).collect();
+    if caps_before.is_empty() && !caps_after.is_empty() {
+        out.push(line(
+            format!("Added {}", count(caps_after.len(), "caption", "captions")),
+            &caps_after.iter().collect::<Vec<_>>(),
+        ));
+    } else if !caps_before.is_empty() && caps_after.is_empty() {
+        out.push(RunChange { text: "Removed the captions".into(), clip_ids: Vec::new(), at_us: None });
+    } else if !new_caps.is_empty() && new_caps.len() == caps_after.len() {
+        out.push(line(
+            format!("Made the captions again: {} instead of {}", caps_after.len(), caps_before.len()),
+            &new_caps,
+        ));
+    } else {
+        let style = |c: &Clip| match &c.content {
+            ClipContent::Text { style, .. } => Some(style.clone()),
+            ClipContent::Media { .. } => None,
+        };
+        let restyled: Vec<&Clip> =
+            caps_after.iter().filter(|c| caps_before.iter().any(|b| b.id == c.id && style(b) != style(c))).collect();
+        if !restyled.is_empty() {
+            out.push(line(format!("Restyled {}", count(restyled.len(), "caption", "captions")), &restyled));
+        }
+    }
+    let (titles_before, titles_after) = (text_clips(before, false), text_clips(after, false));
+    let text_of = |c: &Clip| match &c.content {
+        ClipContent::Text { text, .. } => text.clone(),
+        ClipContent::Media { .. } => String::new(),
+    };
+    for t in &titles_after {
+        match titles_before.iter().find(|b| b.id == t.id) {
+            None => out.push(line(format!("Added the text {}", quote(&text_of(t))), &[t])),
+            Some(b) if text_of(b) != text_of(t) => {
+                out.push(line(format!("Changed a text to {}", quote(&text_of(t))), &[t]))
+            }
+            _ => {}
+        }
+    }
+    for b in titles_before.iter().filter(|b| !titles_after.iter().any(|t| t.id == b.id)) {
+        out.push(RunChange {
+            text: format!("Removed the text {}", quote(&text_of(b))),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+
+    // Changes to clips that were already there, grouped by what changed.
+    let mut zoomed: Vec<(&Clip, f32)> = Vec::new();
+    let mut grouped: Vec<(&'static str, Vec<&Clip>)> = Vec::new();
+    for &(clip, origin) in &pairs {
+        let Some(o) = origin else { continue };
+        let mut push = |what: &'static str| match grouped.iter_mut().find(|(w, _)| *w == what) {
+            Some((_, clips)) => clips.push(clip),
+            None => grouped.push((what, vec![clip])),
+        };
+        if let (
+            ClipContent::Media {
+                volume: v1,
+                speed: s1,
+                keep_pitch: k1,
+                adjust: a1,
+                fade_in_us: fi1,
+                fade_out_us: fo1,
+                clean_voice: cv1,
+                dereverb: dr1,
+                normalize: n1,
+                leveler: l1,
+                shape: sh1,
+                duck_db: d1,
+                background: b1,
+                ..
+            },
+            ClipContent::Media {
+                volume: v2,
+                speed: s2,
+                keep_pitch: k2,
+                adjust: a2,
+                fade_in_us: fi2,
+                fade_out_us: fo2,
+                clean_voice: cv2,
+                dereverb: dr2,
+                normalize: n2,
+                leveler: l2,
+                shape: sh2,
+                duck_db: d2,
+                background: b2,
+                ..
+            },
+        ) = (&o.content, &clip.content)
+        {
+            if (scale(clip) - scale(o)).abs() > 0.005 && clip.keyframes == o.keyframes {
+                if scale(clip) > scale(o) {
+                    zoomed.push((clip, scale(clip) / scale(o).max(0.01)));
+                } else {
+                    push("Zoomed out on");
+                }
+            }
+            if v1 != v2 {
+                push("Changed the volume of");
+            }
+            if s1 != s2 {
+                push("Changed the speed of");
+            } else if k1 != k2 {
+                push(if *k2 { "Turned on Keep pitch for" } else { "Turned off Keep pitch for" });
+            }
+            if a1 != a2 {
+                push("Changed the colour of");
+            }
+            if sh1 != sh2 || (crop(clip) != crop(o) && clip.keyframes == o.keyframes) {
+                push("Changed the crop or shape of");
+            }
+            if (fi1, fo1) != (fi2, fo2) {
+                push("Changed the sound fades of");
+            }
+            if !cv1 && *cv2 {
+                push("Turned on Clean voice for");
+            } else if *cv1 && !cv2 {
+                push("Turned off Clean voice for");
+            }
+            if dr1 != dr2 {
+                push(match (*dr1 > 0.0, *dr2 > 0.0) {
+                    (false, true) => "Turned on Reduce echo for",
+                    (true, false) => "Turned off Reduce echo for",
+                    _ => "Changed how much echo is reduced in",
+                });
+            }
+            if n1 != n2 {
+                push(if *n2 { "Turned on Match loudness for" } else { "Turned off Match loudness for" });
+            }
+            if l1 != l2 {
+                push(match (*l1 > 0.0, *l2 > 0.0) {
+                    (false, true) => "Turned on Even out volume for",
+                    (true, false) => "Turned off Even out volume for",
+                    _ => "Changed how much the volume is evened out in",
+                });
+            }
+            if d1 != d2 {
+                push(match (*d1 > 0.0, *d2 > 0.0) {
+                    (false, true) => "Turned on Lower under speech for",
+                    (true, false) => "Turned off Lower under speech for",
+                    _ => "Changed how much speech lowers",
+                });
+            }
+            if b1 != b2 {
+                push(match b2 {
+                    Background::None => "Removed the background of",
+                    Background::Blur { .. } => "Blurred the background of",
+                    Background::Color { .. } | Background::Image { .. } => "Replaced the background of",
+                });
+            }
+        }
+        if clip.keyframes != o.keyframes {
+            push(if clip.keyframes.is_empty() { "Removed the motion of" } else { "Added motion to" });
+        }
+        if (&clip.anim_in, &clip.anim_out) != (&o.anim_in, &o.anim_out) {
+            push("Changed the animations of");
+        }
+        if clip.transition_in != o.transition_in && clip.id == o.id {
+            push(if clip.transition_in.is_some() { "Added transitions to" } else { "Removed transitions from" });
+        }
+    }
+    if !zoomed.is_empty() {
+        let lo = zoomed.iter().map(|(_, f)| *f).fold(f32::MAX, f32::min);
+        let hi = zoomed.iter().map(|(_, f)| *f).fold(0.0, f32::max);
+        let factor = if hi - lo < 0.01 { format!("{lo:.2}×") } else { format!("{lo:.2}–{hi:.2}×") };
+        let clips: Vec<&Clip> = zoomed.iter().map(|(c, _)| *c).collect();
+        out.push(line(format!("Zoomed in on {} ({factor})", count(clips.len(), "place", "places")), &clips));
+    }
+    // Clips split in two where nothing was cut or zoomed: a new piece of a clip, playing its own part of it.
+    if passages.is_empty() && zoomed.is_empty() {
+        let pieces: Vec<&Clip> = pairs
+            .iter()
+            .filter(|(c, o)| o.is_some_and(|o| o.id != c.id))
+            .filter_map(|(c, _)| {
+                let (asset, a, b) = source(c)?;
+                let alone = pairs
+                    .iter()
+                    .all(|(d, _)| d.id == c.id || source(d).is_none_or(|(x, c0, c1)| x != asset || c1 <= a || c0 >= b));
+                alone.then_some(*c)
+            })
+            .collect();
+        for piece in pieces.iter().take(3) {
+            let name = asset_name(source(piece).map_or("", |s| s.0));
+            out.push(line(format!("Split {name}"), &[*piece]));
+        }
+        if pieces.len() > 3 {
+            out.push(line(format!("Split clips in {} more places", pieces.len() - 3), &pieces[3..]));
+        }
+    }
+    for (what, clips) in grouped {
+        let unique: HashSet<&str> = clips.iter().map(|c| c.id.as_str()).collect();
+        let noun = if what.contains("transition") {
+            count(unique.len(), "cut", "cuts")
+        } else {
+            count(unique.len(), "clip", "clips")
+        };
+        out.push(line(format!("{what} {noun}"), &clips));
+    }
+
+    // Tracks, canvas and the rest of the project.
+    for t in &after.tracks {
+        if let Some(b) = before.tracks.iter().find(|b| b.id == t.id) {
+            let name = if t.name.is_empty() { "a track".to_owned() } else { format!("the {} track", t.name) };
+            if b.muted != t.muted {
+                out.push(RunChange {
+                    text: format!("{} {name}", if t.muted { "Muted" } else { "Unmuted" }),
+                    clip_ids: Vec::new(),
+                    at_us: None,
+                });
+            }
+            if b.hidden != t.hidden {
+                out.push(RunChange {
+                    text: format!("{} {name}", if t.hidden { "Hid" } else { "Showed" }),
+                    clip_ids: Vec::new(),
+                    at_us: None,
+                });
+            }
+        }
+    }
+    let (c1, c2) = (&before.canvas, &after.canvas);
+    if (c1.width, c1.height) != (c2.width, c2.height) {
+        out.push(RunChange {
+            text: format!("Changed the format to {} × {}", c2.width, c2.height),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+    if c1.fps != c2.fps {
+        out.push(RunChange {
+            text: format!("Changed the frame rate to {} fps", c2.fps),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+    if c1.background != c2.background || c1.background_blur != c2.background_blur {
+        out.push(RunChange { text: "Changed the background".into(), clip_ids: Vec::new(), at_us: None });
+    }
+    let corrected = after.word_corrections.len() as i64 - before.word_corrections.len() as i64;
+    if corrected > 0 {
+        out.push(RunChange {
+            text: format!("Corrected {}", count(corrected as usize, "word", "words")),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    } else if after.word_corrections != before.word_corrections {
+        out.push(RunChange { text: "Changed word corrections".into(), clip_ids: Vec::new(), at_us: None });
+    }
+    let on_timeline: HashSet<&str> =
+        after.tracks.iter().flat_map(|t| &t.clips).filter_map(|c| source(c).map(|s| s.0)).collect();
+    for a in after.assets.iter().filter(|a| before.asset(&a.id).is_none() && !on_timeline.contains(a.id.as_str())) {
+        out.push(RunChange {
+            text: format!("Imported {} into the library", a.name),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+    for format in [ThumbnailFormat::Cover9x16, ThumbnailFormat::Youtube16x9] {
+        let name = match format {
+            ThumbnailFormat::Cover9x16 => "the 9:16 cover",
+            ThumbnailFormat::Youtube16x9 => "the YouTube thumbnail",
+        };
+        // Cuts before its frame move the frame's time with the picture; showing the same moment, it is the same cover.
+        let moved_with_cut = |old: &Thumbnail, new: &Thumbnail| {
+            Thumbnail { time_us: new.time_us, ..old.clone() } == *new
+                && (new.image.is_some()
+                    || shown_source(before, old.time_us)
+                        .is_some_and(|shown| Some(shown) == shown_source(after, new.time_us)))
+        };
+        let verb = match (before.thumbnail(format), after.thumbnail(format)) {
+            (None, Some(_)) => "Made",
+            (Some(_), None) => "Removed",
+            (Some(old), Some(new)) if old != new && !moved_with_cut(old, new) => "Changed",
+            _ => continue,
+        };
+        out.push(RunChange { text: format!("{verb} {name}"), clip_ids: Vec::new(), at_us: None });
+    }
+    let (was, now) = (&before.reel_candidates, &after.reel_candidates);
+    let old = |id: &str| was.iter().find(|c| c.id == id);
+    let made =
+        now.iter().filter(|c| c.status == ReelStatus::Made && old(&c.id).is_none_or(|o| o.status != ReelStatus::Made));
+    let made = made.count();
+    let proposed = now.iter().filter(|c| c.status != ReelStatus::Made && old(&c.id).is_none()).count();
+    let changed = now.iter().filter(|c| c.status != ReelStatus::Made && old(&c.id).is_some_and(|o| o != *c)).count();
+    let removed = was.iter().filter(|o| !now.iter().any(|c| c.id == o.id)).count();
+    for (n, what) in [(proposed, "Proposed"), (made, "Made"), (changed, "Changed"), (removed, "Removed")] {
+        if n > 0 {
+            out.push(RunChange {
+                text: format!("{what} {}", count(n, "reel", "reels")),
+                clip_ids: Vec::new(),
+                at_us: None,
+            });
+        }
+    }
+    if before.name != after.name {
+        out.push(RunChange {
+            text: format!("Renamed the project to {}", quote(&after.name)),
+            clip_ids: Vec::new(),
+            at_us: None,
+        });
+    }
+
+    // Anything else still says that something changed.
+    if out.is_empty() && before != after {
+        out.push(RunChange { text: "Changed the project".into(), clip_ids: Vec::new(), at_us: None });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nuzky_engine::edit::{EditCmd, Editor};
+    use serde_json::json;
+
+    fn editor() -> Editor {
+        let mut e = Editor::new(Project::new("t"));
+        let asset = |id: &str, name: &str, kind: &str, secs: i64| {
+            json!({"id": id, "name": name, "path": format!("/m/{name}"), "kind": kind, "durationUs": secs * 1_000_000,
+                   "width": 1080, "height": 1920, "fps": 30.0, "hasAudio": true, "rotation": 0, "mirror": false})
+        };
+        apply(
+            &mut e,
+            json!({"type": "addAssets", "assets": [asset("t1", "take-1.mp4", "video", 20), asset("m", "lofi.mp3", "audio", 60)]}),
+        );
+        apply(&mut e, json!({"type": "addClip", "assetId": "t1", "startUs": 0, "trackId": "main"}));
+        e
+    }
+
+    fn apply(e: &mut Editor, cmd: serde_json::Value) {
+        e.apply(serde_json::from_value::<EditCmd>(cmd).unwrap(), None).unwrap();
+    }
+
+    fn texts(changes: &[RunChange]) -> Vec<&str> {
+        changes.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_rough_cut_says_what_was_cut_captioned_and_zoomed() {
+        let mut e = editor();
+        let before = e.project.clone();
+        apply(
+            &mut e,
+            json!({"type": "rippleDeleteRanges", "ranges": [{"startUs": 2_000_000, "endUs": 4_000_000}, {"startUs": 10_000_000, "endUs": 12_500_000}]}),
+        );
+        let style = json!({"fontSize": 95.0, "color": "#ffffff", "strokeWidth": 7.5});
+        let seg = |a: i64, b: i64, t: &str| json!({"startUs": a, "endUs": b, "text": t});
+        apply(
+            &mut e,
+            json!({"type": "addCaptions", "style": style, "segments": [seg(0, 1_000_000, "dneska vám"), seg(1_000_000, 2_000_000, "ukážu jak"), seg(2_000_000, 3_000_000, "natočit video")]}),
+        );
+        apply(
+            &mut e,
+            json!({"type": "zoomRanges", "ranges": [{"startUs": 5_000_000, "endUs": 8_000_000, "scale": 1.2}]}),
+        );
+
+        let changes = summarize(&before, &e.project);
+        assert_eq!(
+            texts(&changes),
+            [
+                "Shortened the video from 20.0 s to 15.5 s",
+                "Cut out 2 passages, 4.5 s in total",
+                "Added 3 captions",
+                "Zoomed in on 1 place (1.20×)"
+            ]
+        );
+        // Split pieces of the take are not new media, and each line points at its clips.
+        assert_eq!(changes[2].clip_ids.len(), 3);
+        assert_eq!(changes[2].at_us, Some(0));
+        let zoomed = &e.project.tracks[0].clips.iter().find(|c| c.id == changes[3].clip_ids[0]).unwrap();
+        assert_eq!(changes[3].at_us, Some(zoomed.start_us));
+        assert!(scale(zoomed) > 1.1);
+    }
+
+    #[test]
+    fn added_music_and_a_volume_change_name_the_file_and_clip() {
+        let mut e = editor();
+        let before = e.project.clone();
+        apply(&mut e, json!({"type": "addClip", "assetId": "m", "startUs": 0}));
+        let music = e.project.tracks.iter().find(|t| t.kind == TrackKind::Audio).unwrap().clips[0].id.clone();
+        apply(&mut e, json!({"type": "updateClip", "clipId": music, "volume": 0.3}));
+        let take = e.project.tracks[0].clips[0].id.clone();
+        apply(
+            &mut e,
+            json!({"type": "updateClip", "clipId": take, "cleanVoice": true, "dereverb": 0.8, "normalize": true, "leveler": 0.5}),
+        );
+
+        let changes = summarize(&before, &e.project);
+        assert_eq!(
+            texts(&changes),
+            [
+                "Added lofi.mp3 on an audio track",
+                "Turned on Clean voice for 1 clip",
+                "Turned on Reduce echo for 1 clip",
+                "Turned on Match loudness for 1 clip",
+                "Turned on Even out volume for 1 clip",
+            ]
+        );
+        assert_eq!(changes[0].clip_ids, [music.as_str()]);
+        assert!(changes[1..].iter().all(|change| change.clip_ids == [take.as_str()]));
+        let before = e.project.clone();
+        apply(&mut e, json!({"type": "updateClip", "clipId": music, "duckDb": 12}));
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Turned on Lower under speech for 1 clip"]);
+        let before = e.project.clone();
+        apply(&mut e, json!({"type": "updateClip", "clipId": take, "dereverb": 0.4, "leveler": 0.2}));
+        assert_eq!(
+            texts(&summarize(&before, &e.project)),
+            ["Changed how much echo is reduced in 1 clip", "Changed how much the volume is evened out in 1 clip",]
+        );
+        let before = e.project.clone();
+        apply(
+            &mut e,
+            json!({"type": "updateClip", "clipId": take, "cleanVoice": false, "dereverb": 0.0, "normalize": false, "leveler": 0.0}),
+        );
+        assert_eq!(
+            texts(&summarize(&before, &e.project)),
+            [
+                "Turned off Clean voice for 1 clip",
+                "Turned off Reduce echo for 1 clip",
+                "Turned off Match loudness for 1 clip",
+                "Turned off Even out volume for 1 clip",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_split_says_where() {
+        let mut e = editor();
+        let before = e.project.clone();
+        let take = e.project.tracks[0].clips[0].id.clone();
+        apply(&mut e, json!({"type": "splitClip", "clipId": take, "atUs": 5_000_000}));
+        let changes = summarize(&before, &e.project);
+        assert_eq!(texts(&changes), ["Split take-1.mp4"]);
+        assert_eq!(changes[0].at_us, Some(5_000_000));
+    }
+
+    #[test]
+    fn covers_say_what_happened_to_them_but_not_that_a_cut_moved_their_frame() {
+        let mut e = editor();
+        let cover = |time_us: i64, dim: f32| json!({"type": "setThumbnail", "thumbnail": {"format": "cover_9x16", "timeUs": time_us, "background": {"dim": dim}}});
+        let before = e.project.clone();
+        apply(&mut e, cover(8_000_000, 0.0));
+        apply(&mut e, json!({"type": "setThumbnail", "thumbnail": {"format": "youtube_16x9", "timeUs": 0}}));
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Made the 9:16 cover", "Made the YouTube thumbnail"]);
+        let before = e.project.clone();
+        let cut = json!({"type": "rippleDeleteRanges", "ranges": [{"startUs": 1_000_000, "endUs": 2_000_000}]});
+        apply(&mut e, cut.clone());
+        assert_eq!(
+            texts(&summarize(&before, &e.project)),
+            ["Shortened the video from 20.0 s to 19.0 s", "Cut out 1 passage, 1.0 s in total"]
+        );
+        // A cut together with a frame chosen elsewhere is a change.
+        let mut other = Editor::new(before.clone());
+        apply(&mut other, cut);
+        apply(&mut other, cover(3_000_000, 0.0));
+        assert!(texts(&summarize(&before, &other.project)).contains(&"Changed the 9:16 cover"));
+        let before = e.project.clone();
+        apply(&mut e, cover(7_000_000, 0.3));
+        apply(&mut e, json!({"type": "removeThumbnail", "format": "youtube_16x9"}));
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Changed the 9:16 cover", "Removed the YouTube thumbnail"]);
+    }
+
+    #[test]
+    fn reels_say_how_many_were_proposed_made_and_dropped() {
+        let mut e = editor();
+        let candidate = |id: &str, from: i64, status: &str| {
+            let mut c = json!({"id": id, "from": from, "to": from + 9, "startUs": from * 1_000_000,
+                "endUs": from * 1_000_000 + 900_000, "title": "T", "hook": "H.", "why": "W", "durationUs": 900_000,
+                "score": 0.5, "status": status});
+            if status == "made" {
+                c["projectPath"] = json!(format!("/v/{id}.nuzky"));
+            }
+            c
+        };
+        let before = e.project.clone();
+        apply(
+            &mut e,
+            json!({"type": "setReelCandidates", "candidates": [candidate("a", 0, "proposed"), candidate("b", 10, "proposed")]}),
+        );
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Proposed 2 reels"]);
+        let before = e.project.clone();
+        apply(&mut e, json!({"type": "updateReelCandidate", "candidate": candidate("a", 0, "made")}));
+        apply(&mut e, json!({"type": "updateReelCandidate", "candidate": candidate("b", 10, "rejected")}));
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Made 1 reel", "Changed 1 reel"]);
+        let before = e.project.clone();
+        apply(
+            &mut e,
+            json!({"type": "setReelCandidates", "candidates": [candidate("a", 0, "made"), candidate("c", 10, "proposed")]}),
+        );
+        assert_eq!(texts(&summarize(&before, &e.project)), ["Proposed 1 reel", "Removed 1 reel"]);
+    }
+
+    #[test]
+    fn an_unchanged_project_has_no_lines() {
+        let e = editor();
+        assert!(summarize(&e.project, &e.project).is_empty());
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "product": "MadMan Cut",
+  "source": "https://github.com/nuzkyapp/nuzky",
+  "tag": "v0.1.3-alpha",
+  "commit": "1461a17f143d79c6ec0a851a9b34f3978a023501",
+  "license": "GPL-3.0-or-later",
+  "referenceInstaller": "Nuzky_0.1.3-alpha_x64-setup.exe",
+  "referenceInstallerSha256": "02642cbe233507e130b00d29879644f1914acb78e89ed8078a28eef237d43215"
+}

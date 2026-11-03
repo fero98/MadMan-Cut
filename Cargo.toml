@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/cli", "src-tauri", "crates/analysis", "crates/session", "crates/mcp", "crates/agent", "crates/vision", "crates/interchange", "crates/chatgpt", "crates/discovery"]
+
+[workspace.package]
+version = "0.1.3-alpha"
+edition = "2024"
+license = "GPL-3.0-or-later"
+homepage = "https://nuzky.app"
+repository = "https://github.com/nuzkyapp/nuzky"
+
+[workspace.dependencies]
+nuzky-session = { path = "crates/session" }
+nuzky-mcp = { path = "crates/mcp" }
+nuzky-agent = { path = "crates/agent" }
+nuzky-analysis = { path = "crates/analysis" }
+nuzky-vision = { path = "crates/vision" }
+nuzky-interchange = { path = "crates/interchange" }
+nuzky-chatgpt = { path = "crates/chatgpt" }
+schemars = "1.2.2"
+ts-rs = "12.0.1"
+nuzky-engine = { path = "crates/engine" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+# Backtraces keep their files and lines; full debug info made every test binary ten times larger and the build
+# and linking slower.
+debug = "line-tables-only"
+
+# The app crate is mostly glue between the UI and the engine. Optimising it took 7 of the 9 s a rebuild cost after an
+# edit there; without it the debug app prepared an hour of sound no slower, and the preview and export flows pass.
+[profile.dev.package.nuzky-app]
+opt-level = 0
+
+# Build scripts and their dependencies get the same debug info as the rest, so `cargo clippy` and `cargo test`
+# share them: with none, whisper.cpp and the FFmpeg bindings built twice in every new checkout.
+[profile.dev.build-override]
+debug = "line-tables-only"

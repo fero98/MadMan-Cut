@@ -1,0 +1,522 @@
+@import "tailwindcss";
+/* The website lives in the same repo; its classes do not belong in the app's stylesheet. */
+@source not "../site";
+
+/* The UI face. The same variable file the engine and the font picker use, so it ships with the app
+   and looks the same on Linux, Windows and macOS. */
+@font-face {
+  font-family: "Inter UI";
+  src: url("../assets/fonts/inter/Inter[opsz,wght].ttf") format("truetype");
+  font-weight: 100 900;
+  font-display: block;
+}
+
+@theme {
+  --color-bg: #0b0b0d;
+  --color-stage: #000000;
+  --color-panel: #191a1d;
+  /* The timeline's lanes and ruler, a step below the panes. */
+  --color-well: #101114;
+  --color-raised: #2c2c30;
+  --color-line: #36363b;
+  --color-fg: #f2f2f5;
+  --color-muted: #a1a1a9;
+  --color-subtle: #6e6e75;
+  --color-accent: #ffb16e;
+  --color-accent-strong: #a5421c;
+  --color-danger: #ff453a;
+  --color-warn: #ff9f0a;
+  --color-ok: #30d158;
+  /* "clip-text" would collide with Tailwind's bg-clip-text (background-clip: text). */
+  --color-clip-video: #245891;
+  --color-clip-image: #43468e;
+  --color-clip-audio: #17603c;
+  --color-clip-title: #865316;
+  --color-clip-captions: #5a3f9a;
+  --font-sans: "Inter UI", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The root stays at 16 px, so Tailwind's rem sizes are the px values in DESIGN.md; body text is 13 px. */
+html {
+  font-size: 16px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+}
+
+body,
+#root {
+  font-size: 13px;
+  line-height: 1.25;
+  font-optical-sizing: auto;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  color-scheme: dark;
+}
+
+input,
+textarea,
+select {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* In the base layer, so a `focus-visible:outline-*` utility on an element can adjust its ring. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  /* On timeline clips the accent ring means selected, so keyboard focus is an `fg` outline just outside it. */
+  [data-clip-id]:focus-visible {
+    outline-color: var(--color-fg);
+    outline-offset: 2px;
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Materials. Panes are solid. Floating bars (top bar groups, transport, timeline tools) look like
+ * glass but never blur: they float over still backgrounds, where a blur would look the same and
+ * cost a repaint. Only short-lived overlays (menus, dialogs, toasts) blur what is under them.
+ */
+@layer components {
+  /* The hairline is an inset outline: outlines paint after the content, so a child at the edge never covers it. */
+  .pane {
+    background: var(--color-panel);
+    border-radius: 12px;
+    outline: 1px solid rgb(255 255 255 / 0.09);
+    outline-offset: -1px;
+  }
+  .bar {
+    background: rgb(255 255 255 / 0.06);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.1),
+      inset 0 0 0 1px rgb(255 255 255 / 0.07),
+      0 4px 12px rgb(0 0 0 / 0.25);
+  }
+  .overlay {
+    background: rgb(38 38 43 / 0.88);
+    -webkit-backdrop-filter: blur(28px) saturate(1.8);
+    backdrop-filter: blur(28px) saturate(1.8);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.12),
+      inset 0 0 0 1px rgb(255 255 255 / 0.1),
+      0 18px 50px rgb(0 0 0 / 0.55);
+  }
+  /* For an overlay that is mostly text, such as the launcher: less of the video's colour comes through. */
+  .overlay-thick {
+    background: rgb(36 36 41 / 0.96);
+    -webkit-backdrop-filter: blur(28px) saturate(1.1);
+    backdrop-filter: blur(28px) saturate(1.1);
+  }
+  /* While the video plays (App.tsx sets the attribute), the blur would be redone on every frame under it. */
+  [data-playing] .overlay,
+  /* An overlay that plays a video of its own, as Video from YouTube does, for the same reason. */
+  .overlay.overlay-solid {
+    background: rgb(42 42 47 / 0.97);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .overlay {
+      background: #2a2a2f;
+    }
+  }
+  @media (prefers-contrast: more) {
+    .overlay {
+      background: #2a2a2f;
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+    }
+    .bar,
+    .overlay {
+      box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+    }
+    .pane {
+      outline-color: rgb(255 255 255 / 0.35);
+    }
+  }
+
+  /* Segmented controls and tab tracks: a recessed track, the chosen segment lifted out of it. */
+  .seg-track {
+    background: rgb(255 255 255 / 0.045);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.05);
+  }
+  .seg-on {
+    background: rgb(255 255 255 / 0.15);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.1),
+      0 1px 3px rgb(0 0 0 / 0.4);
+  }
+  /* SegThumb (ui.tsx): it slides to a new choice. It is placed absolutely, so its width changes only its own box. */
+  .seg-thumb {
+    transition:
+      transform 260ms cubic-bezier(0.32, 0.72, 0, 1),
+      width 260ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  /* Segments a disabled fieldset turns off, as in the Export dialog while it exports, drop to 40 % with their plate. */
+  .seg-track:has(> [data-seg]:disabled) > .seg-thumb {
+    opacity: 0.4;
+  }
+
+  /* Button and IconButton (ui.tsx) shapes. Here rather than as utilities, so a `className` such as
+     "h-6 px-2 text-[12px]" on a call site overrides them: Tailwind sorts same-property utilities by
+     value, and a smaller utility would otherwise lose to the base size. */
+  .btn {
+    display: inline-flex;
+    height: 2rem;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    border-radius: 0.5rem;
+    padding-inline: 0.75rem;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .btn-pill {
+    border-radius: 9999px;
+    padding-inline: 0.875rem;
+  }
+  .icon-btn {
+    display: inline-flex;
+    height: 2rem;
+    width: 2rem;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.5rem;
+  }
+  .icon-btn-round {
+    border-radius: 9999px;
+  }
+
+  /* The one prominent action per view: Export, Generate, Apply in a dialog. */
+  .btn-prominent {
+    background: var(--color-accent-strong);
+    color: #fff;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.2),
+      0 1px 3px rgb(0 0 0 / 0.45);
+  }
+  .btn-prominent:not([aria-disabled="true"]):hover {
+    background: #8e3517;
+  }
+  /* Disabled (always `aria-disabled`, so it stays focusable), a quiet grey capsule rather than a muddy blue one. */
+  .btn-prominent[aria-disabled="true"] {
+    background: rgb(255 255 255 / 0.08);
+    color: rgb(242 242 245 / 0.4);
+    box-shadow: none;
+    opacity: 1;
+  }
+}
+
+/* Thin, dark scrollbars that do not shift layout. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+/* The thumb shows while the pointer is over the scroller, like overlay scrollbars on macOS. */
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+:hover::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.16);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(255 255 255 / 0.28);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+input[type="range"] {
+  accent-color: var(--color-accent);
+}
+
+/* RangeInput (ui.tsx): a thin track, accent fill between --fill-from and --fill-to, a white capsule thumb. */
+input[type="range"].range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"].range:disabled {
+  cursor: not-allowed;
+}
+.range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    rgb(255 255 255 / 0.13) var(--fill-from),
+    var(--color-accent) var(--fill-from),
+    var(--color-accent) var(--fill-to),
+    rgb(255 255 255 / 0.13) var(--fill-to)
+  );
+}
+.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 7px;
+  background: #f7f7f9;
+  box-shadow:
+    0 0 0 0.5px rgb(0 0 0 / 0.35),
+    0 1px 3px rgb(0 0 0 / 0.5);
+}
+.range:enabled:hover::-webkit-slider-thumb {
+  background: #fff;
+}
+/* Disabled: a solid grey thumb on a dimmed track. Opacity on the input would let the 0 tick show through the thumb. */
+.range:disabled::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    rgb(255 255 255 / 0.06) var(--fill-from),
+    rgb(255 177 110 / 0.35) var(--fill-from),
+    rgb(255 177 110 / 0.35) var(--fill-to),
+    rgb(255 255 255 / 0.06) var(--fill-to)
+  );
+}
+.range:disabled::-webkit-slider-thumb {
+  background: #55555b;
+  box-shadow: none;
+}
+/* Locked while an AI agent edits: read-only rather than off, so the values it changes stay readable. */
+.range.range-locked:disabled::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    rgb(255 255 255 / 0.1) var(--fill-from),
+    rgb(255 177 110 / 0.6) var(--fill-from),
+    rgb(255 177 110 / 0.6) var(--fill-to),
+    rgb(255 255 255 / 0.1) var(--fill-to)
+  );
+}
+.range.range-locked:disabled::-webkit-slider-thumb {
+  background: #8e8e93;
+}
+
+@keyframes skeleton {
+  from {
+    background-position: -200px 0;
+  }
+  to {
+    background-position: 200px 0;
+  }
+}
+.skeleton {
+  background: linear-gradient(90deg, #232326 0, #2e2e33 50%, #232326 100%) no-repeat;
+  background-size: 400px 100%;
+  animation: skeleton 1.4s linear infinite;
+}
+
+/* Dialogs: the scrim and the panel appear over 200 ms. Keyframes rather than @starting-style transitions,
+   which left the scrim transparent in WebKitGTK. */
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+.scrim-in {
+  animation: scrim-in 200ms ease-out both;
+}
+.dialog-in {
+  animation: dialog-in 200ms ease-out both;
+}
+/* Menus grow out of the point they were opened from (each sets its transform-origin); toasts rise into the stack. */
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+}
+.menu-in {
+  animation: menu-in 140ms cubic-bezier(0.2, 0.9, 0.3, 1) backwards;
+}
+/* It shows once the toasts it pushes up have left its place. */
+@keyframes toast-in {
+  0%,
+  35% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+.toast-in {
+  animation: toast-in 220ms cubic-bezier(0.32, 0.72, 0, 1) backwards;
+}
+/* The copy a menu, dialog or toast leaves while it fades out (lib/exit.ts). A chosen menu item blinks once first, off
+   and back on, as on macOS. */
+@keyframes exit-out {
+  to {
+    opacity: 0;
+  }
+}
+.exit-ghost {
+  pointer-events: none;
+  animation: exit-out 150ms ease-out forwards;
+}
+.exit-ghost[data-chose] {
+  animation-delay: 50ms;
+}
+@keyframes chosen {
+  0%,
+  49% {
+    background-color: transparent;
+  }
+  50%,
+  100% {
+    background-color: rgb(255 255 255 / 0.14);
+  }
+}
+.exit-ghost [data-chosen] {
+  animation: chosen 100ms linear forwards;
+}
+/* A part of Your style that just changed, by the AI or anywhere else. */
+@keyframes changed {
+  from {
+    background-color: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+}
+.changed {
+  animation: changed 2400ms ease-out;
+}
+/* A tooltip's first showing (Tooltip in ui.tsx); the ones after it, while the pointer moves along, show at once. */
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+}
+.tip-in {
+  animation: tip-in 120ms ease-out backwards;
+}
+
+/* FadeImg (ui.tsx): a picture that arrives after its place was drawn. */
+@keyframes img-in {
+  from {
+    opacity: 0;
+  }
+}
+img[data-loaded="fade"] {
+  animation: img-in 180ms ease-out;
+}
+
+@keyframes indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.indeterminate {
+  animation: indeterminate 1.2s ease-in-out infinite;
+}
+
+/*
+ * Motion previews on transition and animation tiles. At rest a tile shows a frame from the
+ * middle of the effect; hovering or focusing the tile plays it in a loop.
+ */
+.pv {
+  animation-duration: 1.4s;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
+  animation-fill-mode: both;
+  animation-play-state: paused;
+  animation-delay: -0.56s;
+}
+button:hover .pv,
+button:focus-visible .pv {
+  animation-play-state: running;
+}
+.pv-out {
+  animation-direction: reverse;
+}
+
+/* Native options can otherwise inherit light text on a light Windows popup. */
+.speech-select { color-scheme: dark; }
+.speech-select option { color: #f2f2f5; background-color: #25262b; }
+
+@keyframes t-dissolve-b { 0%, 15% { opacity: 0 } 85%, 100% { opacity: 1 } }
+@keyframes t-swap-b { 0%, 49.9% { opacity: 0 } 50%, 100% { opacity: 1 } }
+@keyframes t-flash { 0%, 10% { opacity: 0 } 50% { opacity: 1 } 90%, 100% { opacity: 0 } }
+@keyframes t-slide-left-a { 0%, 15% { transform: translateX(0) } 85%, 100% { transform: translateX(-100%) } }
+@keyframes t-slide-left-b { 0%, 15% { transform: translateX(100%) } 85%, 100% { transform: translateX(0) } }
+@keyframes t-slide-up-a { 0%, 15% { transform: translateY(0) } 85%, 100% { transform: translateY(-100%) } }
+@keyframes t-slide-up-b { 0%, 15% { transform: translateY(100%) } 85%, 100% { transform: translateY(0) } }
+@keyframes t-slide-right-a { 0%, 15% { transform: translateX(0) } 85%, 100% { transform: translateX(100%) } }
+@keyframes t-slide-right-b { 0%, 15% { transform: translateX(-100%) } 85%, 100% { transform: translateX(0) } }
+@keyframes t-slide-down-a { 0%, 15% { transform: translateY(0) } 85%, 100% { transform: translateY(100%) } }
+@keyframes t-slide-down-b { 0%, 15% { transform: translateY(-100%) } 85%, 100% { transform: translateY(0) } }
+@keyframes t-zoom-a { 0%, 15% { transform: scale(1); opacity: 1 } 55%, 100% { transform: scale(1.9); opacity: 0 } }
+@keyframes t-zoom-b { 0%, 40% { transform: scale(0.85); opacity: 0 } 85%, 100% { transform: scale(1); opacity: 1 } }
+@keyframes t-wipe-b { 0%, 15% { clip-path: inset(0 0 0 100%) } 85%, 100% { clip-path: inset(0 0 0 0) } }
+@keyframes t-wipe-right-b { 0%, 15% { clip-path: inset(0 100% 0 0) } 85%, 100% { clip-path: inset(0 0 0 0) } }
+@keyframes t-wipe-up-b { 0%, 15% { clip-path: inset(100% 0 0 0) } 85%, 100% { clip-path: inset(0 0 0 0) } }
+@keyframes t-wipe-down-b { 0%, 15% { clip-path: inset(0 0 100% 0) } 85%, 100% { clip-path: inset(0 0 0 0) } }
+@keyframes t-blur-a { 0%, 10% { filter: blur(0) } 50%, 100% { filter: blur(6px) } }
+@keyframes t-blur-b { 0%, 49.9% { opacity: 0; filter: blur(6px) } 50% { opacity: 1; filter: blur(6px) } 90%, 100% { opacity: 1; filter: blur(0) } }
+
+@keyframes a-fade { 0%, 15% { opacity: 0 } 70%, 100% { opacity: 1 } }
+@keyframes a-zoomIn { 0%, 15% { opacity: 0; transform: scale(0.3) } 70%, 100% { opacity: 1; transform: scale(1) } }
+@keyframes a-zoomOut { 0%, 15% { opacity: 0; transform: scale(1.9) } 70%, 100% { opacity: 1; transform: scale(1) } }
+@keyframes a-slideUp { 0%, 15% { opacity: 0; transform: translateY(120%) } 70%, 100% { opacity: 1; transform: translateY(0) } }
+@keyframes a-slideDown { 0%, 15% { opacity: 0; transform: translateY(-120%) } 70%, 100% { opacity: 1; transform: translateY(0) } }
+@keyframes a-slideLeft { 0%, 15% { opacity: 0; transform: translateX(120%) } 70%, 100% { opacity: 1; transform: translateX(0) } }
+@keyframes a-slideRight { 0%, 15% { opacity: 0; transform: translateX(-120%) } 70%, 100% { opacity: 1; transform: translateX(0) } }
+@keyframes a-pop { 0%, 15% { transform: scale(0) } 55% { transform: scale(1.18) } 70%, 100% { transform: scale(1) } }
+@keyframes a-typewriter { 0%, 15% { clip-path: inset(0 100% 0 0) } 70%, 100% { clip-path: inset(0 0 0 0) } }
+.a-typewriter {
+  animation-timing-function: steps(5, end);
+}
+
+/* Motion presets, stronger than the real move so it reads at tile size. Ken Burns grows from the right edge, as the engine zooms it. */
+@keyframes m-pushIn { 0%, 10% { transform: scale(1) } 90%, 100% { transform: scale(1.4) } }
+@keyframes m-pullOut { 0%, 10% { transform: scale(1.4) } 90%, 100% { transform: scale(1) } }
+.m-kenBurns {
+  transform-origin: 100% 50%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+  /* A still sweep would read as a third done; a full striped bar says "in progress" instead. */
+  .indeterminate {
+    width: 100%;
+    background: repeating-linear-gradient(135deg, var(--color-accent) 0 4px, color-mix(in srgb, var(--color-accent) 35%, transparent) 4px 8px);
+  }
+}

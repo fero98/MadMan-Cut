@@ -1,0 +1,1070 @@
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode, type Ref } from "react";
+import madmanIcon from "../../../assets/madman/icon-v2-64.png";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import {
+  AlertCircle,
+  ArrowUpDown,
+  ChevronDown,
+  ChevronLeft,
+  Compass,
+  Copy,
+  Folder,
+  FolderInput,
+  FolderOpen,
+  FolderPlus,
+  GalleryVerticalEnd,
+  Film,
+  Info,
+  LayoutGrid,
+  ListChecks,
+  Loader2,
+  Pencil,
+  Plus,
+  Split,
+  Search,
+  Sparkles,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
+import { followPointer } from "../../lib/drag";
+import { addDraftFolder } from "../../lib/capcut";
+import { useStyle } from "../../lib/style";
+import { StylePage } from "../style/StylePage";
+import { ViralLab } from "../viral/ViralLab";
+import { AiPanel } from "../ai/AiPanel";
+import {
+  blocked,
+  createCollection,
+  deleteCollection,
+  duplicateProject,
+  fold,
+  matches,
+  moveToCollection,
+  newProject,
+  openProject,
+  openProjectFile,
+  onlyPristine,
+  periodOf,
+  pickOneVideo,
+  pickVideosForNewProject,
+  refreshLibrary,
+  renameCollection,
+  setSort,
+  showEditor,
+  trashBlocked,
+  trashProjects,
+  undoLastToast,
+  useLibrary,
+  useSaidSearch,
+} from "../../lib/library";
+import { FORMATS } from "../../lib/presets";
+import { openReelsToFind } from "../../lib/reels";
+import { useAgent } from "../../lib/agent";
+import { useSetup, stepsLeft } from "../../lib/setup";
+import { trySample } from "../../lib/tour";
+import { useEditor } from "../../lib/store";
+import { formatLength } from "../../lib/time";
+import type { Collection, LibraryProject, Said } from "../../lib/types";
+import { AiRunBar, JobIndicator } from "../TopBar";
+import { Button, IconButton, Menu, type MenuEntry } from "../ui";
+import { ProjectCard } from "./ProjectCard";
+import { Poster } from "./Poster";
+import { VersionRow } from "../Updates";
+import { useWindowButtons } from "../../lib/window";
+import { SOCIAL_LINKS } from "../../lib/social";
+import { api } from "../../lib/api";
+
+type MenuState = { items: MenuEntry[]; at: { x: number; y: number; align?: "start" | "end"; above?: boolean }; label: string; keyboard: boolean; back: HTMLElement | null; /** The card it acts on. */ target?: string };
+const HIDDEN_SAMPLE_KEY = "madman.hiddenOriginalSamples";
+
+function readHiddenSamples(): string[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(HIDDEN_SAMPLE_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((p): p is string => typeof p === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** A ratio's shape, as in the New project menu and on the first start. */
+export function FormatShape({ width, height, size }: { width: number; height: number; size: number }) {
+  const scale = size / Math.max(width, height);
+  return <span className="inline-block rounded-[2px] border-[1.5px] border-current" style={{ width: Math.round(width * scale), height: Math.round(height * scale) }} />;
+}
+
+function newProjectItems(): MenuEntry[] {
+  return [
+    ...FORMATS.map((f) => ({ label: `Prázdný ${f.label}`, shortcut: f.hint, icon: <FormatShape width={f.width} height={f.height} size={14} />, run: () => newProject(f.width, f.height) })),
+    "separator" as const,
+    { label: "Z videí…", shortcut: "Formát prvního videa", icon: <Film size={15} />, run: () => void pickVideosForNewProject() },
+    { label: "Z projektu CapCut…", shortcut: "Střih, titulky a přiblížení", icon: <FolderInput size={15} />, run: () => void addDraftFolder() },
+    { label: "Krátká videa z dlouhého…", shortcut: "AI najde zajímavé okamžiky", icon: <GalleryVerticalEnd size={15} />, run: () => void pickOneVideo(openReelsToFind) },
+  ];
+}
+
+const byName = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+/** The AI panel works on the open project, so the projects have no AI of their own; on Your style it opens beside the style. */
+function toggleStyleChat() {
+  useStyle.setState((s) => ({ chatOpen: !s.chatOpen }));
+}
+
+function AiButton() {
+  const working = useAgent((s) => s.status !== "idle");
+  const open = useStyle((s) => s.chatOpen);
+  const title = open ? "Close the AI (Ctrl+J)" : "Talk about your style with the AI (Ctrl+J)";
+  return (
+    <Button variant="bar" pill aria-pressed={open} title={working ? `${title}. It is still working.` : title} onClick={toggleStyleChat} className={open ? "bg-white/[.15]!" : ""}>
+      {working ? <Loader2 size={15} className="animate-spin text-accent" /> : <Sparkles size={15} />} AI
+    </Button>
+  );
+}
+
+/** The AI beside Your style: what the creator says there is about their style. */
+function StyleChat() {
+  const panel = useRef<HTMLElement>(null);
+  return <AiPanel about="style" panelRef={panel} className="w-[340px] shrink-0" onClose={() => useStyle.setState({ chatOpen: false })} />;
+}
+
+export function Home() {
+  const projects = useLibrary((s) => s.projects);
+  const collections = useLibrary((s) => s.collections);
+  const filter = useLibrary((s) => s.filter);
+  const page = useLibrary((s) => s.page);
+  const chatOpen = useStyle((s) => s.chatOpen);
+  const sort = useLibrary((s) => s.sort);
+  const selection = useLibrary((s) => s.selection);
+  const loadError = useLibrary((s) => s.loadError);
+  const current = useEditor((s) => s.snap);
+  const [hiddenSamples, setHiddenSamples] = useState(readHiddenSamples);
+  const samplePath = current?.project.name === "Sample video" && current.project.assets.some((a) => a.credit?.source === "youtube" && a.credit.id === "SfmKRW_bSHI") ? current.path : null;
+  useEffect(() => {
+    if (!samplePath) return;
+    setHiddenSamples((previous) => {
+      if (previous.includes(samplePath)) return previous;
+      const next = [...previous, samplePath];
+      try { localStorage.setItem(HIDDEN_SAMPLE_KEY, JSON.stringify(next)); } catch { /* Keep it hidden for this session. */ }
+      return next;
+    });
+  }, [samplePath]);
+  const fileDrag = useEditor((s) => s.fileDrag);
+  const [query, setQuery] = useState("");
+  const said = useSaidSearch(query, filter === "all" ? null : filter);
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [drag, setDrag] = useState<{ paths: string[]; x: number; y: number; over: string | null } | null>(null);
+  const searchField = useRef<HTMLInputElement>(null);
+  const grid = useRef<HTMLDivElement>(null);
+  const [focusPath, setFocusPath] = useState<string | null>(null);
+  const [creating, setCreating] = useState<string[] | null>(null);
+  const draggedAt = useRef(0);
+
+  useEffect(() => {
+    void refreshLibrary();
+    // Files may have changed while Nuzky was in the background; a list a few seconds old is kept.
+    const onFocus = () => void refreshLibrary(3000);
+    window.addEventListener("focus", onFocus);
+    // The open project is saved a moment after its last change, often after the list showed it as it was.
+    const offSaved = useEditor.subscribe((s, prev) => {
+      if (s.saveState === "saved" && prev.saveState !== "saved") void refreshLibrary();
+    });
+    // A search started in the launcher continues here.
+    const handed = useLibrary.getState().handoffQuery;
+    if (handed) {
+      setQuery(handed);
+      useLibrary.setState({ handoffQuery: null });
+    }
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      offSaved();
+    };
+  }, []);
+
+  const collectionOf = (id: string | null) => collections.find((c) => c.id === id);
+  const visibleProjects = useMemo(() => projects?.filter((p) => !(p.name === "Sample video" && (p.path === samplePath || hiddenSamples.includes(p.path)))) ?? null, [projects, samplePath, hiddenSamples]);
+  const inView = useMemo(() => (visibleProjects ?? []).filter((p) => filter === "all" || p.collection === filter), [visibleProjects, filter]);
+  const sorted = useMemo(() => (sort === "name" ? [...inView].sort((a, b) => byName.compare(a.name, b.name)) : inView), [inView, sort]);
+  const searching = query.trim().length > 0;
+  const found = useMemo(() => (searching ? sorted.filter((p) => matches(p, query, collections)) : sorted), [sorted, searching, query, collections]);
+  const firstRun = filter === "all" && !searching && onlyPristine(visibleProjects, current);
+  const hits = useMemo(
+    () => (said.result && said.query === query ? said.result.hits.filter((h) => inView.some((p) => p.path === h.path)) : []),
+    [said, query, inView],
+  );
+
+  // Focus follows a card asked for, such as a new duplicate, once it is listed.
+  const focusAsked = useLibrary((s) => s.focusPath);
+  useEffect(() => {
+    if (!focusAsked || !found.some((p) => p.path === focusAsked)) return;
+    setFocusPath(focusAsked);
+    useLibrary.setState({ focusPath: null });
+    requestAnimationFrame(() => {
+      const card = cardEl(focusAsked);
+      card?.focus();
+      card?.scrollIntoView({ block: "nearest" });
+    });
+  }, [focusAsked, found]);
+
+  const tabStop = found.some((p) => p.path === focusPath) ? focusPath : (found.find((p) => p.path === current?.path) ?? found[0])?.path;
+  const cardEl = (path: string) => grid.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`) ?? null;
+  /** Enter and ↓ in the search field move to the first result, so what opens next is in plain view. */
+  const focusFirstResult = () => {
+    const first = grid.current?.querySelector<HTMLElement>("[data-path]") ?? document.querySelector<HTMLElement>('section[aria-label="Said in your videos"] button');
+    if (first?.dataset.path) setFocusPath(first.dataset.path);
+    first?.focus();
+    first?.scrollIntoView({ block: "nearest" });
+  };
+
+  const select = (paths: string[]) => useLibrary.setState({ selection: paths });
+  const toggle = (p: LibraryProject, range: boolean) => {
+    const sel = useLibrary.getState().selection;
+    if (range && sel.length > 0) {
+      const from = found.findIndex((x) => x.path === sel[sel.length - 1]);
+      const to = found.findIndex((x) => x.path === p.path);
+      const span = found.slice(Math.min(from, to), Math.max(from, to) + 1).map((x) => x.path);
+      select([...new Set([...sel, ...span])]);
+    } else select(sel.includes(p.path) ? sel.filter((x) => x !== p.path) : [...sel, p.path]);
+    setFocusPath(p.path);
+  };
+  const open = (p: LibraryProject) => {
+    if (Date.now() - draggedAt.current < 300) return;
+    const reason = blocked(p);
+    if (reason) return useEditor.getState().toast({ kind: "info", text: reason });
+    openProject(p);
+  };
+
+  const showMenu = (items: MenuEntry[], at: MenuState["at"], label: string, keyboard: boolean, target?: string) =>
+    setMenu({ items, at, label, keyboard, target, back: document.activeElement instanceof HTMLElement ? document.activeElement : null });
+  const closeMenu = (chose: boolean) => {
+    const back = menu?.back;
+    setMenu(null);
+    if (!chose) back?.focus();
+    // A chosen item may move focus on, as Rename and Duplicate do; otherwise it goes back, not to the page.
+    else requestAnimationFrame(() => (!document.activeElement || document.activeElement === document.body) && back?.focus());
+  };
+
+  const cardMenu = (p: LibraryProject): MenuEntry[] => {
+    const sel = selection.includes(p.path) && selection.length > 1 ? selection : [p.path];
+    const many = sel.length > 1;
+    const reason = blocked(p);
+    const shared = (useLibrary.getState().projects ?? []).filter((x) => sel.includes(x.path)).map((x) => x.collection);
+    const same = shared.every((c) => c === shared[0]) ? shared[0] : undefined;
+    return [
+      { label: "Open", icon: <FolderOpen size={15} />, shortcut: "Enter", run: () => open(p), disabled: many ? "Open one project at a time." : reason },
+      { label: "Rename", icon: <Pencil size={15} />, shortcut: "F2", run: () => useLibrary.setState({ renaming: p.path }), disabled: many ? "Rename one project at a time." : reason },
+      { label: "Duplicate", icon: <Copy size={15} />, shortcut: "Ctrl+D", run: () => void duplicateProject(p), disabled: many ? "Duplicate one project at a time." : p.state === "broken" ? reason : null },
+      {
+        label: "Move to collection",
+        icon: <FolderInput size={15} />,
+        disabled: p.state === "broken" ? reason : null,
+        submenu: [
+          { label: "No collection", checked: same === null, run: () => void moveToCollection(sel, null) },
+          ...collections.map((c) => ({ label: c.name, checked: same === c.id, run: () => void moveToCollection(sel, c.id) })),
+          "separator" as const,
+          { label: "New collection…", icon: <FolderPlus size={15} />, run: () => setCreating(sel) },
+        ],
+      },
+      { label: "Show in folder", icon: <Folder size={15} />, run: () => void revealItemInDir(p.path), disabled: many ? "Show one project at a time." : null },
+      "separator",
+      {
+        label: many ? `Move ${sel.length} to Trash` : "Move to Trash",
+        icon: <Trash2 size={15} />,
+        shortcut: "Delete",
+        danger: true,
+        run: () => void trashProjects(sel),
+        disabled: trashBlocked(sel) ?? (p.state === "busy" ? reason : null),
+      },
+    ];
+  };
+
+  const openCardMenu = (p: LibraryProject, at: { x: number; y: number }, keyboard: boolean) => {
+    if (!selection.includes(p.path)) select([]);
+    setFocusPath(p.path);
+    showMenu(cardMenu(p), at, p.name, keyboard, p.path);
+  };
+
+  /** Dragging cards onto a collection in the sidebar moves them there. */
+  const startDrag = (p: LibraryProject, e: PointerEvent<HTMLDivElement>) => {
+    const start = { x: e.clientX, y: e.clientY };
+    const paths = selection.includes(p.path) ? selection : [p.path];
+    let dragging = false;
+    const target = (x: number, y: number) => document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null;
+    followPointer({
+      move: (ev) => {
+        if (!dragging && Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > 5) dragging = p.state !== "broken";
+        if (dragging) setDrag({ paths, x: ev.clientX, y: ev.clientY, over: target(ev.clientX, ev.clientY) });
+      },
+      up: (ev) => {
+        if (!dragging) return;
+        draggedAt.current = Date.now();
+        setDrag(null);
+        const over = target(ev.clientX, ev.clientY);
+        if (over) void moveToCollection(paths, over);
+      },
+      cancel: () => setDrag(null),
+    });
+  };
+
+  /** Arrow keys move between cards by where they sit, Enter opens, Space selects. */
+  const onGridKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const el = (e.target as HTMLElement).closest<HTMLElement>("[data-path]");
+    const p = el && found.find((x) => x.path === el.dataset.path);
+    if (!el || !p) return;
+    const mod = e.ctrlKey || e.metaKey;
+    const go = (path: string | undefined) => {
+      if (!path) return;
+      e.preventDefault();
+      setFocusPath(path);
+      const card = cardEl(path);
+      card?.focus();
+      card?.scrollIntoView({ block: "nearest" });
+    };
+    const cards = [...(grid.current?.querySelectorAll<HTMLElement>("[data-path]") ?? [])];
+    const index = cards.indexOf(el);
+    const vertical = (dir: 1 | -1) => {
+      const r = el.getBoundingClientRect();
+      const rows = cards.filter((c) => (dir === 1 ? c.getBoundingClientRect().top > r.bottom : c.getBoundingClientRect().bottom < r.top));
+      if (rows.length === 0) return undefined;
+      const row = dir === 1 ? Math.min(...rows.map((c) => c.getBoundingClientRect().top)) : Math.max(...rows.map((c) => c.getBoundingClientRect().top));
+      const centre = (c: HTMLElement) => c.getBoundingClientRect().left + c.getBoundingClientRect().width / 2;
+      return rows
+        .filter((c) => Math.abs(c.getBoundingClientRect().top - row) < 4)
+        .sort((a, b) => Math.abs(centre(a) - centre(el)) - Math.abs(centre(b) - centre(el)))[0]?.dataset.path;
+    };
+    if (e.key === "ArrowRight") go(cards[index + 1]?.dataset.path);
+    else if (e.key === "ArrowLeft") go(cards[index - 1]?.dataset.path);
+    else if (e.key === "ArrowDown") go(vertical(1));
+    else if (e.key === "ArrowUp") go(vertical(-1));
+    else if (e.key === "Home") go(cards[0]?.dataset.path);
+    else if (e.key === "End") go(cards[cards.length - 1]?.dataset.path);
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      open(p);
+    } else if (e.key === " ") {
+      e.preventDefault();
+      toggle(p, e.shiftKey);
+    } else if (e.key === "F2" && !blocked(p)) {
+      e.preventDefault();
+      useLibrary.setState({ renaming: p.path });
+    } else if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      void trashProjects(selection.length > 0 ? selection : [p.path]);
+    } else if (mod && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      select(found.map((x) => x.path));
+    } else if (mod && e.key.toLowerCase() === "d" && p.state !== "broken") {
+      e.preventDefault();
+      void duplicateProject(p);
+    } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+      e.preventDefault();
+      const r = el.getBoundingClientRect();
+      openCardMenu(p, { x: r.left + 12, y: r.top + 24 }, true);
+    } else if (e.key === "Escape" && selection.length > 0) {
+      e.preventDefault();
+      e.stopPropagation();
+      select([]);
+    }
+  };
+
+  // Keys of the home screen: Esc goes back to the editor, typing searches.
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (menu || useLibrary.getState().pendingSwitch || document.querySelector("dialog[open]") || useStyle.getState().learnOpen || useSetup.getState().open) return;
+      const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+      // The style page has no search; its fields take what is typed.
+      const style = useLibrary.getState().page === "style";
+      if (useLibrary.getState().page === "viral") return;
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+      if (e.key === "Escape" && !typing) {
+        if (useLibrary.getState().selection.length > 0) select([]);
+        else showEditor();
+      } else if (mod && (key === "k" || key === "f") && !style) {
+        e.preventDefault();
+        searchField.current?.focus();
+        searchField.current?.select();
+      } else if (mod && key === "z" && !e.shiftKey && !typing) {
+        // Undo here takes back the last Trash, move or deleted collection, while its toast still offers it.
+        if (undoLastToast()) e.preventDefault();
+      } else if (mod && key === "j" && style) {
+        e.preventDefault();
+        toggleStyleChat();
+      } else if (mod && key === "o") {
+        e.preventDefault();
+        void openProjectFile();
+      } else if (mod && key === "n") {
+        e.preventDefault();
+        const r = document.querySelector("[data-new-project]")?.getBoundingClientRect();
+        if (r) showMenu(newProjectItems(), { x: r.right, y: r.bottom + 6, align: "end" }, "New project", true);
+      } else if (!typing && !style && !mod && !e.altKey && e.key.length === 1 && e.key !== " ") {
+        // Typing anywhere starts a search, as in the launcher.
+        e.preventDefault();
+        searchField.current?.focus();
+        setQuery((q) => q + e.key);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  const title = filter === "all" ? "Všechny projekty" : (collectionOf(filter)?.name ?? "Všechny projekty");
+  const sections = useMemo(() => {
+    // A few projects need no groups: each card says when it was opened.
+    if (searching || sort === "name" || found.length < 12) return [{ title: null as string | null, items: found }];
+    const groups: { title: string | null; items: LibraryProject[] }[] = [];
+    for (const p of found) {
+      const period = periodOf(p.modifiedMs);
+      const last = groups[groups.length - 1];
+      if (last?.title === period) last.items.push(p);
+      else groups.push({ title: period, items: [p] });
+    }
+    return groups;
+  }, [found, searching, sort]);
+
+  const buttonsInBar = useWindowButtons((s) => s.inBar);
+  return (
+    <div className="flex h-full flex-col bg-bg" aria-label="Projects">
+      <header data-tauri-drag-region="deep" className={`flex h-12 shrink-0 items-center gap-2 px-1.5 ${buttonsInBar ? "pl-[78px]" : ""}`}>
+        <Button variant="bar" pill title="Back to the editor (Esc)" onClick={() => showEditor()} className="max-w-[340px] min-w-0">
+          <ChevronLeft size={15} className="shrink-0" />
+          <span className="truncate">{current?.project.name ?? "Editor"}</span>
+        </Button>
+        <div className="flex-1" />
+        <AiRunBar />
+        <JobIndicator />
+        {page === "style" && <AiButton />}
+      </header>
+      <div className="flex min-h-0 flex-1 gap-1.5 px-1.5 pb-1.5">
+        <Sidebar projects={visibleProjects} drag={drag} creating={creating} setCreating={setCreating} showMenu={showMenu} />
+        <main className="pane relative flex min-w-0 flex-1 flex-col" aria-label={page === "viral" ? "Viral Lab" : page === "style" ? "Your style" : title}>
+          {page === "viral" ? <ViralLab /> : page === "style" ? (
+            <StylePage />
+          ) : (
+            <>
+          <div className="flex h-16 shrink-0 items-center gap-2 pl-6 pr-4">
+            <h1 className="max-w-[40%] shrink-0 truncate text-[17px] font-semibold text-fg">{title}</h1>
+            {projects && !firstRun && <span className="tabular shrink-0 text-[13px] text-muted">{inView.length}</span>}
+            <div className="min-w-4 flex-1" />
+            {!firstRun && (
+              <SearchField ref={searchField} value={query} onChange={setQuery} onEnter={focusFirstResult} onDown={focusFirstResult} />
+            )}
+            {!firstRun && (
+            <Button
+              variant="ghost"
+              aria-haspopup="menu"
+              title="Sort projects"
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                showMenu(
+                  [
+                    { label: "Recent", checked: sort === "opened", run: () => setSort("opened") },
+                    { label: "Name", checked: sort === "name", run: () => setSort("name") },
+                  ],
+                  { x: r.right, y: r.bottom + 6, align: "end" },
+                  "Sort by",
+                  e.detail === 0,
+                );
+              }}
+              className="shrink-0"
+            >
+              <ArrowUpDown size={14} /> {sort === "name" ? "Name" : "Recent"} <ChevronDown size={13} />
+            </Button>
+            )}
+            <IconButton label="Open file… (Ctrl+O)" onClick={() => void openProjectFile()}>
+              <FolderOpen size={16} />
+            </IconButton>
+            <Button
+              variant="primary"
+              data-new-project
+              aria-haspopup="menu"
+              title="New project (Ctrl+N)"
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                showMenu(newProjectItems(), { x: r.right, y: r.bottom + 6, align: "end" }, "New project", e.detail === 0);
+              }}
+              className="shrink-0"
+            >
+              <Plus size={15} /> Nový projekt <ChevronDown size={13} />
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-24">
+            {firstRun ? (
+              <>
+                <FirstRun />
+              </>
+            ) : projects === null ? (
+              loadError ? (
+                <Empty icon={<AlertCircle size={28} className="text-danger" />} title="Your projects couldn't be listed">
+                  <span className="block">{loadError}</span>
+                  <Button pill onClick={() => void refreshLibrary()} className="mt-4">
+                    Try again
+                  </Button>
+                </Empty>
+              ) : (
+                <Skeleton />
+              )
+            ) : (
+              <>
+                {found.length > 0 && (
+                  <div ref={grid} role="listbox" aria-label="Projects" aria-multiselectable onKeyDown={onGridKey} className="flex flex-col gap-7 pt-1">
+                    {sections.map((section) => (
+                      <section key={section.title ?? "all"} role="group" aria-label={section.title ?? undefined}>
+                        {(section.title ?? (searching ? "Projekty" : null)) && <h2 className="mb-3 text-[13px] font-semibold text-fg">{section.title ?? "Projekty"}</h2>}
+                        <div className="grid grid-cols-[repeat(auto-fill,minmax(148px,168px))] gap-x-4 gap-y-5">
+                          {section.items.map((p) => (
+                            <ProjectCard
+                              key={p.path}
+                              p={p}
+                              focusable={p.path === tabStop}
+                              selected={selection.includes(p.path)}
+                              menuOpen={menu?.target === p.path}
+                              selecting={selection.length > 0}
+                              onOpen={() => open(p)}
+                              onToggle={(e) => toggle(p, e.shiftKey)}
+                              onMenu={(at, keyboard) => openCardMenu(p, at, keyboard)}
+                              onDragStart={(e) => startDrag(p, e)}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                )}
+                {searching && <SaidResults query={query} said={said} hits={hits} projects={visibleProjects ?? []} first={found.length === 0} />}
+                {found.length === 0 && !searching && filter !== "all" && (
+                  <Empty icon={<Folder size={28} className="text-muted" />} title={`No projects in ${title} yet`}>
+                    <span className="block">Drag projects onto it from All projects, or start a new one here.</span>
+                    <Button pill onClick={() => useLibrary.setState({ filter: "all" })} className="mt-4">
+                      Show all projects
+                    </Button>
+                  </Empty>
+                )}
+                {searching && found.length === 0 && hits.length === 0 && !said.searching && said.query === query && (
+                  <div className="flex flex-col items-center gap-2 pt-16 text-[13px] text-muted">
+                    <span>Nothing matches “{query.trim()}”{filter === "all" ? "" : ` in ${title}`}.</span>
+                    <Button variant="ghost" onClick={() => setQuery("")} className="text-accent! hover:text-accent!">
+                      Clear search
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+            </>
+          )}
+          {selection.length > 0 && page === "projects" && <SelectionBar showMenu={showMenu} newCollection={setCreating} />}
+          {fileDrag && (
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-[12px] bg-black/45">
+              <div className="overlay flex w-[320px] flex-col items-center gap-2 rounded-[20px] px-6 py-7 text-center">
+                <Upload size={28} className="text-accent" />
+                <div className="text-[15px] font-semibold text-fg">Drop to start a new project</div>
+                <div className="text-[13px] text-muted">It takes the format of the first video.</div>
+              </div>
+            </div>
+          )}
+        </main>
+        {page === "style" && chatOpen && <StyleChat />}
+      </div>
+      {menu && <Menu items={menu.items} at={menu.at} label={menu.label} keyboard={menu.keyboard} onClose={closeMenu} />}
+      {drag && (
+        <div className="pointer-events-none fixed z-[120] rounded-lg bg-raised px-2.5 py-1 text-[12px] font-medium text-fg shadow-lg shadow-black/50 ring-1 ring-white/10" style={{ left: drag.x + 12, top: drag.y + 10 }}>
+          {drag.paths.length === 1 ? (projects?.find((p) => p.path === drag.paths[0])?.name ?? "Project") : `${drag.paths.length} projects`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SearchField({ ref, value, onChange, onEnter, onDown }: { ref: Ref<HTMLInputElement>; value: string; onChange: (v: string) => void; onEnter: () => void; onDown: () => void }) {
+  return (
+    <label className="relative flex h-8 w-[300px] min-w-[180px] shrink items-center">
+      <Search size={14} className="pointer-events-none absolute left-2.5 text-muted" />
+      <input
+        ref={ref}
+        type="search"
+        value={value}
+        placeholder="Search names and what was said"
+        aria-label="Search projects and what was said in them"
+        title="Search (Ctrl+K)"
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && value) {
+            e.stopPropagation();
+            onChange("");
+          } else if (e.key === "Enter") onEnter();
+          else if (e.key === "ArrowDown") {
+            e.preventDefault();
+            onDown();
+          }
+        }}
+        className={`h-8 w-full text-ellipsis rounded-lg border border-white/[.08] bg-white/[.055] pl-8 text-[13px] text-fg outline-none placeholder:text-muted focus:border-accent [&::-webkit-search-cancel-button]:hidden ${value ? "pr-7" : "pr-2"}`}
+      />
+      {value && (
+        <button type="button" aria-label="Clear search" title="Clear search" onClick={() => onChange("")} className="absolute right-1.5 flex h-5 w-5 items-center justify-center rounded-full text-muted hover:bg-white/[.08] hover:text-fg">
+          <X size={12} />
+        </button>
+      )}
+    </label>
+  );
+}
+
+/**
+ * What the search through speech could not cover: nothing transcribed yet, or which projects were
+ * searched by name only. `inScope` limits the projects named to those shown.
+ */
+export function SpeechNote({ query, said, hits, projects, inScope }: { query: string; said: SaidState; hits: number; projects: LibraryProject[]; inScope: (p: LibraryProject) => boolean }) {
+  const result = said.result && said.query === query ? said.result : null;
+  if (!result || said.searching) return null;
+  const untranscribed = result.untranscribed.map((path) => projects.find((p) => p.path === path)).filter((p): p is LibraryProject => !!p && inScope(p));
+  const note = (text: string) => (
+    <p className="flex items-start gap-1.5 py-1 text-[12px] text-muted">
+      <Info size={13} className="mt-px shrink-0" />
+      {text}
+    </p>
+  );
+  if (result.transcribed === 0) return note("None of your projects is transcribed yet, so only names were searched. Transcribe a project in its Transcript tab.");
+  return (
+    <>
+      {hits === 0 && <p className="py-1 text-[13px] text-muted">Nobody says “{query.trim()}” in your transcribed videos.</p>}
+      {untranscribed.length > 0 &&
+        note(
+          untranscribed.length <= 2
+            ? `${untranscribed.map((p) => p.name).join(" and ")} ${untranscribed.length === 1 ? "isn't" : "aren't"} transcribed, so only ${untranscribed.length === 1 ? "its name was" : "their names were"} searched.`
+            : `${untranscribed.length} projects aren't transcribed, so only their names were searched.`,
+        )}
+    </>
+  );
+}
+
+type SaidState = { query: string; result: Said | null; searching: boolean };
+
+/** Quotes of where the words were said, each opening its project at that moment. */
+function SaidResults({ query, said, hits, projects, first }: { query: string; said: SaidState; hits: Said["hits"]; projects: LibraryProject[]; /** No project names above it. */ first: boolean }) {
+  const filter = useLibrary((s) => s.filter);
+  if (fold(query).replace(/\s+/g, "").length < 2) return null;
+  return (
+    <section aria-label="Said in your videos" className={first ? "pt-1" : "mt-8"}>
+      <h2 className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-fg">
+        Said in your videos
+        {said.searching && <Loader2 size={13} className="animate-spin text-muted" aria-label="Searching" />}
+      </h2>
+      <div className="flex flex-col gap-0.5">
+        {hits.map((hit) => {
+          const p = projects.find((x) => x.path === hit.path);
+          if (!p) return null;
+          return (
+            <button
+              key={`${hit.path}:${hit.startUs}`}
+              type="button"
+              onClick={() => openProject(p, hit.startUs)}
+              title={`Open ${p.name} at ${formatLength(hit.startUs)}`}
+              className="-mx-2 flex items-center gap-3 rounded-lg px-2 py-1.5 text-left transition-colors duration-[120ms] hover:bg-white/[.06]"
+            >
+              <span className="relative h-10 w-10 shrink-0 overflow-hidden rounded-md bg-stage">
+                <Poster p={p} box={1} compact />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-baseline gap-2">
+                  <span className="truncate text-[13px] font-medium text-fg">{p.name}</span>
+                  <span className="tabular shrink-0 text-[12px] text-muted">{formatLength(hit.startUs)}</span>
+                </span>
+                <Quote hit={hit} />
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      <SpeechNote query={query} said={said} hits={hits.length} projects={projects} inScope={(p) => filter === "all" || p.collection === filter} />
+    </section>
+  );
+}
+
+export function Quote({ hit }: { hit: Said["hits"][number] }) {
+  return (
+    <span className="block truncate text-[12px] text-muted">
+      “{hit.before && "…"}
+      {hit.before} <mark className="rounded-[3px] bg-accent/25 px-0.5 text-fg">{hit.text}</mark> {hit.after}
+      {hit.after && "…"}”
+    </span>
+  );
+}
+
+/** The shapes of cards while the list loads, so nothing jumps when it arrives. */
+function Skeleton() {
+  return (
+    <div aria-busy aria-label="Loading projects" className="grid grid-cols-[repeat(auto-fill,minmax(148px,168px))] gap-x-4 gap-y-5 pt-1">
+      {Array.from({ length: 6 }, (_, i) => (
+        <div key={i}>
+          <div className="w-full rounded-[10px] bg-white/[.04]" style={{ aspectRatio: `${152 / 180}` }} />
+          <div className="mt-2.5 h-3 w-3/5 rounded bg-white/[.05]" />
+          <div className="mt-2 h-2.5 w-2/5 rounded bg-white/[.04]" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Empty({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col items-center gap-2 pt-24 text-center">
+      {icon}
+      <div className="text-[15px] font-semibold text-fg">{title}</div>
+      <div className="max-w-[360px] text-[13px] text-muted">{children}</div>
+    </div>
+  );
+}
+
+const FIRST_STEPS = [
+  ["Titulky ve vašem jazyce", "Vyberte jazyk v Titulcích nebo nechte editor jazyk rozpoznat."],
+  ["Střih pauz a přeřeknutí", "Upravte přepis nebo požádejte o střih AI."],
+  ["Export pro Reels a TikTok", "1080p ve formátu 9:16. Jiný formát vyberte u náhledu."],
+];
+
+/** No projects yet: the way from a talking head video to a post, and the formats to start empty. */
+function FirstRun() {
+  return (
+    <div className="mx-auto flex max-w-[748px] flex-col items-center gap-6 pt-16 text-center">
+      <div className="flex flex-col items-center gap-2">
+        <img src={madmanIcon} alt="" className="mb-2 size-12 rounded-xl" />
+        <p className="text-[12px] font-semibold tracking-[0.12em] text-accent">MADMAN CUT</p>
+        <h2 className="text-[22px] font-semibold tracking-[-0.02em] text-fg">Začněte své první video</h2>
+        <p className="text-[13px] text-muted">Vaše záběry, váš příběh. Vytvořte video podle sebe.</p>
+      </div>
+      <div className="-mt-2 flex gap-2">
+        <Button variant="primary" onClick={() => void pickVideosForNewProject()} className="h-9 px-4">
+          <Film size={16} /> Otevřít video…
+        </Button>
+        <Button onClick={trySample} className="h-9 px-4">
+          Přehrát návod
+        </Button>
+      </div>
+      <ol className="grid w-full grid-cols-3 gap-6 text-left">
+        {FIRST_STEPS.map(([title, line], i) => (
+          <li key={title} className="flex gap-2.5 rounded-xl border border-white/[.08] bg-white/[.025] p-3">
+            <span className="tabular flex size-5 shrink-0 items-center justify-center rounded-full bg-accent/15 text-[11px] font-semibold text-accent">{i + 1}</span>
+            <span>
+              <span className="block text-[13px] font-semibold text-fg">{title}</span>
+              <span className="mt-0.5 block text-[12px] text-muted">{line}</span>
+            </span>
+          </li>
+        ))}
+      </ol>
+      <div className="flex flex-col items-center gap-2 text-[13px] text-muted">
+        <p>
+          Chcete střih pomocí AI?{" "}
+          <button type="button" onClick={() => useSetup.getState().openSetup()} className="text-accent hover:underline">
+            Nastavit aplikaci
+          </button>{" "}
+          nebo{" "}
+          <button type="button" onClick={() => useEditor.setState({ connectOpen: true })} className="text-accent hover:underline">
+            připojit agenta
+          </button>{" "}
+          kterého už používáte, například Claude Code, Codex nebo Gemini.
+        </p>
+        <p>Video z telefonu můžete také přetáhnout do tohoto okna.</p>
+        <div className="flex items-center gap-1">
+          Nebo začněte prázdným projektem:
+          {FORMATS.map((f) => (
+            <Button key={f.label} variant="ghost" title={f.hint} onClick={() => newProject(f.width, f.height)} className="tabular h-7 px-2 text-[12px]">
+              <FormatShape width={f.width} height={f.height} size={12} /> {f.label}
+            </Button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** What can be done with the selected projects at once. */
+function SelectionBar({ showMenu, newCollection }: { showMenu: (items: MenuEntry[], at: MenuState["at"], label: string, keyboard: boolean) => void; newCollection: (paths: string[]) => void }) {
+  const selection = useLibrary((s) => s.selection);
+  const collections = useLibrary((s) => s.collections);
+  const editing = useEditor((s) => !!s.aiRun && selection.includes(s.snap?.path ?? ""));
+  return (
+    <div role="toolbar" aria-label="Selected projects" className="overlay absolute bottom-4 left-1/2 z-10 flex h-11 -translate-x-1/2 items-center gap-1 rounded-full pl-4 pr-1.5 text-[13px] text-fg">
+      <span className="tabular pr-2 font-medium">{selection.length} selected</span>
+      <span className="h-5 w-px bg-white/[.12]" />
+      <Button
+        variant="ghost"
+        pill
+        aria-haspopup="menu"
+        onClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          showMenu(
+            [
+              { label: "No collection", run: () => void moveToCollection(selection, null) },
+              ...collections.map((c) => ({ label: c.name, run: () => void moveToCollection(selection, c.id) })),
+              "separator" as const,
+              { label: "New collection…", icon: <FolderPlus size={15} />, run: () => newCollection(selection) },
+            ],
+            { x: r.left, y: r.top - 6, above: true },
+            "Move to collection",
+            e.detail === 0,
+          );
+        }}
+      >
+        <FolderInput size={14} /> Move to collection <ChevronDown size={13} />
+      </Button>
+      <Button
+        variant="ghost"
+        pill
+        disabled={editing}
+        disabledReason="The AI is editing the open project. Stop it first, then move it to the Trash."
+        onClick={() => void trashProjects(selection)}
+        className="text-danger! hover:text-danger!"
+      >
+        <Trash2 size={14} /> Move to Trash
+      </Button>
+      <span className="h-5 w-px bg-white/[.12]" />
+      <IconButton round label="Clear selection (Esc)" onClick={() => useLibrary.setState({ selection: [] })}>
+        <X size={15} />
+      </IconButton>
+    </div>
+  );
+}
+
+/** All projects, then the collections; projects dragged onto a collection move there. */
+function Sidebar({
+  projects,
+  drag,
+  creating,
+  setCreating,
+  showMenu,
+}: {
+  projects: LibraryProject[] | null;
+  drag: { over: string | null } | null;
+  /** Projects waiting for a new collection, or null; an empty list is a new collection from the sidebar. */
+  creating: string[] | null;
+  setCreating: (paths: string[] | null) => void;
+  showMenu: (items: MenuEntry[], at: MenuState["at"], label: string, keyboard: boolean) => void;
+}) {
+  const collections = useLibrary((s) => s.collections);
+  const filter = useLibrary((s) => s.filter);
+  const empty = onlyPristine(projects, useEditor((s) => s.snap));
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const count = (id: string) => projects?.filter((p) => p.collection === id).length ?? 0;
+  const page = useLibrary((s) => s.page);
+  const suggestions = useStyle((s) => s.view?.suggestions.length ?? 0);
+  const left = useSetup((s) => stepsLeft(s.states));
+  const pick = (id: string) => useLibrary.setState({ filter: id, page: "projects", selection: [] });
+
+  const rowKeys = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const rows = [...(e.currentTarget.closest("nav")?.querySelectorAll<HTMLElement>("[data-row]") ?? [])];
+    rows[rows.indexOf(e.currentTarget) + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
+  };
+  const collectionMenu = (c: Collection, at: { x: number; y: number }, keyboard: boolean) =>
+    showMenu(
+      [
+        { label: "Rename", icon: <Pencil size={15} />, shortcut: "F2", run: () => setRenaming(c.id) },
+        { label: "Delete collection", icon: <Trash2 size={15} />, danger: true, run: () => void deleteCollection(c.id) },
+      ],
+      at,
+      c.name,
+      keyboard,
+    );
+
+  return (
+    <div className="pane flex w-[232px] shrink-0 flex-col">
+      <div className="flex h-14 shrink-0 items-center gap-2.5 border-b border-white/[.07] px-3.5" aria-label="MadMan Cut">
+        <img src={madmanIcon} alt="" className="size-8 shrink-0 rounded-lg" />
+        <span className="min-w-0"><span className="block text-[13px] font-semibold text-fg">MadMan Cut</span><span className="block text-[11px] text-muted">Video studio</span></span>
+      </div>
+      <nav aria-label="Collections" className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
+        <Row icon={<Sparkles size={16} />} label="MADMAN Viral Lab" count={undefined} on={page === "viral"} onClick={() => useLibrary.setState({ page: "viral", selection: [] })} onKeyDown={rowKeys} />
+        <Row icon={<LayoutGrid size={16} />} label="Všechny projekty" count={empty ? 0 : projects?.length} on={page === "projects" && filter === "all"} onClick={() => pick("all")} onKeyDown={rowKeys} />
+        <Row
+          icon={<Split size={16} />}
+          label="Váš styl"
+          count={suggestions || undefined}
+          countLabel={suggestions === 1 ? "1 suggestion" : `${suggestions} suggestions`}
+          on={page === "style"}
+          onClick={() => useLibrary.setState({ page: "style", selection: [] })}
+          onKeyDown={rowKeys}
+        />
+        <Row
+          icon={<ListChecks size={16} />}
+          label="Nastavení"
+          count={left || undefined}
+          countLabel={left === 1 ? "1 step left" : `${left} steps left`}
+          on={false}
+          onClick={() => useSetup.getState().openSetup()}
+          onKeyDown={rowKeys}
+        />
+        <Row icon={<Compass size={16} />} label="Průvodce" count={undefined} on={false} onClick={trySample} onKeyDown={rowKeys} />
+        <div className="mt-4 mb-1 flex h-7 items-center justify-between pl-2.5">
+          <h2 className="text-[13px] font-semibold text-fg">Sbírky</h2>
+          <IconButton label="New collection" onClick={() => setCreating([])} className="h-7 w-7">
+            <Plus size={15} />
+          </IconButton>
+        </div>
+        {collections.map((c) =>
+          renaming === c.id ? (
+            <NameField
+              key={c.id}
+              initial={c.name}
+              label="Collection name"
+              onDone={(name) => {
+                setRenaming(null);
+                if (name !== null) void renameCollection(c.id, name);
+              }}
+            />
+          ) : (
+            <Row
+              key={c.id}
+              drop={c.id}
+              dropping={!!drag}
+              over={drag?.over === c.id}
+              icon={<Folder size={16} />}
+              label={c.name}
+              count={count(c.id)}
+              on={page === "projects" && filter === c.id}
+              onClick={() => pick(c.id)}
+              onKeyDown={(e) => {
+                if (e.key === "F2") {
+                  e.preventDefault();
+                  setRenaming(c.id);
+                } else if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  collectionMenu(c, { x: r.left + 12, y: r.bottom }, true);
+                } else rowKeys(e);
+              }}
+              onContextMenu={(at) => collectionMenu(c, at, false)}
+            />
+          ),
+        )}
+        {creating !== null ? (
+          <NameField
+            initial=""
+            label="New collection name"
+            onDone={async (name) => {
+              const paths = creating;
+              setCreating(null);
+              if (name === null) return;
+              const created = await createCollection(name, paths);
+              if (!created) return;
+              if (paths.length === 0) pick(created.id);
+              else useEditor.getState().toast({ kind: "success", text: paths.length === 1 ? `Moved the project to ${created.name}.` : `Moved ${paths.length} projects to ${created.name}.` });
+            }}
+          />
+        ) : (
+          collections.length === 0 && (
+            <button
+              type="button"
+              data-row
+              onKeyDown={rowKeys}
+              onClick={() => setCreating([])}
+              className="flex h-8 items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] text-muted transition-colors duration-[120ms] hover:bg-white/[.05] hover:text-fg"
+            >
+              <FolderPlus size={16} /> Nová sbírka
+            </button>
+          )
+        )}
+      </nav>
+      <div className="shrink-0 p-2 pt-0">
+        <div role="group" aria-label="MadMan na sociálních sítích" className="mb-1 flex flex-wrap gap-1 px-1">
+          {SOCIAL_LINKS.map((link) => (
+            <button key={link.id} type="button" data-social={link.id} title={`Otevřít ${link.label} v prohlížeči`} onClick={() => void api.openSoundPage(link.url).catch(() => useEditor.getState().toast({ kind: "error", text: "Odkaz se nepodařilo otevřít v prohlížeči." }))} className="rounded-md px-1.5 py-1 text-[11px] text-muted hover:bg-white/[.06] hover:text-fg">
+              {link.label}
+            </button>
+          ))}
+        </div>
+        <VersionRow showMenu={showMenu} />
+      </div>
+    </div>
+  );
+}
+
+function Row({
+  icon,
+  label,
+  count,
+  countLabel,
+  on,
+  onClick,
+  onKeyDown,
+  onContextMenu,
+  drop,
+  dropping = false,
+  over = false,
+}: {
+  icon: ReactNode;
+  label: string;
+  count: number | undefined;
+  /** Says what the count is; such a count is news, in accent. */
+  countLabel?: string;
+  on: boolean;
+  onClick: () => void;
+  onKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => void;
+  onContextMenu?: (at: { x: number; y: number }) => void;
+  drop?: string;
+  dropping?: boolean;
+  over?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      data-row
+      data-drop={drop}
+      aria-current={on ? "page" : undefined}
+      onClick={onClick}
+      onKeyDown={onKeyDown}
+      onContextMenu={
+        onContextMenu &&
+        ((e) => {
+          e.preventDefault();
+          onContextMenu({ x: e.clientX, y: e.clientY });
+        })
+      }
+      className={`flex h-8 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] transition-colors duration-[120ms] ease-out ${
+        over ? "bg-accent/20 text-fg outline outline-1 -outline-offset-1 outline-accent" : on ? "bg-white/[.08] font-medium text-fg" : dropping ? "text-fg hover:bg-white/[.05]" : "text-fg/90 hover:bg-white/[.05]"
+      }`}
+    >
+      <span className={`shrink-0 ${on || over ? "text-accent" : "text-muted"}`}>{icon}</span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {count !== undefined &&
+        (countLabel ? (
+          <span className="tabular shrink-0 text-[12px] font-medium text-accent" aria-label={countLabel} title={countLabel}>
+            {count}
+          </span>
+        ) : (
+          <span className="tabular shrink-0 text-[12px] text-muted">{count}</span>
+        ))}
+    </button>
+  );
+}
+
+/** A name typed in place: Enter saves, Esc or an empty name cancels. */
+function NameField({ initial, label, onDone }: { initial: string; label: string; onDone: (name: string | null) => void }) {
+  const [draft, setDraft] = useState(initial);
+  const done = useRef(false);
+  const finish = (save: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    onDone(save && draft.trim() ? draft.trim() : null);
+  };
+  return (
+    <div className="flex h-8 shrink-0 items-center gap-2.5 rounded-lg bg-white/[.05] px-2.5">
+      <Folder size={16} className="shrink-0 text-accent" />
+      <input
+        autoFocus
+        aria-label={label}
+        placeholder="Collection name"
+        value={draft}
+        maxLength={60}
+        onFocus={(e) => e.currentTarget.select()}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => finish(true)}
+        onKeyDown={(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") finish(true);
+          if (e.key === "Escape") finish(false);
+        }}
+        className="min-w-0 flex-1 bg-transparent text-[13px] text-fg outline-none placeholder:text-muted"
+      />
+    </div>
+  );
+}
+

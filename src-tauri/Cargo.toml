@@ -1,0 +1,83 @@
+[package]
+name = "nuzky-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nuzky desktop video editor"
+
+[lib]
+name = "nuzky_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nuzky-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+madman-discovery = { path = "../crates/discovery" }
+nuzky-engine.workspace = true
+nuzky-session.workspace = true
+nuzky-mcp.workspace = true
+nuzky-agent.workspace = true
+nuzky-analysis.workspace = true
+nuzky-interchange.workspace = true
+nuzky-vision.workspace = true
+nuzky-chatgpt.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+log.workspace = true
+tauri = { version = "2.12.1", features = [] }
+tauri-plugin-dialog = "2.8.1"
+tauri-plugin-opener = "2.7.0"
+tauri-plugin-updater = "2.14.0"
+env_logger = "0.11"
+jiff = { version = "0.2.37", default-features = false, features = ["std"] }
+tungstenite = "0.30"
+cpal = "0.18.2"
+rtrb = "0.4"
+semver = "1.0.28"
+png = "0.18"
+base64 = "0.23"
+dirs = "6"
+dunce = "1.0.5"
+uuid = { version = "1", features = ["v4"] }
+percent-encoding = "2.3.2"
+whisper-rs = "0.16.0"
+ureq = "3.4.2"
+sha2 = "0.11.0"
+toml_edit = "0.25.15"
+trash = "5.2.9"
+unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+# The mock runtime of the ACL tests (src/acl_tests.rs). Not `unstable`: `cargo build --all-targets` would give the
+# app it too, and it changes how wry makes the window's webview.
+tauri = { version = "2.12.1", features = ["test"] }
+ts-rs.workspace = true
+minisign-verify = "0.3.0"
+nuzky-engine = { workspace = true, features = ["ts"] }
+nuzky-mcp = { workspace = true, features = ["ts"] }
+nuzky-chatgpt = { workspace = true, features = ["ts"] }
+
+# How the UI flows drive the app on macOS (src/test_bridge.rs, debug builds only). wry already uses these crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSNotification", "NSOperation", "NSProcessInfo", "NSString", "NSValue"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSBitmapImageRep", "NSButton", "NSControl", "NSEvent", "NSGraphicsContext", "NSImage", "NSImageRep", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "WKWebView", "WKSnapshotConfiguration"] }
+
+# Speech recognition on the GPU through Vulkan.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+nuzky-analysis = { workspace = true, features = ["gpu"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+# Free disk space, memory and the Windows version, which std does not tell. Already in the build through wry.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_SystemInformation"] }

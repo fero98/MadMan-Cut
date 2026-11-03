@@ -1,0 +1,23 @@
+/target
+/target-*
+/node_modules
+/dist
+/delivery
+/site/.next
+/site/.vercel
+/site/next-env.d.ts
+*.tsbuildinfo
+.DS_Store
+/.cargo/config.toml
+/src-tauri/gen/schemas
+*.local
+CLAUDE.local.md
+.playwright-mcp/
+/tmp-test/
+__pycache__/
+# Core dumps can hold memory contents such as tokens.
+*.core
+core.[0-9]*
+/core
+/src-tauri/core
+/crates/*/core

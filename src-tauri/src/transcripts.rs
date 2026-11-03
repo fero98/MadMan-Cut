@@ -1,0 +1,554 @@
+//! The Transcript panel. Words belong to media files and are placed through the clips that play
+//! them, so every edit keeps them right; cuts are planned exactly as for agents.
+
+use anyhow::{Context, Result, ensure};
+use nuzky_engine::{
+    Project,
+    edit::{TimeRange, merge_ranges},
+    model::MAX_CORRECTION_CHARS,
+};
+use nuzky_mcp::transcript::{self, Derived, Hesitation, Pause};
+use nuzky_session::{Expect, host::Host};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+
+use crate::{AppState, CmdResult, Snapshot};
+
+/// A word where it is heard on the timeline; `i` numbers it for cuts.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "TranscriptWord"))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Word {
+    i: usize,
+    start_us: i64,
+    end_us: i64,
+    text: String,
+    p: f32,
+    /// What recognition wrote, when the user corrected the word.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    original: Option<String>,
+}
+
+/// The timeline's speech as it is now, from the transcripts of its media files.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptView {
+    /// Sent back with a cut, which is refused once the speech moved or was recognised again.
+    key: String,
+    words: Vec<Word>,
+    pauses: Vec<Pause>,
+    /// Voice between words that recognition did not write, such as an "eee".
+    hesitations: Vec<Hesitation>,
+    /// Heard media without a transcript yet.
+    untranscribed: Vec<String>,
+    /// Earlier attempts of restarted sentences, unfinished ones included, and filler words: what
+    /// removing retakes cuts besides the pauses and hesitations.
+    retakes: usize,
+    fillers: usize,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCut {
+    snapshot: Snapshot,
+    /// Where the first cut starts, which is now where what followed it plays.
+    start_us: i64,
+    removed_us: i64,
+}
+
+/// What to cut; hesitations are named by the word before them.
+enum Target {
+    /// Inclusive word index ranges.
+    Words { delete: Vec<[usize; 2]>, hesitations: Vec<usize> },
+    /// The pauses of the view with this pause length, by index, or all of them.
+    Pauses { pause_us: i64, only: Option<Vec<usize>>, hesitations: Vec<usize> },
+    /// What the retake analysis suggests deleting, as for agents, every hesitation and every pause
+    /// longer than `pause_us`.
+    Retakes { pause_us: i64 },
+}
+
+fn view(host: &Host, pause_us: i64) -> Result<TranscriptView> {
+    let project = host.session.state()?.project;
+    let derived = transcript::derive(&project, &host.transcripts)?;
+    // Without words, or with voices overlapping so that no pause can be cut, there are none to show.
+    let pauses = transcript::pauses(&project, &derived, pause_us).unwrap_or_default();
+    let found = nuzky_analysis::retakes(&derived.words, &derived.languages);
+    let deleted: Vec<[usize; 2]> = found.groups.iter().flat_map(|g| g.delete.iter().copied()).collect();
+    let attempts: Vec<[usize; 2]> =
+        deleted.iter().copied().chain(found.unfinished.iter().map(|u| [u.from, u.to])).collect();
+    Ok(TranscriptView {
+        key: transcript::word_key(&project, &derived.words),
+        words: derived
+            .words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| Word {
+                i,
+                start_us: w.start_us,
+                end_us: w.end_us,
+                text: w.text.clone(),
+                p: w.probability,
+                original: derived.original(w).map(str::to_owned),
+            })
+            .collect(),
+        pauses,
+        hesitations: transcript::hesitations(&project, &derived, &host.cache_dir),
+        untranscribed: derived.untranscribed,
+        retakes: attempts.len(),
+        // Words; a filler in an attempt that goes anyway is not counted twice.
+        fillers: found
+            .fillers
+            .iter()
+            .filter(|f| !attempts.iter().any(|&[a, b]| a <= f.from && f.to <= b))
+            .map(|f| f.to + 1 - f.from)
+            .sum(),
+    })
+}
+
+/// What "Remove retakes and pauses" cuts: what the retake analysis suggests deleting, as for agents, the
+/// `hesitations` and every pause longer than `pause_us`.
+pub(crate) fn retake_ranges(
+    project: &Project,
+    derived: &Derived,
+    pause_us: i64,
+    hesitations: &[Hesitation],
+) -> Result<Vec<TimeRange>> {
+    // An untranscribed clip could hold the attempt worth keeping.
+    ensure!(derived.untranscribed.is_empty(), "TRANSCRIPT_MISSING: transcribe every heard clip first");
+    let delete = nuzky_analysis::retakes(&derived.words, &derived.languages).suggested_delete;
+    transcript::edit_ranges(project, derived, Some(delete.as_slice()), None, Some(pause_us), hesitations)
+}
+
+/// Applies the cut as one user edit. Returns the clips to select, where the cut starts and how much it removed.
+fn cut(host: &Host, key: &str, target: Target) -> Result<(Vec<String>, i64, i64)> {
+    let state = host.session.state()?;
+    let derived = transcript::derive(&state.project, &host.transcripts)?;
+    transcript::check_key(&state.project, &derived, key)?;
+    let found = transcript::hesitations(&state.project, &derived, &host.cache_dir);
+    let ranges = match target {
+        Target::Words { delete, hesitations } => {
+            let hesitations = transcript::pick_hesitations(&found, &hesitations)?;
+            transcript::edit_ranges(&state.project, &derived, Some(delete.as_slice()), None, None, &hesitations)?
+        }
+        Target::Pauses { pause_us, only, hesitations } => {
+            let pauses = transcript::pauses(&state.project, &derived, pause_us)?;
+            let picked = match only {
+                Some(only) => only
+                    .iter()
+                    .map(|&i| pauses.get(i).context("INVALID_PAUSE: no such pause"))
+                    .collect::<Result<Vec<_>>>()?,
+                None => pauses.iter().collect(),
+            };
+            let hesitations = transcript::pick_hesitations(&found, &hesitations)?;
+            let around = match hesitations.is_empty() {
+                true => Vec::new(),
+                false => transcript::edit_ranges(&state.project, &derived, None, None, None, &hesitations)?,
+            };
+            merge_ranges(
+                picked
+                    .into_iter()
+                    .map(|p| TimeRange { start_us: p.start_us, end_us: p.end_us })
+                    .chain(around)
+                    .collect(),
+            )
+        }
+        Target::Retakes { pause_us } => retake_ranges(&state.project, &derived, pause_us, &found)?,
+    };
+    ensure!(!ranges.is_empty(), "Nothing to cut");
+    let plan = transcript::plan_cut(&state.project, &derived, ranges)?;
+    let edited = host.session.edit(
+        vec![plan.edit],
+        None,
+        Expect { revision: None, speech_layout_key: Some(state.speech_layout_key) },
+    )?;
+    Ok((edited.outcome.select, plan.ranges[0].start_us, state.project.duration_us() - plan.preview.duration_us()))
+}
+
+/// Corrects words as one user edit, with the captions that show them. Returns how many
+/// caption clips changed.
+fn correct(host: &Host, key: &str, fixes: &[(usize, String, Option<String>)]) -> Result<usize> {
+    let state = host.session.state()?;
+    let derived = transcript::derive(&state.project, &host.transcripts)?;
+    transcript::check_word_key(&state.project, &derived, key)?;
+    let plan = transcript::plan_correction(&state.project, &derived, fixes)?;
+    if !plan.edits.is_empty() {
+        host.session.edit(
+            plan.edits,
+            None,
+            Expect { revision: Some(state.stamp.revision), speech_layout_key: None },
+        )?;
+    }
+    Ok(plan.captions.len())
+}
+
+/// Agents read error codes; the panel says what happened.
+fn explain(error: anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    match text.split_once(':').map(|(code, _)| code) {
+        Some("INVALID_CORRECTION") => {
+            format!("A word must be one line of 1 to {MAX_CORRECTION_CHARS} characters.")
+        }
+        Some("SPEECH_CHANGED" | "INVALID_HESITATION" | "WORD_MISMATCH") => {
+            "The transcript changed in the meantime. Check the words and try again.".into()
+        }
+        Some("TRANSCRIPT_MISSING") => "Transcribe the remaining clips first.".into(),
+        Some("OVERLAPPING_SPEECH" | "UNSAFE_CUT") => {
+            "These words overlap other speech, so they cannot be cut on their own.".into()
+        }
+        _ => text,
+    }
+}
+
+#[tauri::command]
+pub async fn transcript_view(app: AppHandle, pause_us: i64) -> CmdResult<TranscriptView> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AppState>().session.lock().unwrap().host.clone();
+        view(&host, pause_us).map_err(explain)
+    })
+    .await
+    .map_err(crate::err)?
+}
+
+#[tauri::command]
+pub async fn cut_words(
+    app: AppHandle,
+    key: String,
+    delete: Vec<[usize; 2]>,
+    hesitations: Vec<usize>,
+    expected_epoch: Option<String>,
+) -> CmdResult<TranscriptCut> {
+    apply_cut(app, key, Target::Words { delete, hesitations }, expected_epoch).await
+}
+
+#[tauri::command]
+pub async fn remove_pauses(
+    app: AppHandle,
+    key: String,
+    pause_us: i64,
+    only: Option<Vec<usize>>,
+    hesitations: Vec<usize>,
+    expected_epoch: Option<String>,
+) -> CmdResult<TranscriptCut> {
+    apply_cut(app, key, Target::Pauses { pause_us, only, hesitations }, expected_epoch).await
+}
+
+#[tauri::command]
+pub async fn remove_retakes(
+    app: AppHandle,
+    key: String,
+    pause_us: i64,
+    expected_epoch: Option<String>,
+) -> CmdResult<TranscriptCut> {
+    apply_cut(app, key, Target::Retakes { pause_us }, expected_epoch).await
+}
+
+#[derive(Deserialize)]
+pub struct WordFix {
+    i: usize,
+    text: String,
+    /// The word as the view showed it, so a view that went stale cannot correct another word.
+    expected: String,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WordsCorrected {
+    snapshot: Snapshot,
+    /// Caption clips that now show the corrected words.
+    captions: usize,
+}
+
+#[tauri::command]
+pub async fn correct_words(
+    app: AppHandle,
+    key: String,
+    corrections: Vec<WordFix>,
+    expected_epoch: Option<String>,
+) -> CmdResult<WordsCorrected> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let current = crate::lock_session(&state.session, expected_epoch.as_deref())?;
+        let fixes: Vec<_> = corrections.into_iter().map(|f| (f.i, f.text, Some(f.expected))).collect();
+        let captions = correct(&current.host, &key, &fixes).map_err(explain)?;
+        Ok(WordsCorrected { snapshot: current.snapshot(Vec::new())?, captions })
+    })
+    .await
+    .map_err(crate::err)?
+}
+
+async fn apply_cut(
+    app: AppHandle,
+    key: String,
+    target: Target,
+    expected_epoch: Option<String>,
+) -> CmdResult<TranscriptCut> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let current = crate::lock_session(&state.session, expected_epoch.as_deref())?;
+        let (select, start_us, removed_us) = cut(&current.host, &key, target).map_err(explain)?;
+        Ok(TranscriptCut { snapshot: current.snapshot(select)?, start_us, removed_us })
+    })
+    .await
+    .map_err(crate::err)?
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use nuzky_engine::{
+        Project,
+        edit::{EditCmd, new_id},
+        model::{Asset, AssetKind},
+        speech,
+    };
+    use nuzky_session::{
+        Mode, ProjectSession,
+        transcripts::{Record, TranscriptStore, VERSION},
+    };
+
+    /// A 10 s talk with a word every second and its stored transcript, plus music on its own track.
+    pub(crate) fn fixture() -> (std::path::PathBuf, Host) {
+        let dir = std::env::temp_dir().join(format!("app-transcripts-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asset = |id: &str, kind| {
+            let path = dir.join(id);
+            std::fs::write(&path, id).unwrap();
+            Asset {
+                id: id.into(),
+                name: id.into(),
+                path: path.to_string_lossy().into(),
+                kind,
+                duration_us: 10_000_000,
+                width: 1080,
+                height: 1920,
+                fps: 30.0,
+                has_audio: true,
+                rotation: 0,
+                mirror: false,
+                credit: None,
+                part: None,
+            }
+        };
+        let mut project = Project::new("transcript");
+        project
+            .apply(EditCmd::AddAssets {
+                assets: vec![asset("talk", AssetKind::Video), asset("music", AssetKind::Audio)],
+            })
+            .unwrap();
+        project.apply(EditCmd::AddClip { asset_id: "talk".into(), start_us: None, track_id: None }).unwrap();
+        project.apply(EditCmd::AddClip { asset_id: "music".into(), start_us: Some(0), track_id: None }).unwrap();
+        let path = dir.join("project.nuzky");
+        std::fs::write(&path, serde_json::to_vec(&project).unwrap()).unwrap();
+        let store = TranscriptStore::at(dir.join("transcripts")).unwrap();
+        let talk = &project.assets[0];
+        let words = (0..8)
+            .map(|i| speech::Word {
+                start_us: 500_000 + i * 1_000_000,
+                end_us: 900_000 + i * 1_000_000,
+                text: format!("w{i}"),
+                probability: 0.9,
+            })
+            .collect();
+        store
+            .put(
+                talk,
+                &Record {
+                    version: VERSION,
+                    fingerprint: store.fingerprint(talk).unwrap(),
+                    duration_us: talk.duration_us,
+                    model: "fixture".into(),
+                    language: "cs".into(),
+                    words,
+                    segments: vec![],
+                    alignment: None,
+                },
+            )
+            .unwrap();
+        let session = ProjectSession::open(&path, Mode::Write, None).unwrap();
+        (dir.clone(), Host { session, jobs: Default::default(), transcripts: store, cache_dir: dir.join("cache") })
+    }
+
+    #[test]
+    fn edits_and_undo_keep_the_transcript_and_word_cuts_leave_music_in_place() {
+        let (dir, host) = fixture();
+        let placed = |host: &Host| view(host, 300_000).unwrap();
+        let texts = |v: &TranscriptView| v.words.iter().map(|w| (w.text.clone(), w.start_us)).collect::<Vec<_>>();
+        let first = placed(&host);
+        assert_eq!(first.words.len(), 8);
+        assert!(first.untranscribed.is_empty());
+
+        let (_, start_us, removed_us) =
+            cut(&host, &first.key, Target::Words { delete: vec![[2, 3]], hesitations: vec![] }).unwrap();
+        let cut_view = placed(&host);
+        assert_eq!(cut_view.words.len(), 6);
+        // The cut keeps 0.12 s after w1; w4 now follows it.
+        assert_eq!(start_us, 1_900_000 + 120_000);
+        assert_eq!((cut_view.words[2].text.as_str(), cut_view.words[2].start_us), ("w4", 4_500_000 - removed_us));
+        let project = host.session.state().unwrap().project;
+        let music = &project.tracks.iter().find(|t| t.keep_in_place).unwrap().clips[0];
+        assert_eq!((music.start_us, music.duration_us), (0, 10_000_000));
+        assert!(
+            explain(cut(&host, &first.key, Target::Words { delete: vec![[0, 0]], hesitations: vec![] }).unwrap_err())
+                .starts_with("The transcript changed")
+        );
+
+        // Q over the first second and double speed: the words follow without recognising again.
+        host.session
+            .edit(
+                vec![EditCmd::RippleDeleteRanges {
+                    ranges: vec![TimeRange { start_us: 0, end_us: 1_000_000 }],
+                    keep_track_ids: None,
+                }],
+                None,
+                Expect::default(),
+            )
+            .unwrap();
+        let after_q = placed(&host);
+        assert_eq!(after_q.words[0].text, "w1");
+        let clip = host.session.state().unwrap().project.tracks[0].clips[0].id.clone();
+        host.session
+            .edit(
+                vec![
+                    serde_json::from_value(serde_json::json!({"type": "updateClip", "clipId": clip, "speed": 2}))
+                        .unwrap(),
+                ],
+                None,
+                Expect::default(),
+            )
+            .unwrap();
+        assert_eq!(placed(&host).words[0].start_us, after_q.words[0].start_us / 2);
+
+        host.session.undo().unwrap();
+        assert_eq!(texts(&placed(&host)), texts(&after_q));
+        host.session.undo().unwrap();
+        host.session.undo().unwrap();
+        assert_eq!(texts(&placed(&host)), texts(&first));
+        host.session.redo().unwrap();
+        assert_eq!(texts(&placed(&host)), texts(&cut_view));
+
+        let current = placed(&host);
+        assert!(!current.pauses.is_empty());
+        cut(&host, &current.key, Target::Pauses { pause_us: 300_000, only: None, hesitations: vec![] }).unwrap();
+        let tight = placed(&host);
+        assert_eq!(texts(&tight).len(), current.words.len());
+        assert!(tight.pauses.is_empty());
+        drop(host);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The fixture's talk prepared in the audio cache, as its 20 ms waveform peaks: a quiet room,
+    /// each word loud and an "eee" between w2 (2.5-2.9 s) and w3 (3.5-3.9 s) at 3.1-3.4 s.
+    fn prepare_sound(host: &Host) {
+        let project = host.session.state().unwrap().project;
+        let pcm = nuzky_engine::audio::pcm_path(&host.cache_dir, project.asset("talk").unwrap());
+        std::fs::create_dir_all(pcm.parent().unwrap()).unwrap();
+        std::fs::File::create(&pcm).unwrap().set_len(10 * 48_000 * 2 * 4).unwrap();
+        let mut peaks = vec![1u8; 500];
+        for i in 0..8 {
+            peaks[25 + 50 * i..45 + 50 * i].fill(127);
+        }
+        peaks[155..170].fill(102);
+        std::fs::write(nuzky_engine::audio::peaks_for(&pcm), peaks).unwrap();
+    }
+
+    #[test]
+    fn a_hesitation_shows_where_it_is_heard_and_goes_like_a_deleted_word() {
+        let (dir, host) = fixture();
+        assert!(view(&host, 300_000).unwrap().hesitations.is_empty(), "the sound is not prepared yet");
+        prepare_sound(&host);
+        let first = view(&host, 300_000).unwrap();
+        assert_eq!(first.hesitations, [Hesitation { after_word: 2, start_us: 3_100_000, end_us: 3_400_000 }]);
+        // A split where nothing is cut away leaves it as it was.
+        let clip = host.session.state().unwrap().project.tracks[0].clips[0].id.clone();
+        host.session
+            .edit(vec![EditCmd::SplitClip { clip_id: clip, at_us: 3_200_000 }], None, Expect::default())
+            .unwrap();
+        assert_eq!(view(&host, 300_000).unwrap().hesitations, first.hesitations);
+        host.session.undo().unwrap();
+        // As a deleted word: half the quiet on each side stays, at most 0.12 s after w2 and 0.08 s before w3.
+        let (_, start_us, removed_us) =
+            cut(&host, &first.key, Target::Pauses { pause_us: 300_000, only: Some(vec![]), hesitations: vec![2] })
+                .unwrap();
+        assert_eq!((start_us, removed_us), (3_000_000, 450_000));
+        assert!(view(&host, 300_000).unwrap().hesitations.is_empty());
+        host.session.undo().unwrap();
+        assert!(
+            explain(cut(&host, &first.key, Target::Words { delete: vec![], hesitations: vec![3] }).unwrap_err())
+                .starts_with("The transcript changed")
+        );
+        // At double speed it plays in half the time.
+        let clip = host.session.state().unwrap().project.tracks[0].clips[0].id.clone();
+        host.session
+            .edit(
+                vec![
+                    serde_json::from_value(serde_json::json!({"type": "updateClip", "clipId": clip, "speed": 2}))
+                        .unwrap(),
+                ],
+                None,
+                Expect::default(),
+            )
+            .unwrap();
+        let fast = view(&host, 300_000).unwrap();
+        assert_eq!(fast.hesitations, [Hesitation { after_word: 2, start_us: 1_550_000, end_us: 1_700_000 }]);
+        // Removing retakes and pauses takes it, though no pause does: its gap of 0.3 s is no longer than one.
+        assert!(fast.pauses.iter().all(|p| p.end_us <= 1_550_000 || p.start_us >= 1_700_000));
+        cut(&host, &fast.key, Target::Retakes { pause_us: 300_000 }).unwrap();
+        assert!(view(&host, 300_000).unwrap().hesitations.is_empty());
+        drop(host);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrected_word_shows_in_the_view_and_its_caption_and_one_undo_takes_both_back() {
+        let (dir, host) = fixture();
+        let segments = vec![nuzky_engine::edit::CaptionSegment {
+            start_us: 2_000_000,
+            end_us: 4_000_000,
+            text: "w2 w3".into(),
+            words: vec![],
+        }];
+        let style = nuzky_engine::edit::caption_presets()[0].style.clone();
+        host.session
+            .edit(
+                vec![EditCmd::AddCaptions { segments, style, anim_in: None, anim_out: None, transform: None }],
+                None,
+                Expect::default(),
+            )
+            .unwrap();
+        let caption = |host: &Host| {
+            let project = host.session.state().unwrap().project;
+            match &project.tracks.iter().find(|t| t.is_captions()).unwrap().clips[0].content {
+                nuzky_engine::model::ClipContent::Text { text, .. } => text.clone(),
+                _ => unreachable!(),
+            }
+        };
+        let first = view(&host, 300_000).unwrap();
+        assert_eq!(correct(&host, &first.key, &[(3, "tři".into(), Some("w3".into()))]).unwrap(), 1);
+        let fixed = view(&host, 300_000).unwrap();
+        assert_eq!((fixed.words[3].text.as_str(), fixed.words[3].original.as_deref()), ("tři", Some("w3")));
+        assert!(fixed.words.iter().filter(|w| w.i != 3).all(|w| w.original.is_none()));
+        assert_eq!(caption(&host), "w2 tři");
+        assert!(
+            explain(correct(&host, &first.key, &[(2, "dva".into(), None)]).unwrap_err())
+                .starts_with("The transcript changed")
+        );
+        assert!(
+            explain(correct(&host, &fixed.key, &[(2, "dva".into(), Some("w3".into()))]).unwrap_err())
+                .starts_with("The transcript changed")
+        );
+        let long = "x".repeat(MAX_CORRECTION_CHARS + 1);
+        assert!(
+            explain(correct(&host, &fixed.key, &[(2, long, None)]).unwrap_err()).starts_with("A word must be one line")
+        );
+        host.session.undo().unwrap();
+        assert_eq!(view(&host, 300_000).unwrap().words[3].text, "w3");
+        assert_eq!(caption(&host), "w2 w3");
+        drop(host);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
