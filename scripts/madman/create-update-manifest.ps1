@@ -10,6 +10,7 @@ $version = [string]$config.version
 if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw 'Invalid application version.' }
 $artifact = Get-Item -LiteralPath $Installer
 if ($artifact.Extension -ine '.exe') { throw 'Expected a Windows NSIS installer.' }
+if ($artifact.Name -notmatch '^[A-Za-z0-9._-]+$') { throw 'Use an installer name containing only letters, digits, dots, underscores and hyphens: GitHub can rename other characters.' }
 $signature = (Get-Content -LiteralPath ($artifact.FullName + '.sig') -Raw).Trim()
 $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($signature))
 if ($decoded -notmatch ("(?m)^trusted comment:.*(?:\t| )version:" + [regex]::Escape($version) + '(?:\s|$)')) {
