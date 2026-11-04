@@ -1,0 +1,36 @@
+{
+  "nuzkyPlugin": 2,
+  "id": "vhs",
+  "name": "Filmové VHS",
+  "description": "Retro vzhled videokazety: barevný posun, řádky a zrnění.",
+  "version": "1.0.0",
+  "effects": [
+    {
+      "id": "vhs",
+      "name": "Filmové VHS",
+      "params": [
+        {
+          "type": "number",
+          "id": "amount",
+          "label": "Intenzita",
+          "min": 0,
+          "max": 1,
+          "step": 0.05,
+          "default": 0.6
+        },
+        {
+          "type": "toggle",
+          "id": "lines",
+          "label": "Řádky",
+          "default": true
+        },
+        {
+          "type": "color",
+          "id": "tint",
+          "label": "Odstín",
+          "default": "#FFC890"
+        }
+      ]
+    }
+  ]
+}
