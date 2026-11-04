@@ -24,6 +24,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # The user commissioned this bundled tutorial for public distribution. Pin its bytes so a replacement
         # video does not silently pass the private-media check.
         (assets/madman/guide.mp4) [ "$(git show "$local_sha:$file" | sha256sum | cut -d' ' -f1)" = "a6c19cbc9666d726cad943a520ce7e6acf5d61a43b4a4333ee65e86dd4c3cf04" ] && continue ;;
+        (assets/madman/ai-guide.mp4) [ "$(git show "$local_sha:$file" | sha256sum | cut -d' ' -f1)" = "81774d8a0e2d072949b785528a7964c8c8c355c9719094c2eb3187f8b2384829" ] && continue ;;
       esac
       printf '%s\n' "$file"
     done)
