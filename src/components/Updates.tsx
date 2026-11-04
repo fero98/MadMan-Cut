@@ -34,7 +34,7 @@ function updateMenu(): MenuEntry[] {
  * Nuzky starts on the home screen, so a new version is seen at the next launch.
  */
 export function VersionRow({ showMenu }: { showMenu: ShowMenu }) {
-  const { version, enabled, latest, checking, install } = useUpdates();
+  const { version, enabled, latest, checking, checked, install } = useUpdates();
   const blocked = useRestartBlocker();
   if (!version) return null;
   if (!enabled) return <p className="flex h-8 items-center px-2.5 text-[12px] text-muted" title="Based on Nuzky · GPL-3.0-or-later">MadMan Cut {version}</p>;
@@ -55,8 +55,22 @@ export function VersionRow({ showMenu }: { showMenu: ShowMenu }) {
   const found = !!latest && (checking !== "manual" || !!install);
   const downloading = install?.stage === "downloading" ? install : null;
 
+  const updateNow = async () => {
+    if (install?.stage === "ready" || install?.stage === "installed") return void restartToUpdate();
+    if (!latest) await checkForUpdates(true);
+    if (useUpdates.getState().latest) await installUpdate();
+  };
+
   return (
     <div className="relative">
+      <div className="flex items-center justify-between gap-2 px-2.5 pb-1">
+        <span className="min-w-0 truncate text-[12px] text-muted">MadMan Cut {version}</span>
+        <button type="button" data-update-action onClick={() => void updateNow()} disabled={!!checking || (!!install && install.stage !== "ready" && install.stage !== "installed") || (!!blocked && !!install)}
+          className="shrink-0 rounded-md bg-[#c54b12] px-2.5 py-1.5 text-[12px] font-bold text-white hover:bg-[#e05a18] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-50">
+          {install?.stage === "ready" || install?.stage === "installed" ? "Restartovat" : checking ? "Kontroluji…" : "Aktualizovat"}
+        </button>
+      </div>
+      {checked && !latest && !checking && <p role="status" className="px-2.5 pb-1 text-[12px] text-[#8de3a6]">Verze je aktuální</p>}
       <button
         type="button"
         data-version
@@ -71,7 +85,7 @@ export function VersionRow({ showMenu }: { showMenu: ShowMenu }) {
           <>
             <Loader2 size={16} className="shrink-0 animate-spin text-accent" />
             <span className="min-w-0 flex-1 truncate font-semibold text-fg" role="status">
-              Downloading
+              Stahuji aktualizaci
               {downloading.percent !== null && <span className="tabular ml-1.5 text-[12px] font-medium text-accent">{downloading.percent}%</span>}
             </span>
           </>

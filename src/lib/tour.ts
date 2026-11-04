@@ -226,7 +226,7 @@ export function endTour() {
 /** Opens the MadMan guide without touching the current project. */
 export function trySample() {
   useSetup.getState().closeSetup();
-  useGuide.setState({ open: true });
+  useGuide.setState({ open: true, section: "general" });
 }
 
 /** Done's way on: the person's own video, as Open a talking head video… on the first start. */

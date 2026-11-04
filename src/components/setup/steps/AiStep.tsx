@@ -4,6 +4,7 @@ import { AlertTriangle, Check, ExternalLink } from "lucide-react";
 import { api, errorText, plainError } from "../../../lib/api";
 import { pickOneVideo } from "../../../lib/library";
 import { useSetup } from "../../../lib/setup";
+import { useGuide } from "../../../lib/guide";
 import { useEditor } from "../../../lib/store";
 import { useTour } from "../../../lib/tour";
 import type { AgentKind, AgentStatus } from "../../../lib/types";
@@ -109,6 +110,7 @@ function Agents() {
         <span className="block text-muted">Stačí jeden agent. MadMan Cut hledá jeho příkazový nástroj: Claude Code, Codex CLI nebo Antigravity CLI pro Gemini. Samotná desktopová aplikace jej nemusí obsahovat.</span>
         <span className="mt-1 block text-muted">Karty se neoznačují. Nainstalujte vybraný nástroj podle jeho návodu, přihlaste se a potom klikněte na Zkontrolovat znovu a Připojit.</span>
       </p>
+      <button type="button" className="self-start text-[13px] font-semibold text-accent hover:underline" onClick={() => useGuide.setState({ open: true, section: "ai" })}>Přehrát videonávod k připojení AI</button>
       <div className="flex flex-col gap-2">
         {AGENTS.map((agent) => (
           <AgentCard

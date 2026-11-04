@@ -1,12 +1,14 @@
 import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import guideVideo from "../../assets/madman/guide.mp4";
+import aiGuideVideo from "../../assets/madman/ai-guide.mp4";
 import { useGuide } from "../lib/guide";
 import { IconButton } from "./ui";
 
 /** Local subtitled guide. Closing removes the player and returns focus to its opener. */
 export function GuideDialog() {
   const open = useGuide((s) => s.open);
+  const section = useGuide((s) => s.section);
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -23,10 +25,10 @@ export function GuideDialog() {
       className="overlay m-auto w-[min(960px,calc(100vw-40px))] max-h-[calc(100vh-40px)] rounded-[20px] p-4 text-fg backdrop:bg-black/70"
     >
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 id="guide-title" className="text-[17px] font-semibold">Průvodce MadMan Cut</h2>
+        <h2 id="guide-title" className="text-[17px] font-semibold">{section === "ai" ? "Připojení AI – videonávod" : "Průvodce MadMan Cut"}</h2>
         <IconButton label="Zavřít průvodce" round onClick={() => useGuide.setState({ open: false })}><X size={16} /></IconButton>
       </div>
-      <video aria-label="Instruktážní video s českými titulky" className="block max-h-[calc(100vh-135px)] w-full rounded-xl bg-black" controls autoPlay muted playsInline preload="metadata" src={guideVideo} />
+      <video aria-label="Instruktážní video v češtině" className="block max-h-[calc(100vh-135px)] w-full rounded-xl bg-black" controls autoPlay muted playsInline preload="metadata" src={section === "ai" ? aiGuideVideo : guideVideo} />
       <p className="mt-2 text-[12px] text-muted">České titulky jsou součástí obrazu. Video je bez zvuku.</p>
     </dialog>
   );

@@ -27,6 +27,8 @@ type Updates = {
   canInstall: boolean;
   /** A check in flight; one the user asked for shows until it answers. */
   checking: "auto" | "manual" | null;
+  /** True only after a successful check in this session. */
+  checked: boolean;
   /** Installing `latest`: downloading (the percentage, null until the size is known), downloaded and waiting for a restart, being installed, or installed and waiting for a restart. */
   install: { stage: "downloading"; percent: number | null } | { stage: "ready" | "installing" | "installed" } | null;
 };
@@ -53,7 +55,7 @@ function load(): Partial<Saved> {
 let checkedAt = 0;
 let started = false;
 
-export const useUpdates = create<Updates>(() => ({ version: "", enabled: false, auto: true, latest: null, canInstall: false, checking: null, install: null }));
+export const useUpdates = create<Updates>(() => ({ version: "", enabled: false, auto: true, latest: null, canInstall: false, checking: null, checked: false, install: null }));
 
 function save() {
   const { version, auto, latest, canInstall } = useUpdates.getState();
@@ -82,7 +84,7 @@ function restarted(version: string, text: string) {
   } catch {
     return;
   }
-  if (note.from && note.from !== version) useEditor.getState().toast({ kind: "success", text: `Updated to Nuzky ${version}.` });
+  if (note.from && note.from !== version) useEditor.getState().toast({ kind: "success", text: `MadMan Cut byl aktualizován na verzi ${version}.` });
   if (note.view === "editor") showEditor();
   if (note.draft && !useAgent.getState().draft) useAgent.setState({ draft: note.draft });
 }
@@ -108,20 +110,21 @@ export async function checkForUpdates(manual: boolean) {
   try {
     const found = await api.checkForUpdate();
     const latest = found?.version ?? null;
-    useUpdates.setState({ latest, canInstall: !!found?.canInstall });
+    useUpdates.setState({ latest, canInstall: !!found?.canInstall, checked: true });
     if (asked()) {
       const toast = useEditor.getState().toast;
       if (latest)
         toast({
           kind: "info",
-          text: `Nuzky ${latest} is available.`,
-          action: found?.canInstall ? { label: "Update", run: () => void installUpdate(), valid: () => !useUpdates.getState().install } : { label: "Download from GitHub…", run: downloadUpdate },
+          text: `Je dostupná verze MadMan Cut ${latest}.`,
+          action: found?.canInstall ? { label: "Aktualizovat", run: () => void installUpdate(), valid: () => !useUpdates.getState().install } : { label: "Stáhnout z GitHubu…", run: downloadUpdate },
         });
-      else toast({ kind: "success", text: `Nuzky ${version} is the latest version.` });
+      else toast({ kind: "success", text: `MadMan Cut ${version} je aktuální.` });
     }
   } catch (e) {
+    useUpdates.setState({ checked: false });
     console.warn("Update check failed", errorText(e));
-    if (asked()) useEditor.getState().toast({ kind: "error", text: "Couldn't check for updates. Check your internet connection or try again later." });
+    if (asked()) useEditor.getState().toast({ kind: "error", text: "Aktualizaci se nepodařilo ověřit. Zkontrolujte internet a zkuste to znovu." });
   } finally {
     useUpdates.setState({ checking: null });
     save();
@@ -186,9 +189,9 @@ export async function installUpdate() {
   if (restartBlocker()) return;
   useEditor.getState().toast({
     kind: "info",
-    text: `Nuzky ${latest} is ready.`,
+    text: `MadMan Cut ${latest} je připraven k instalaci.`,
     // Work that starts meanwhile takes the toast away, and Restart to update waits for it.
-    action: { label: "Restart now", run: () => void restartToUpdate(), valid: () => useUpdates.getState().install?.stage === "ready" && !restartBlocker() },
+    action: { label: "Restartovat nyní", run: () => void restartToUpdate(), valid: () => useUpdates.getState().install?.stage === "ready" && !restartBlocker() },
   });
 }
 
