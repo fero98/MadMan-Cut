@@ -35,7 +35,7 @@ export function GuideDialog() {
         <p className="mt-2 text-[13px] text-muted">Otevřete projekt a tlačítkem AI připojte dostupného agenta. Výsledek vždy zkontrolujte; možnosti závisí na připojeném agentovi a jeho nastavení.</p>
         <ul className="mt-3 flex list-disc flex-col gap-2 pl-5 text-[13px] text-fg/85">
           <li><strong>Vlastní doplněk:</strong> v editoru otevřete Doplňky → Nainstalované → Vytvořit doplněk a popište, co má dělat. Třeba: „Odstraň klipy kratší než půl sekundy.“</li>
-          <li><strong>Vlastní obrazový efekt:</strong> požádejte AI o doplněk s efektem, například o vzhled staré videokazety. Hotový efekt přidáte vybranému klipu v Úpravy → Efekty.</li>
+          <li><strong>Vlastní obrazový efekt:</strong> požádejte AI o doplněk s efektem, například o vzhled staré videokazety. Hotový efekt přidáte vybranému klipu v Adjust (Úpravy) → Efekty.</li>
           <li><strong>Střih a titulky:</strong> požádejte AI například o odstranění dlouhých pauz nebo vytvoření titulků. U mluveného slova může být nejprve potřeba přepis.</li>
           <li><strong>Hudba a formát:</strong> můžete požádat o vyhledání zvuku a pomoc s úpravou videa na výšku. Dostupnost závisí na zdrojích a připojení.</li>
           <li><strong>Váš styl:</strong> v části Váš styl zapište pravidla, například aby hudba nepřehlušovala řeč. AI se jimi při práci může řídit.</li>

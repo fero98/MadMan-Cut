@@ -396,7 +396,7 @@ export function openPlugin(id: string | null) {
 }
 
 /** Where a plugin's effects are added. */
-export const ADD_EFFECTS = "Vyberte video nebo obrázek a přidejte je v části Úpravy → Efekty.";
+export const ADD_EFFECTS = "Vyberte video nebo obrázek a přidejte je v části Adjust (Úpravy) → Efekty.";
 
 /** Why the plugin cannot run on this project now, or null. */
 export function pluginBlocked(p: Plugin, hasWords: boolean): string | null {
