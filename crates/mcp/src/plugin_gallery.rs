@@ -330,10 +330,10 @@ fn effect_file(id: &str) -> String {
 
 fn need_line(need: Need) -> &'static str {
     match need {
-        Need::Words => "Reads the words said in the video.",
-        Need::Silences => "Reads where the sound goes quiet.",
-        Need::Loudness => "Reads how loud the sound is.",
-        Need::Beats => "Reads the beats of the music.",
+        Need::Words => "Čte slova vyslovená ve videu.",
+        Need::Silences => "Zjišťuje tichá místa ve zvuku.",
+        Need::Loudness => "Zjišťuje hlasitost zvuku.",
+        Need::Beats => "Zjišťuje údery v hudbě.",
     }
 }
 
@@ -347,7 +347,16 @@ fn size(bytes: u64) -> String {
 }
 
 fn counted(n: usize, one: &str) -> String {
-    format!("{n} {one}{}", if n == 1 { "" } else { "s" })
+    let word = match (one, n) {
+        ("picture", 1) => "obrázek",
+        ("picture", 2..=4) => "obrázky",
+        ("picture", _) => "obrázků",
+        ("sound", 1) => "zvuk",
+        ("sound", 2..=4) => "zvuky",
+        ("sound", _) => "zvuků",
+        _ => one,
+    };
+    format!("{n} {word}")
 }
 
 /// One thing a plugin can do, compared between versions without the sizes of its files.
@@ -404,18 +413,18 @@ fn listed(names: &[String]) -> String {
     match names {
         [] => String::new(),
         [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [rest @ .., last] => format!("{} a {last}", rest.join(", ")),
     }
 }
 
 fn sentence(fact: Fact, manifest: &Manifest, files: &[Listing]) -> String {
     match fact {
-        Fact::Changes => "Can change anything in this project, as one step you can undo.".into(),
+        Fact::Changes => "Může změnit celý projekt. Změnu lze vrátit zpět jedním krokem.".into(),
         Fact::Adds { pictures, sounds } => {
             let what = match (pictures, sounds) {
                 (p, 0) => counted(p, "picture"),
                 (0, s) => counted(s, "sound"),
-                (p, s) => format!("{} and {}", counted(p, "picture"), counted(s, "sound")),
+                (p, s) => format!("{} a {}", counted(p, "picture"), counted(s, "sound")),
             };
             let bytes = manifest
                 .files
@@ -424,27 +433,26 @@ fn sentence(fact: Fact, manifest: &Manifest, files: &[Listing]) -> String {
                 .filter_map(|name| files.iter().find(|f| f.path == *name))
                 .map(|f| f.size)
                 .sum();
-            format!("Adds {what} of its own to your video and Media ({}).", size(bytes))
+            format!("Přidá {what} do videa a médií ({}).", size(bytes))
         }
-        Fact::Looks(names) if names.len() == 1 => format!("Adds a look you can put on clips: {}.", names[0]),
-        Fact::Looks(names) => format!("Adds {} looks you can put on clips: {}.", names.len(), listed(&names)),
+        Fact::Looks(names) if names.len() == 1 => format!("Přidá vzhled, který můžete použít na klipy: {}.", names[0]),
+        Fact::Looks(names) => format!("Přidá {} vzhledů, které můžete použít na klipy: {}.", names.len(), listed(&names)),
         Fact::Uses(tool) => match tool {
-            Tool::BuildCaptions => "Adds captions to your video.",
-            Tool::ApplyZooms => "Adds zooms to your video.",
-            Tool::ApplyMotion => "Adds motion to your video.",
+            Tool::BuildCaptions => "Přidá do videa titulky.",
+            Tool::ApplyZooms => "Přidá do videa přiblížení.",
+            Tool::ApplyMotion => "Přidá do videa pohyb.",
         }
         .into(),
         Fact::Reads(need) => need_line(need).into(),
-        Fact::Sealed => "Can't reach the internet, your files or other apps.".into(),
+        Fact::Sealed => "Nemá přístup k internetu, vašim souborům ani jiným aplikacím.".into(),
         Fact::Preview => {
-            "Installing runs nothing. Opening it shows a preview: its script runs without changing your project.".into()
+            "Instalací se nic nespustí. Po otevření se zobrazí náhled: skript běží bez změny projektu.".into()
         }
         Fact::OnPress => format!(
-            "It changes your project only when you press {}, or by itself after import or before export if you turn \
-             that on.",
-            if manifest.actions.len() > 1 { "one of its buttons" } else { "its button" }
+            "Projekt změní až po stisknutí {} nebo automaticky po importu či před exportem, pokud tuto možnost zapnete.",
+            if manifest.actions.len() > 1 { "některého z jeho tlačítek" } else { "jeho tlačítka" }
         ),
-        Fact::OnClips => "Installing changes no project. Its looks show only on clips you put them on.".into(),
+        Fact::OnClips => "Instalace nemění žádný projekt. Vzhledy se zobrazí jen na klipech, na které je použijete.".into(),
     }
 }
 
@@ -1249,14 +1257,13 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Can change anything in this project, as one step you can undo.",
-                "Adds 1 picture and 1 sound of its own to your video and Media (4 KB).",
-                "Reads the words said in the video.",
-                "Reads the beats of the music.",
-                "Can't reach the internet, your files or other apps.",
-                "Installing runs nothing. Opening it shows a preview: its script runs without changing your project.",
-                "It changes your project only when you press its button, or by itself after import or before export if \
-                 you turn that on.",
+                "Může změnit celý projekt. Změnu lze vrátit zpět jedním krokem.",
+                "Přidá 1 obrázek a 1 zvuk do videa a médií (4 KB).",
+                "Čte slova vyslovená ve videu.",
+                "Zjišťuje údery v hudbě.",
+                "Nemá přístup k internetu, vašim souborům ani jiným aplikacím.",
+                "Instalací se nic nespustí. Po otevření se zobrazí náhled: skript běží bez změny projektu.",
+                "Projekt změní až po stisknutí jeho tlačítka nebo automaticky po importu či před exportem, pokud tuto možnost zapnete.",
             ]
         );
         assert!(entry.summary.iter().all(|line| !line.new), "a plugin not installed has nothing new");
@@ -1289,9 +1296,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Adds a look you can put on clips: VHS.",
-                "Can't reach the internet, your files or other apps.",
-                "Installing changes no project. Its looks show only on clips you put them on.",
+                "Přidá vzhled, který můžete použít na klipy: VHS.",
+                "Nemá přístup k internetu, vašim souborům ani jiným aplikacím.",
+                "Instalace nemění žádný projekt. Vzhledy se zobrazí jen na klipech, na které je použijete.",
             ]
         );
         home.install(&gallery, "vhs", None).unwrap();
@@ -1343,8 +1350,7 @@ mod tests {
         assert_eq!(entry.state, State::Available);
         assert_eq!(
             entry.summary.last().unwrap().text,
-            "It changes your project only when you press one of its buttons, or by itself after import or before \
-             export if you turn that on."
+            "Projekt změní až po stisknutí některého z jeho tlačítek nebo automaticky po importu či před exportem, pokud tuto možnost zapnete."
         );
         home.install(&gallery, "beep", None).unwrap();
         assert!(home.plugins().join("beep/plugin.json").is_file());
@@ -1360,7 +1366,7 @@ mod tests {
         let gallery = gallery_of("http://127.0.0.1:9", &[(manifest, files)]);
         let entry = entries(&gallery, &Home::new().plugins()).remove(0);
         let lines: Vec<_> = entry.summary.iter().map(|line| line.text.as_str()).collect();
-        assert_eq!(lines[1], "Adds 1 picture of its own to your video and Media (1 KB).");
+        assert_eq!(lines[1], "Přidá 1 obrázek do videa a médií (1 KB).");
     }
 
     #[test]
@@ -1383,8 +1389,8 @@ mod tests {
         assert_eq!(
             new,
             [
-                "Adds 2 pictures and 1 sound of its own to your video and Media (4 KB).",
-                "Reads where the sound goes quiet.",
+                "Přidá 2 obrázky a 1 zvuk do videa a médií (4 KB).",
+                "Zjišťuje tichá místa ve zvuku.",
             ]
         );
         // A copy edited until its manifest no longer reads could do only what every plugin can.
@@ -1395,11 +1401,10 @@ mod tests {
         assert_eq!(
             old,
             [
-                "Can change anything in this project, as one step you can undo.",
-                "Can't reach the internet, your files or other apps.",
-                "Installing runs nothing. Opening it shows a preview: its script runs without changing your project.",
-                "It changes your project only when you press its button, or by itself after import or before export if \
-                 you turn that on.",
+                "Může změnit celý projekt. Změnu lze vrátit zpět jedním krokem.",
+                "Nemá přístup k internetu, vašim souborům ani jiným aplikacím.",
+                "Instalací se nic nespustí. Po otevření se zobrazí náhled: skript běží bez změny projektu.",
+                "Projekt změní až po stisknutí jeho tlačítka nebo automaticky po importu či před exportem, pokud tuto možnost zapnete.",
             ]
         );
     }
@@ -1417,7 +1422,7 @@ mod tests {
         let lines: Vec<_> = entry.summary.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
             lines[2..5],
-            ["Adds captions to your video.", "Adds motion to your video.", "Reads the words said in the video."]
+            ["Přidá do videa titulky.", "Přidá do videa pohyb.", "Čte slova vyslovená ve videu."]
         );
         home.install(&gallery, "beep", None).unwrap();
         // 1.1 also zooms.
@@ -1428,7 +1433,7 @@ mod tests {
         let entry = entries(&gallery_of(&server.repo, &[(newer, files)]), &home.plugins()).remove(0);
         assert_eq!(entry.state, State::Update);
         let new: Vec<_> = entry.summary.iter().filter(|line| line.new).map(|line| line.text.as_str()).collect();
-        assert_eq!(new, ["Adds zooms to your video."]);
+        assert_eq!(new, ["Přidá do videa přiblížení."]);
     }
 
     #[test]

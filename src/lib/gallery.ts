@@ -28,7 +28,7 @@ export interface GalleryPlugin {
   installedVersion: string | null;
 }
 
-export const REFUSED = "Nuzky won’t install this plugin. It includes files plugins aren’t allowed to have.";
+export const REFUSED = "MadMan Cut tento doplněk nenainstaluje. Obsahuje soubory, které nejsou povolené.";
 
 interface Gallery {
   tab: "installed" | "gallery";
@@ -110,11 +110,11 @@ export async function installGalleryPlugin(p: GalleryPlugin, replacing: GalleryS
     // Opening it would run its preview, so only the user's Open does.
     useEditor.getState().toast({
       kind: "success",
-      text: `Installed “${p.name}”.`,
-      action: { label: "Open", run: () => openPlugin(p.id), valid: () => usePlugins.getState().list?.some((q) => q.id === p.id) ?? true },
+      text: `Doplněk „${p.name}“ byl nainstalován.`,
+      action: { label: "Otevřít", run: () => openPlugin(p.id), valid: () => usePlugins.getState().list?.some((q) => q.id === p.id) ?? true },
     });
   } catch (e) {
-    // Nothing was installed, so the version the user turned them on for is still the one that runs.
+    // Nic nebylo nainstalováno, so the version the user turned them on for is still the one that runs.
     const { auto } = usePlugins.getState();
     for (const trigger of was) if (!auto[trigger].includes(p.id)) setAuto(p.id, trigger, true);
     const text = errorText(e);
@@ -132,21 +132,21 @@ export const stopInstall = () => void api.cancelGalleryInstall();
 export function galleryError(text: string, install = false): { title: string; detail: string; retry: boolean } {
   const code = text.match(/^[A-Z][A-Z_]+(?=:)/)?.[0] ?? "";
   const detail = code ? text.slice(code.length + 1).trim() : text;
-  if (code === "OFFLINE") return { title: "Can’t reach the gallery", detail: "Check your internet connection.", retry: true };
-  if (code === "GALLERY_BUSY") return { title: "GitHub is busy", detail: "Try again in a few minutes.", retry: true };
-  if (code === "GALLERY_FAILED") return { title: "The gallery isn’t answering", detail: "Try again later.", retry: true };
-  if (code === "GALLERY_NEWER") return { title: "This gallery needs a newer Nuzky", detail: "", retry: false };
-  if (code === "PLUGIN_API_NEWER") return { title: "This plugin needs a newer Nuzky", detail: "", retry: false };
-  if (code === "GALLERY_GONE") return { title: "No longer in the gallery", detail: "", retry: false };
-  if (code === "GALLERY_STALE") return { title: "The gallery changed", detail: "Check what this plugin does now, then try again.", retry: false };
-  if (code === "GALLERY_CHANGED") return { title: "Your copy changed", detail: "Check what Replace will do now, then try again.", retry: false };
-  if (code === "GALLERY_INSTALLING") return { title: "Another plugin is installing", detail: "Wait for it to finish.", retry: true };
-  if (code === "GALLERY_REFUSED") return { title: "Nothing was installed", detail: REFUSED, retry: false };
-  if (code === "GALLERY_BROKEN") return { title: "Nothing was installed", detail, retry: false };
+  if (code === "OFFLINE") return { title: "Galerie není dostupná", detail: "Zkontrolujte připojení k internetu.", retry: true };
+  if (code === "GALLERY_BUSY") return { title: "GitHub je momentálně přetížený", detail: "Zkuste to za několik minut.", retry: true };
+  if (code === "GALLERY_FAILED") return { title: "Galerie neodpovídá", detail: "Zkuste to později.", retry: true };
+  if (code === "GALLERY_NEWER") return { title: "Galerie vyžaduje novější MadMan Cut", detail: "", retry: false };
+  if (code === "PLUGIN_API_NEWER") return { title: "Doplněk vyžaduje novější MadMan Cut", detail: "", retry: false };
+  if (code === "GALLERY_GONE") return { title: "Doplněk už v galerii není", detail: "", retry: false };
+  if (code === "GALLERY_STALE") return { title: "Galerie se změnila", detail: "Zkontrolujte, co doplněk nyní dělá, a zkuste to znovu.", retry: false };
+  if (code === "GALLERY_CHANGED") return { title: "Vaše kopie se změnila", detail: "Zkontrolujte, co nahrazení provede, a zkuste to znovu.", retry: false };
+  if (code === "GALLERY_INSTALLING") return { title: "Instaluje se jiný doplněk", detail: "Počkejte na dokončení.", retry: true };
+  if (code === "GALLERY_REFUSED") return { title: "Nic nebylo nainstalováno", detail: REFUSED, retry: false };
+  if (code === "GALLERY_BROKEN") return { title: "Nic nebylo nainstalováno", detail, retry: false };
   if (code === "GALLERY_CORRUPT")
-    return install ? { title: "Nothing was installed", detail: "A file didn’t download correctly. Try again.", retry: true } : { title: "The gallery didn’t load", detail: "Try again later.", retry: true };
-  if (code.startsWith("STORE_")) return { title: "Couldn’t save the plugin", detail, retry: true };
-  return { title: "Something went wrong", detail, retry: true };
+    return install ? { title: "Nic nebylo nainstalováno", detail: "Soubor se nestáhl správně. Zkuste to znovu.", retry: true } : { title: "Galerii se nepodařilo načíst", detail: "Zkuste to později.", retry: true };
+  if (code.startsWith("STORE_")) return { title: "Doplněk se nepodařilo uložit", detail, retry: true };
+  return { title: "Něco se nepodařilo", detail, retry: true };
 }
 
 export function size(bytes: number) {

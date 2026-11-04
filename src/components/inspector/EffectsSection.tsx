@@ -34,7 +34,7 @@ export function EffectsSection({ clip }: { clip: Clip }) {
   const add = (e: PluginEffect) =>
     set((all) => [...all, { plugin: e.plugin, effect: e.id, name: e.name, version: e.version, params: Object.fromEntries(e.params.map((p) => [p.id, p.default])) }]);
   const blocked =
-    effects.length >= MAX_EFFECTS ? `a clip has at most ${MAX_EFFECTS} effects` : installed.length === 0 ? "no plugin adds one yet; ask the AI to make one, such as a VHS look" : null;
+    effects.length >= MAX_EFFECTS ? `klip může mít nejvýše ${MAX_EFFECTS} efekty` : installed.length === 0 ? "žádný doplněk zatím nepřidává efekt; požádejte AI o jeho vytvoření" : null;
   const showMenu = (e: MouseEvent<HTMLButtonElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     setMenu({ x: r.right, y: r.bottom + 4, keyboard: e.detail === 0 });
@@ -44,10 +44,10 @@ export function EffectsSection({ clip }: { clip: Clip }) {
   const none = !!list && installed.length === 0 && effects.length === 0;
   return (
     <Section
-      title="Effects"
+      title="Efekty"
       actions={
         none ? undefined : (
-          <IconButton label={blocked ? `Add effect: ${blocked}` : "Add effect"} className={QUIET} disabled={!!blocked} onClick={showMenu}>
+          <IconButton label={blocked ? `Přidat efekt: ${blocked}` : "Přidat efekt"} className={QUIET} disabled={!!blocked} onClick={showMenu}>
             <Plus size={14} />
           </IconButton>
         )
@@ -55,9 +55,9 @@ export function EffectsSection({ clip }: { clip: Clip }) {
     >
       {none && (
         <div className="flex flex-col items-start gap-2">
-          <p className="text-[12px] text-muted">Effects come from plugins.</p>
+          <p className="text-[12px] text-muted">Efekty pocházejí z doplňků.</p>
           <Button variant="ghost" className="-ml-2 h-7 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={makeEffectWithAi}>
-            <Sparkles size={13} /> Make an effect
+            <Sparkles size={13} /> Vytvořit efekt
           </Button>
         </div>
       )}
@@ -72,7 +72,7 @@ export function EffectsSection({ clip }: { clip: Clip }) {
           >
             <div className="flex min-h-6 items-center justify-between gap-2">
               <span className="truncate text-[12px] font-medium text-fg/80">{effect.name}</span>
-              <IconButton label={`Remove ${effect.name}`} className={QUIET} onClick={() => set((all) => all.filter((_, i) => i !== index))}>
+              <IconButton label={`Odebrat ${effect.name}`} className={QUIET} onClick={() => set((all) => all.filter((_, i) => i !== index))}>
                 <X size={14} />
               </IconButton>
             </div>
@@ -84,7 +84,7 @@ export function EffectsSection({ clip }: { clip: Clip }) {
                 </p>
                 {issue.broken && (
                   <Button variant="ghost" className="ml-3 h-7 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => fixEffectsWithAi([issue])}>
-                    <Sparkles size={13} /> Fix with AI
+                    <Sparkles size={13} /> Opravit pomocí AI
                   </Button>
                 )}
               </div>
@@ -103,9 +103,9 @@ export function EffectsSection({ clip }: { clip: Clip }) {
       })}
       {menu && (
         <Menu
-          items={installed.map((e) => ({ label: named(e), disabled: e.error ? `Has an error: ${plainDetail(e.error)}` : null, run: () => add(e) }))}
+          items={installed.map((e) => ({ label: named(e), disabled: e.error ? `Obsahuje chybu: ${plainDetail(e.error)}` : null, run: () => add(e) }))}
           at={{ x: menu.x, y: menu.y, align: "end" }}
-          label="Add effect"
+          label="Přidat efekt"
           keyboard={menu.keyboard}
           onClose={() => setMenu(null)}
         />

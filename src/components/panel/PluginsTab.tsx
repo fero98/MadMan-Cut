@@ -25,19 +25,19 @@ export function PluginMark({ plugin, size = 30 }: { plugin: Pick<Plugin, "name" 
 }
 
 export const showFolder = (id: string | null) =>
-  api.showPluginFolder(id).catch((e) => useEditor.getState().toast({ kind: "error", text: `Couldn't show the folder: ${errorText(e)}` }));
+  api.showPluginFolder(id).catch((e) => useEditor.getState().toast({ kind: "error", text: `Složku se nepodařilo otevřít: ${errorText(e)}` }));
 
 export function pluginMenu(p: Plugin): MenuEntry[] {
   return [
-    { label: "Change with AI", icon: <Sparkles size={14} />, run: () => changeWithAi(p) },
-    { label: "Show in folder", icon: <FolderOpen size={14} />, run: () => void showFolder(p.id) },
+    { label: "Upravit pomocí AI", icon: <Sparkles size={14} />, run: () => changeWithAi(p) },
+    { label: "Zobrazit ve složce", icon: <FolderOpen size={14} />, run: () => void showFolder(p.id) },
     "separator",
-    { label: "Move to Trash", icon: <Trash2 size={14} />, danger: true, run: () => void removePlugin(p) },
+    { label: "Přesunout do koše", icon: <Trash2 size={14} />, danger: true, run: () => void removePlugin(p) },
   ];
 }
 
 function Row({ plugin: p, open }: { plugin: Plugin; open: boolean }) {
-  const runs = usePlugins((s) => [s.auto.import.includes(p.id) && "After import", s.auto.export.includes(p.id) && "Before export"].filter(Boolean).join(" · "));
+  const runs = usePlugins((s) => [s.auto.import.includes(p.id) && "Po importu", s.auto.export.includes(p.id) && "Před exportem"].filter(Boolean).join(" · "));
   const broken = brokenEffects(p);
   const [menu, setMenu] = useState<{ x: number; y: number; keyboard: boolean } | null>(null);
   const showMenu = (e: MouseEvent<HTMLButtonElement>) => {
@@ -58,11 +58,11 @@ function Row({ plugin: p, open }: { plugin: Plugin; open: boolean }) {
           <span className="truncate font-medium text-fg">{p.name}</span>
           {p.error ? (
             <span className="line-clamp-2 text-[12px] text-danger">
-              {runs && <span className="text-muted">{runs} · </span>}Can’t load: {plainDetail(p.error)}
+              {runs && <span className="text-muted">{runs} · </span>}Nelze načíst: {plainDetail(p.error)}
             </span>
           ) : broken.length > 0 ? (
             <span className="truncate text-[12px] text-warn">
-              {runs && <span className="text-muted">{runs} · </span>}Can’t draw {broken.map((e) => e.name).join(", ")}
+              {runs && <span className="text-muted">{runs} · </span>}Nelze vykreslit {broken.map((e) => e.name).join(", ")}
             </span>
           ) : (
             <span className="truncate text-[12px] text-muted">{[runs, p.description].filter(Boolean).join(" · ")}</span>
@@ -71,15 +71,15 @@ function Row({ plugin: p, open }: { plugin: Plugin; open: boolean }) {
       </button>
       {p.error && fixable(p.error) && (
         <Button variant="ghost" className="h-7 shrink-0 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => fixWithAi(p, p.error ?? "")}>
-          <Sparkles size={13} /> Fix with AI
+          <Sparkles size={13} /> Opravit pomocí AI
         </Button>
       )}
       {!p.error && broken.length > 0 && (
         <Button variant="ghost" className="h-7 shrink-0 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => fixWithAi(p, broken.map((e) => e.error).join("\n"))}>
-          <Sparkles size={13} /> Fix with AI
+          <Sparkles size={13} /> Opravit pomocí AI
         </Button>
       )}
-      <IconButton label={`More for ${p.name}`} className={`size-7 shrink-0 ${open || menu ? "" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"}`} onClick={showMenu}>
+      <IconButton label={`Další možnosti: ${p.name}`} className={`size-7 shrink-0 ${open || menu ? "" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"}`} onClick={showMenu}>
         <MoreHorizontal size={16} />
       </IconButton>
       {menu && <Menu items={pluginMenu(p)} at={{ x: menu.x, y: menu.y, align: "end" }} label={p.name} keyboard={menu.keyboard} onClose={() => setMenu(null)} />}
@@ -141,7 +141,8 @@ function Installed() {
           <Sparkles size={13} /> Vytvořit doplněk
         </Button>
       </div>
-      <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" aria-label="Plugins">
+      <p className="shrink-0 px-3.5 pb-2 text-[12px] text-muted">Tip: S připojenou AI si můžete vytvořit vlastní doplněk nebo obrazový efekt. Klikněte na „Vytvořit doplněk“ a popište svůj nápad.</p>
+      <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" aria-label="Doplňky">
         {list.map((p) => (
           <Row key={p.id} plugin={p} open={p.id === open} />
         ))}
@@ -160,7 +161,7 @@ export function PluginsTab() {
   const tab = useGallery((s) => s.tab);
   return (
     <div className="flex min-h-0 flex-1 flex-col pt-3">
-      <TabBar group="plugins" label="Plugins" tabs={TABS} value={tab} onChange={showTab} />
+      <TabBar group="plugins" label="Doplňky" tabs={TABS} value={tab} onChange={showTab} />
       <TabPanel group="plugins" id={tab} className="flex min-h-0 flex-1 flex-col">
         {tab === "installed" ? <Installed /> : <GalleryList />}
       </TabPanel>

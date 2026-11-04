@@ -75,7 +75,7 @@ export interface PluginPreview {
 /** When a plugin the user turned on runs by itself: after an import they make in the app, or before an export. */
 export type Trigger = "import" | "export";
 
-const WHEN: Record<Trigger, string> = { import: "after import", export: "before export" };
+const WHEN: Record<Trigger, string> = { import: "po importu", export: "před exportem" };
 
 interface PluginsState {
   list: Plugin[] | null;
@@ -203,11 +203,11 @@ const listed = ({ id, error, manifest: m, runs, effects }: ListedPlugin): Plugin
     id,
     name,
     description: m?.description ?? "",
-    actions: m?.actions?.length ? m.actions : [{ id: "run", label: m?.action ?? "Run" }],
+    actions: m?.actions?.length ? m.actions : [{ id: "run", label: m?.action ?? "Spustit" }],
     needs: m?.needs ?? [],
     inputs: m?.inputs ?? [],
     sections: m?.sections ?? [],
-    error: m ? null : (error ?? "Can't load."),
+    error: m ? null : (error ?? "Nelze načíst."),
     runs,
     effects: (m?.effects ?? []).map((e) => ({
       plugin: id,
@@ -234,7 +234,7 @@ export async function loadPlugins() {
     });
   } catch (e) {
     usePlugins.setState({ list: [] });
-    useEditor.getState().toast({ kind: "error", text: `Couldn't read your plugins: ${errorText(e)}` });
+    useEditor.getState().toast({ kind: "error", text: `Doplňky se nepodařilo načíst: ${errorText(e)}` });
   }
 }
 
@@ -276,21 +276,20 @@ export function useEffectsVersion() {
 
 /** What an effect's row in the clip inspector says about it. */
 export const issueRow = (i: EffectIssue) =>
-  i.broken ? `${i.name} has an error, so the clip is drawn without it.` : `${i.name} isn't installed on this computer, so the clip is drawn without it.`;
+  i.broken ? `Efekt ${i.name} obsahuje chybu, proto se klip zobrazí bez něj.` : `Efekt ${i.name} není na tomto počítači nainstalován, proto se klip zobrazí bez něj.`;
 
 /** The warning about effects the video plays without, all missing or all broken. */
 export function drawnWithout(issues: EffectIssue[]) {
-  const one = issues.length === 1;
   const who = names(issues.map((i) => i.name));
   return issues[0].broken
-    ? `${who} ${one ? "has an error" : "have errors"}, so the video plays without ${one ? "it" : "them"}.`
-    : `${who} ${one ? "isn't" : "aren't"} installed on this computer, so the video plays and exports without ${one ? "it" : "them"}.`;
+    ? `Efekty ${who} obsahují chybu, proto se video přehraje bez nich.`
+    : `Efekty ${who} nejsou na tomto počítači nainstalované, proto se video přehraje a exportuje bez nich.`;
 }
 
 /** The AI panel asked to fix broken effects, with what Nuzky says about each file and line. */
 export function fixEffectsWithAi(broken: EffectIssue[]) {
   const named = (id: string) => usePlugins.getState().list?.find((p) => p.id === id)?.name ?? id;
-  askAi(broken.map((i) => `Fix the effect “${i.name}” of the Nuzky plugin “${named(i.plugin)}” (${i.plugin}). Nuzky says: ${i.broken}`).join("\n"));
+  askAi(broken.map((i) => `Oprav efekt „${i.name}“ doplňku „${named(i.plugin)}“ (${i.plugin}). Hlášení aplikace: ${i.broken}`).join("\n"));
 }
 
 function announceIssues(issues: EffectIssue[]) {
@@ -306,7 +305,7 @@ function announceIssues(issues: EffectIssue[]) {
   };
   const broken = fresh.filter((i) => i.broken);
   warn(fresh.filter((i) => !i.broken));
-  warn(broken, { label: "Fix with AI", run: () => fixEffectsWithAi(broken) });
+  warn(broken, { label: "Opravit pomocí AI", run: () => fixEffectsWithAi(broken) });
   useEffectIssues.setState((s) => ({ toasted: { ...s.toasted, ...said } }));
 }
 
@@ -397,13 +396,13 @@ export function openPlugin(id: string | null) {
 }
 
 /** Where a plugin's effects are added. */
-export const ADD_EFFECTS = "Select a video or image, then add them in Adjust → Effects.";
+export const ADD_EFFECTS = "Vyberte video nebo obrázek a přidejte je v části Úpravy → Efekty.";
 
 /** Why the plugin cannot run on this project now, or null. */
 export function pluginBlocked(p: Plugin, hasWords: boolean): string | null {
-  if (p.error) return "This plugin can't load. Ask the AI to fix it.";
-  if (!p.runs) return `This plugin only adds effects. ${ADD_EFFECTS}`;
-  if (p.needs.includes("words") && !hasWords) return "Needs to know what is said. Transcribe first.";
+  if (p.error) return "Tento doplněk nelze načíst. Požádejte AI o opravu.";
+  if (!p.runs) return `Tento doplněk pouze přidává efekty. ${ADD_EFFECTS}`;
+  if (p.needs.includes("words") && !hasWords) return "Potřebuje přepis mluveného slova. Nejprve vytvořte přepis.";
   return null;
 }
 
@@ -413,12 +412,12 @@ export const plainDetail = (text: string) => text.replace(/^[A-Z][A-Z_]+: ?/, ""
 /** Whether the AI can fix the error by changing the plugin; a plugin made for a newer Nuzky needs an update instead. */
 export const fixable = (error: string) => !error.startsWith("PLUGIN_API_NEWER");
 
-const TOOL_WORDS: Record<string, string> = { build_captions: "captions", apply_zooms: "zooms", apply_motion: "motion" };
+const TOOL_WORDS: Record<string, string> = { build_captions: "titulky", apply_zooms: "přiblížení", apply_motion: "pohyb" };
 
 /** What the tools a plugin runs after its edits add, such as "Then adds captions and zooms"; null for none. */
 export function toolsLine(tools: string[], after: boolean): string | null {
   const words = [...new Set(tools.map((t) => TOOL_WORDS[t] ?? t))];
-  return words.length ? `${after ? "Then adds" : "Adds"} ${names(words)}` : null;
+  return words.length ? `${after ? "Poté přidá" : "Přidá"} ${names(words)}` : null;
 }
 
 let previews = 0;
@@ -450,7 +449,7 @@ const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
 const continued = (text: string) => (/^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text);
 
 /** "A", "A and B", "A, B and C". */
-const names = (list: string[]) => (list.length < 2 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`);
+const names = (list: string[]) => (list.length < 2 ? list.join("") : `${list.slice(0, -1).join(", ")} a ${list.at(-1)}`);
 
 /** What the plugin's script threw, as a person reads it: without the code, the place in plugin.js and a bare "Error: ". */
 export const readableError = (text: string) => plainDetail(text).replace(/^plugin\.js(?::\d+)*: /, "").replace(/^Error: /, "");
@@ -515,30 +514,30 @@ export async function runPlugin(p: Plugin, action: string | null = null) {
   const ran = await execute(p, valuesOf(p), selection, timeUs, action);
   if (!ran) return;
   const toast = useEditor.getState().toast;
-  if (ran.did === "stopped") return toast({ kind: "info", text: `${p.name} stopped. Nothing changed.` });
+  if (ran.did === "stopped") return toast({ kind: "info", text: `Doplněk ${p.name} byl zastaven. Nic se nezměnilo.` });
   if (ran.did === "failed") return toast(failureToast(ran, null));
-  if (ran.did === "changed") return toast({ kind: "success", text: ran.message ?? `${p.name} is done.`, action: undoAction(ran.snap) });
-  toast({ kind: "info", text: ran.message ?? `${p.name} found nothing to change.` });
+  if (ran.did === "changed") return toast({ kind: "success", text: ran.message ?? `Doplněk ${p.name} dokončil práci.`, action: undoAction(ran.snap) });
+  toast({ kind: "info", text: ran.message ?? `Doplněk ${p.name} nenašel nic ke změně.` });
 }
 
 /** What a run did, in a sentence: `when` is "after import" or "before export", or empty inside the export dialog. */
 export function ranText(r: Exclude<Ran, { did: "failed" }>, when: string) {
   const at = when && ` ${when}`;
-  if (r.did === "stopped") return `${r.plugin.name} was stopped${at}. Nothing changed.`;
-  if (r.message) return `${r.plugin.name} ran${at}: ${continued(sentence(r.message))}`;
-  return r.did === "changed" ? `${r.plugin.name} ran${at}.` : `${r.plugin.name} ran${at} and found nothing to change.`;
+  if (r.did === "stopped") return `Doplněk ${r.plugin.name} byl zastaven${at}. Nic se nezměnilo.`;
+  if (r.message) return `Doplněk ${r.plugin.name} byl spuštěn${at}: ${continued(sentence(r.message))}`;
+  return r.did === "changed" ? `Doplněk ${r.plugin.name} byl spuštěn${at}.` : `Doplněk ${r.plugin.name} byl spuštěn${at} a nenašel nic ke změně.`;
 }
 
-/** Why it failed, in a sentence, without the place in its script, which Copy error and Fix with AI keep. */
+/** Why it failed, in a sentence, without the place in its script, which Kopírovat chybu and Opravit pomocí AI keep. */
 export function failedText(r: Extract<Ran, { did: "failed" }>, when: string) {
   const at = when && ` ${when}`;
-  if (!r.loaded) return `${r.plugin.name} didn't run${at}: it can't load. ${sentence(plainDetail(r.error))}`;
-  if (busy(r.error)) return `${r.plugin.name} didn't run${at}: ${continued(sentence(plainError(r.error)))}`;
-  return `${r.plugin.name} failed${at}: ${sentence(readableError(r.error))} Nothing changed.`;
+  if (!r.loaded) return `Doplněk ${r.plugin.name} se nespustil${at}: nelze jej načíst. ${sentence(plainDetail(r.error))}`;
+  if (busy(r.error)) return `Doplněk ${r.plugin.name} se nespustil${at}: ${continued(sentence(plainError(r.error)))}`;
+  return `Doplněk ${r.plugin.name} selhal${at}: ${sentence(readableError(r.error))} Nic se nezměnilo.`;
 }
 
 export const skippedText = (skipped: NonNullable<PassReport["skipped"]>, when: string) =>
-  `${skipped.all && skipped.names.length > 1 ? "Plugins" : names(skipped.names)} didn't run${when && ` ${when}`}: ${skipped.reason}.`;
+  `${skipped.all && skipped.names.length > 1 ? "Doplňky" : names(skipped.names)} se nespustily${when && ` ${when}`}: ${skipped.reason}.`;
 
 export const copyError = (error: string) => void navigator.clipboard.writeText(error);
 
@@ -549,9 +548,9 @@ function failureToast(r: Extract<Ran, { did: "failed" }>, when: string | null): 
   if (busy(error)) return { kind: "error", text: when === null ? plainError(error) : failedText(r, when) };
   return {
     kind: "warning",
-    text: when === null && r.loaded ? `${p.name} failed: ${sentence(readableError(error))} Nothing changed.` : failedText(r, when ?? ""),
-    action: fixable(error) ? { label: "Fix with AI", run: () => fixWithAi(p, error) } : undefined,
-    secondary: { label: "Copy error", run: () => copyError(error) },
+    text: when === null && r.loaded ? `Doplněk ${p.name} selhal: ${sentence(readableError(error))} Nic se nezměnilo.` : failedText(r, when ?? ""),
+    action: fixable(error) ? { label: "Opravit pomocí AI", run: () => fixWithAi(p, error) } : undefined,
+    secondary: { label: "Kopírovat chybu", run: () => copyError(error) },
   };
 }
 
@@ -563,13 +562,13 @@ function announce({ trigger, results, skipped }: PassReport) {
   const changed = ran.filter((r): r is Extract<Ran, { did: "changed" }> => r.did === "changed");
   if (ran.length) {
     const item = (r: (typeof ran)[number]) =>
-      r.did === "stopped" ? `${r.plugin.name}: stopped, nothing changed.` : `${r.plugin.name}: ${r.message ? continued(sentence(r.message)) : r.did === "changed" ? "changed the project." : "nothing to change."}`;
+      r.did === "stopped" ? `${r.plugin.name}: zastaven, nic se nezměnilo.` : `${r.plugin.name}: ${r.message ? continued(sentence(r.message)) : r.did === "changed" ? "změnil projekt." : "nic ke změně."}`;
     // Undo takes back the whole pass only while its steps follow one another, with nobody's edit between them.
     const together = changed.every((r, i) => i === 0 || (r.from === changed[i - 1].snap.revision && r.snap.sessionEpoch === changed[i - 1].snap.sessionEpoch));
     const last = changed.at(-1);
     toast({
       kind: last ? "success" : "info",
-      text: ran.length === 1 ? ranText(ran[0], when) : `Plugins ran ${when}. ${ran.map(item).join(" ")}`,
+      text: ran.length === 1 ? ranText(ran[0], when) : `Doplňky byly spuštěny ${when}. ${ran.map(item).join(" ")}`,
       action: last && together ? undoAction(last.snap, changed.length) : undefined,
     });
   }
@@ -655,7 +654,7 @@ async function runPass(pass: Pass): Promise<PassReport> {
       const agent = !!aiRun && !aiRun.startsWith(PLUGIN_RUN);
       const elsewhere = snap?.sessionEpoch !== pass.epoch;
       if (agent || elsewhere || usePlugins.getState().running) {
-        const reason = elsewhere ? "another project is open" : agent ? "the AI is editing" : "another plugin is running";
+        const reason = elsewhere ? "je otevřený jiný projekt" : agent ? "AI právě upravuje projekt" : "běží jiný doplněk";
         publish({ skipped: { names: chosen.slice(i).map((c) => c.name), all: i === 0, reason } });
         break;
       }
@@ -744,10 +743,10 @@ function openAi(draft?: string) {
 }
 
 /** Make a plugin: the AI panel with the request started, for the person to finish. */
-export const makeWithAi = () => openAi("Make a Nuzky plugin that ");
+export const makeWithAi = () => openAi("Vytvoř doplněk pro MadMan Cut, který ");
 
 /** Make an effect: the AI panel with the request started, for the person to finish. */
-export const makeEffectWithAi = () => openAi("Make a Nuzky plugin with an effect that ");
+export const makeEffectWithAi = () => openAi("Vytvoř doplněk pro MadMan Cut s efektem, který ");
 
 /** One of the suggestions in the empty Plugins tab, sent as it is. */
 export function askAi(text: string) {
@@ -756,9 +755,9 @@ export function askAi(text: string) {
   void send(text, "project");
 }
 
-export const changeWithAi = (p: Plugin) => openAi(`Change the Nuzky plugin “${p.name}” (${p.id}) so that `);
+export const changeWithAi = (p: Plugin) => openAi(`Uprav doplněk „${p.name}“ (${p.id}) tak, aby `);
 
-export const fixWithAi = (p: Pick<Plugin, "id" | "name">, error: string) => askAi(`Fix the Nuzky plugin “${p.name}” (${p.id}). Nuzky says: ${error}`);
+export const fixWithAi = (p: Pick<Plugin, "id" | "name">, error: string) => askAi(`Oprav doplněk „${p.name}“ (${p.id}). Hlášení aplikace: ${error}`);
 
 export async function removePlugin(p: Plugin) {
   try {
@@ -767,9 +766,9 @@ export async function removePlugin(p: Plugin) {
     // A plugin saved later under the same folder name must not run by itself until the user turns it on.
     setAuto(p.id, "import", false);
     setAuto(p.id, "export", false);
-    useEditor.getState().toast({ kind: "info", text: `Moved “${p.name}” to the Trash.` });
+    useEditor.getState().toast({ kind: "info", text: `Doplněk „${p.name}“ byl přesunut do koše.` });
     await loadPlugins();
   } catch (e) {
-    useEditor.getState().toast({ kind: "error", text: `Couldn't move “${p.name}” to the Trash: ${errorText(e)}` });
+    useEditor.getState().toast({ kind: "error", text: `Doplněk „${p.name}“ se nepodařilo přesunout do koše: ${errorText(e)}` });
   }
 }

@@ -53,10 +53,10 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
             Zastavit
           </Button>
         </div>
-        <ProgressBar value={installing.percent / 100} label={`Installing ${p.name}`} />
+        <ProgressBar value={installing.percent / 100} label={`Instalace doplňku ${p.name}`} />
       </div>
     );
-  else if (p.state === "refused") body = <p className="text-[12px] text-muted">{p.files.some((f) => f.refused) ? REFUSED : "Nuzky won’t install this plugin. Something in it isn’t allowed in plugins."}</p>;
+  else if (p.state === "refused") body = <p className="text-[12px] text-muted">{p.files.some((f) => f.refused) ? REFUSED : "MadMan Cut tento doplněk nenainstaluje. Obsahuje nepovolenou součást."}</p>;
   else if (p.state === "newer")
     body = (
       <div className="flex flex-col gap-2.5">
@@ -69,17 +69,17 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
     const replace = clash || p.state === "changed";
     const note =
       p.state === "update"
-        ? `You have ${p.installedVersion ? `version ${p.installedVersion}` : "an older version"}. Updating replaces it.`
+        ? `Máte ${p.installedVersion ? `verzi ${p.installedVersion}` : "starší verzi"}. Aktualizací ji nahradíte.`
         : p.state === "changed"
-          ? "You or your AI edited your copy."
+          ? "Vy nebo vaše AI jste tuto kopii upravili."
           : clash
-            ? `Your own plugin “${own}” has the same name.`
+            ? `Váš vlastní doplněk „${own}“ má stejné jméno.`
             : p.state === "installed"
               ? "Tato verze je nainstalovaná."
               : null;
     const label = clash ? "Nahradit doplněk" : p.state === "changed" ? "Nahradit upravenou kopii" : p.state === "update" ? "Aktualizovat" : "Nainstalovat";
     const problem = failed ? galleryError(failed, true) : null;
-    const busy = installing ? "Another plugin is installing. Wait for it to finish." : undefined;
+    const busy = installing ? "Instaluje se jiný doplněk. Počkejte na dokončení." : undefined;
     const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
       if (e.key !== "Escape") return;
       e.stopPropagation();
@@ -91,7 +91,7 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
         {confirming ? (
           <>
             <p className="text-[12px] text-fg" role="alert">
-              {clash ? `Your plugin “${own}” goes to the Trash. You can put it back from there.` : "Your edited copy goes to the Trash, with your changes."}
+              {clash ? `Váš doplněk „${own}“ bude přesunut do koše. Odtud jej můžete obnovit.` : "Upravená kopie včetně vašich změn bude přesunuta do koše."}
             </p>
             <div ref={choice} className="flex gap-2" onKeyDown={onKeyDown}>
               <Button pill className="h-8 flex-1" onClick={cancel}>

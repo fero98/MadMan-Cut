@@ -8,7 +8,7 @@ import { PluginMark } from "./PluginsTab";
 const MARKS: Partial<Record<GalleryPlugin["state"], string>> = { installed: "Nainstalováno", update: "Aktualizovat", changed: "Upraveno", clash: "Stejné jméno" };
 
 function Row({ plugin: p, open }: { plugin: GalleryPlugin; open: boolean }) {
-  const off = p.state === "newer" ? "Needs a newer Nuzky" : p.state === "refused" ? "Can’t be installed" : null;
+  const off = p.state === "newer" ? "Vyžaduje novější MadMan Cut" : p.state === "refused" ? "Nelze nainstalovat" : null;
   const mark = MARKS[p.state];
   return (
     <li>
@@ -61,7 +61,7 @@ export function GalleryList() {
     return (
       <>
         {shared}
-        <div role="status" aria-label="Loading the gallery" className="flex flex-col gap-0.5 px-1.5">
+        <div role="status" aria-label="Načítání galerie" className="flex flex-col gap-0.5 px-1.5">
           {[0, 1, 2].map((i) => (
             <div key={i} className="flex min-h-12 items-center gap-2.5 py-2 pl-2">
               <div className="skeleton size-[30px] shrink-0 rounded-lg" />
@@ -86,7 +86,7 @@ export function GalleryList() {
   return (
     <>
       {shared}
-      <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" aria-label="Gallery">
+      <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" aria-label="Galerie">
         {list.map((p) => (
           <Row key={p.id} plugin={p} open={p.id === open} />
         ))}

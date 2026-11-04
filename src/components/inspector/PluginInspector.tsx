@@ -13,7 +13,7 @@ const PREVIEW_DELAY_MS = 300;
 
 const MAC = navigator.userAgent.includes("Mac");
 
-const LOOKING = <span className="text-[12px] text-muted">Looking…</span>;
+const LOOKING = <span className="text-[12px] text-muted">Hledám…</span>;
 
 /** `rows`: what a dynamic list offers, undefined while the plugin is still looking. */
 export function Control({ input, value, rows, onChange }: { input: PluginInput; value: PluginValue; rows?: PluginRow[]; onChange: (v: PluginValue) => void }) {
@@ -25,8 +25,8 @@ export function Control({ input, value, rows, onChange }: { input: PluginInput; 
         {rows === undefined ? (
           LOOKING
         ) : (
-          <Select aria-label={input.label} disabled={!!lock || !rows.length} title={lock ?? (rows.length ? undefined : "None found.")} value={value as string} onChange={(e) => onChange(e.target.value)}>
-            <option value="">{rows.length ? "Choose…" : "None found."}</option>
+          <Select aria-label={input.label} disabled={!!lock || !rows.length} title={lock ?? (rows.length ? undefined : "Nic nenalezeno.")} value={value as string} onChange={(e) => onChange(e.target.value)}>
+            <option value="">{rows.length ? "Vyberte…" : "Nic nenalezeno."}</option>
             {rows.map((r) => (
               <option key={r.value} value={r.value}>
                 {r.label}
@@ -72,7 +72,7 @@ export function Control({ input, value, rows, onChange }: { input: PluginInput; 
         <div role="group" aria-label={input.label} className="flex flex-col gap-2">
           <span className="text-[12px] text-muted">{input.label}</span>
           {options === undefined && LOOKING}
-          {options?.length === 0 && <span className="text-[12px] text-muted">None found.</span>}
+          {options?.length === 0 && <span className="text-[12px] text-muted">Nic nenalezeno.</span>}
           {!!options?.length && (
             <div className="-mx-1 flex max-h-[184px] flex-col gap-2 overflow-y-auto px-1 py-0.5">
               {options.map((o) => (
@@ -122,14 +122,14 @@ function useOutcome(p: Plugin, key: string, running: boolean) {
     const said = describePeek(snap.project, preview.project, true);
     // The timeline marks only clips it already shows, never ones the plugin would add.
     const shown = new Set(snap.project.tracks.flatMap((t) => t.clips.map((c) => c.id)));
-    const lines = [...(said.lines.length ? said.lines.slice(0, 3) : ["Changes the project"]), ...(tools ? [tools] : [])];
+    const lines = [...(said.lines.length ? said.lines.slice(0, 3) : ["Změní projekt"]), ...(tools ? [tools] : [])];
     return { lines, marked: [...said.marks.keys()].some((id) => shown.has(id)) };
   }, [preview, snap]);
   if (blocked) return { blocked, lines: null, marked, stale: false, waiting: false, cannotRun: true };
   if (!preview) return { blocked: null, lines: null, marked, stale: true, waiting: false };
   const stale = running || preview.key !== key || preview.revision !== snap?.revision;
   if (preview.error) return { blocked: preview.error, lines: null, marked, stale, waiting: preview.waiting };
-  if (lines && lines.length === 0) return { blocked: "Nothing left to change.", lines: null, marked, stale, waiting: false };
+  if (lines && lines.length === 0) return { blocked: "Není co změnit.", lines: null, marked, stale, waiting: false };
   return { blocked: null, lines, marked, stale, waiting: false };
 }
 
@@ -160,7 +160,7 @@ function PluginBody({ plugin: p, primary }: { plugin: Plugin; primary: RefObject
   const [first, ...more] = p.actions;
   const primaryOff = (!!outcome.blocked && !outcome.stale && !outcome.waiting) || running || !!lock;
   // The preview is of the primary action, so only what stops every run turns the others off.
-  const moreReason = running ? "Running…" : outcome.cannotRun ? (outcome.blocked ?? undefined) : undefined;
+  const moreReason = running ? "Probíhá…" : outcome.cannotRun ? (outcome.blocked ?? undefined) : undefined;
   useEffect(() => {
     primary.current = primaryOff ? null : () => void runPlugin(p, first.id);
     return () => {
@@ -196,15 +196,15 @@ function PluginBody({ plugin: p, primary }: { plugin: Plugin; primary: RefObject
           {outcome.blocked ? (
             <p className="text-muted">{outcome.blocked}</p>
           ) : said ? (
-            <div className="flex gap-2 text-fg/85" title={outcome.marked ? `${said} Marked on the timeline.` : said}>
+            <div className="flex gap-2 text-fg/85" title={outcome.marked ? `${said} Označeno na časové ose.` : said}>
               <Eye size={14} className="mt-px shrink-0 text-muted" aria-hidden />
               <span className="line-clamp-2">
                 {said}
-                {outcome.marked && <span className="text-muted"> Marked on the timeline.</span>}
+                {outcome.marked && <span className="text-muted"> Označeno na časové ose.</span>}
               </span>
             </div>
           ) : (
-            <p className="text-muted">{running ? "\u00a0" : "Checking…"}</p>
+            <p className="text-muted">{running ? "\u00a0" : "Kontroluji…"}</p>
           )}
         </div>
         <Button
@@ -215,10 +215,10 @@ function PluginBody({ plugin: p, primary }: { plugin: Plugin; primary: RefObject
           title={`${first.label} (${MAC ? "Cmd" : "Ctrl"}+Enter)`}
           aria-keyshortcuts={MAC ? "Meta+Enter" : "Control+Enter"}
           disabled={primaryOff}
-          disabledReason={running ? "Running…" : (outcome.blocked ?? undefined)}
+          disabledReason={running ? "Probíhá…" : (outcome.blocked ?? undefined)}
           onClick={() => void runPlugin(p, first.id)}
         >
-          {pressed === first.id ? "Running…" : first.label}
+          {pressed === first.id ? "Probíhá…" : first.label}
         </Button>
         {more.length > 0 && (
           <div className="flex flex-wrap gap-2">
@@ -233,7 +233,7 @@ function PluginBody({ plugin: p, primary }: { plugin: Plugin; primary: RefObject
                 disabledReason={moreReason}
                 onClick={() => void runPlugin(p, a.id)}
               >
-                <span className="truncate">{pressed === a.id ? "Running…" : a.label}</span>
+                <span className="truncate">{pressed === a.id ? "Probíhá…" : a.label}</span>
               </Button>
             ))}
           </div>
@@ -258,9 +258,9 @@ function AutoSwitches({ plugin: p }: { plugin: Plugin }) {
   const on = usePlugins((s) => s.auto.import.includes(p.id) || s.auto.export.includes(p.id));
   return (
     <section className="flex flex-col gap-2 border-b border-white/[.07] px-4 py-3 last:border-b-0">
-      <AutoSwitch plugin={p} trigger="import" label="Run after import" />
-      <AutoSwitch plugin={p} trigger="export" label="Run before export" />
-      {on && <p className="text-[12px] text-muted">{p.inputs.length ? "Runs on the whole project with these settings." : "Runs on the whole project."}</p>}
+      <AutoSwitch plugin={p} trigger="import" label="Spustit po importu" />
+      <AutoSwitch plugin={p} trigger="export" label="Spustit před exportem" />
+      {on && <p className="text-[12px] text-muted">{p.inputs.length ? "Spustí se na celém projektu s tímto nastavením." : "Spustí se na celém projektu."}</p>}
     </section>
   );
 }
@@ -268,15 +268,15 @@ function AutoSwitches({ plugin: p }: { plugin: Plugin }) {
 /** The looks the plugin adds, each saying when it can't draw, and where they are added. */
 function PluginEffects({ plugin: p }: { plugin: Plugin }) {
   return (
-    <Section title="Effects">
+    <Section title="Efekty">
       {p.effects.map((e) => (
         <div key={e.id} data-plugin-effect={e.id} className="flex flex-col items-start gap-1">
           <span className="text-[12px] font-medium text-fg/80">{e.name}</span>
           {e.error && (
             <>
-              <p className="text-[12px] text-warn">Can’t draw: {plainDetail(e.error)}</p>
+              <p className="text-[12px] text-warn">Nelze vykreslit: {plainDetail(e.error)}</p>
               <Button variant="ghost" className="-ml-2 h-7 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => fixWithAi(p, e.error ?? "")}>
-                <Sparkles size={13} /> Fix with AI
+                <Sparkles size={13} /> Opravit pomocí AI
               </Button>
             </>
           )}
@@ -312,10 +312,10 @@ export function PluginInspector({ plugin: p }: { plugin: Plugin }) {
             </div>
           )}
         </div>
-        <IconButton label={`More for ${p.name}`} className="size-7 shrink-0" onClick={showMenu}>
+        <IconButton label={`Další možnosti: ${p.name}`} className="size-7 shrink-0" onClick={showMenu}>
           <MoreHorizontal size={16} />
         </IconButton>
-        <IconButton label="Close plugin" className="size-7 shrink-0" onClick={() => usePlugins.setState({ open: null, preview: null })}>
+        <IconButton label="Zavřít doplněk" className="size-7 shrink-0" onClick={() => usePlugins.setState({ open: null, preview: null })}>
           <X size={16} />
         </IconButton>
         {menu && <Menu items={pluginMenu(p)} at={{ x: menu.x, y: menu.y, align: "end" }} label={p.name} keyboard={menu.keyboard} onClose={() => setMenu(null)} />}
@@ -325,10 +325,10 @@ export function PluginInspector({ plugin: p }: { plugin: Plugin }) {
           <div className="min-h-0 flex-1 overflow-y-auto">
             <AutoSwitches plugin={p} />
             <section className="flex flex-col items-start gap-3 px-4 py-4">
-              <p className="text-[12px] text-danger">Can’t load: {plainDetail(p.error)}</p>
+              <p className="text-[12px] text-danger">Nelze načíst: {plainDetail(p.error)}</p>
               {fixable(p.error) && (
                 <Button className="h-8 gap-1.5 px-3" onClick={() => fixWithAi(p, p.error ?? "")}>
-                  <Sparkles size={14} className="text-accent" /> Fix with AI
+                  <Sparkles size={14} className="text-accent" /> Opravit pomocí AI
                 </Button>
               )}
             </section>
