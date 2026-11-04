@@ -64,7 +64,7 @@ export function VersionRow({ showMenu }: { showMenu: ShowMenu }) {
   return (
     <div className="relative">
       <div className="flex items-center justify-between gap-2 px-2.5 pb-1">
-        <span className="min-w-0 truncate text-[12px] text-muted">MadMan Cut {version}</span>
+        <span className="min-w-0 truncate text-[12px] text-muted">v{version}</span>
         <button type="button" data-update-action onClick={() => void updateNow()} disabled={!!checking || (!!install && install.stage !== "ready" && install.stage !== "installed") || (!!blocked && !!install)}
           className="shrink-0 rounded-md bg-[#c54b12] px-2.5 py-1.5 text-[12px] font-bold text-white hover:bg-[#e05a18] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:opacity-50">
           {install?.stage === "ready" || install?.stage === "installed" ? "Restartovat" : checking ? "Kontroluji…" : "Aktualizovat"}
@@ -105,7 +105,7 @@ export function VersionRow({ showMenu }: { showMenu: ShowMenu }) {
             <VersionLabel label="Je dostupná aktualizace" version={latest} />
           </>
         ) : (
-          <span className="min-w-0 flex-1 truncate text-[12px] text-muted">MadMan Cut {version}</span>
+          <span className="min-w-0 flex-1 truncate text-[12px] text-muted">Možnosti aktualizací</span>
         )}
       </button>
       {downloading && (

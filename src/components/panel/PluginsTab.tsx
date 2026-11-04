@@ -7,7 +7,7 @@ import { useEditor } from "../../lib/store";
 import { Button, IconButton, Menu, TabBar, TabPanel, lockedProps, useLockReason, type MenuEntry } from "../ui";
 import { GalleryList } from "./GalleryList";
 
-const SUGGESTIONS = ["Make a plugin that removes clips shorter than half a second", "Make a plugin that adds a “Follow for more” text at the end", "Make a plugin that puts a title on every new topic"];
+const SUGGESTIONS = ["Vytvoř doplněk, který odstraní klipy kratší než půl sekundy", "Vytvoř doplněk, který na konec přidá text Sledujte pro další videa", "Vytvoř doplněk, který přidá nadpis ke každému novému tématu"];
 
 /** A plugin has no picture of its own: its first letter on a quiet tile tells the rows apart without colour. */
 export function PluginMark({ plugin, size = 30 }: { plugin: Pick<Plugin, "name" | "error">; size?: number }) {
@@ -92,12 +92,12 @@ function Empty() {
   return (
     <div className="flex flex-col items-center px-5 pt-8 pb-4 text-center">
       <Puzzle size={30} strokeWidth={1.6} className="text-muted" aria-hidden />
-      <h3 className="mt-2.5 text-[13px] font-semibold text-fg">No plugins yet</h3>
-      <p className="mt-1 mb-3.5 max-w-[260px] text-[12px] text-muted">Tell the AI what you’re missing. It writes a plugin that shows up here.</p>
+      <h3 className="mt-2.5 text-[13px] font-semibold text-fg">Zatím nemáte žádné doplňky</h3>
+      <p className="mt-1 mb-3.5 max-w-[260px] text-[12px] text-muted">Připojeného AI agenta můžete požádat o vytvoření doplňku.</p>
       <Button variant="primary" pill className="h-8 gap-1.5 px-4" onClick={makeWithAi}>
-        <Sparkles size={14} /> Make a plugin
+        <Sparkles size={14} /> Vytvořit doplněk s AI
       </Button>
-      <p className="mt-6 mb-1.5 self-stretch text-left text-[12px] text-muted">Try</p>
+      <p className="mt-6 mb-1.5 self-stretch text-left text-[12px] text-muted">Zkuste například</p>
       <ul className="flex flex-col gap-1.5 self-stretch">
         {SUGGESTIONS.map((s) => (
           <li key={s}>
@@ -107,17 +107,17 @@ function Empty() {
               onClick={lock ? undefined : () => askAi(s)}
               className="flex w-full items-center gap-2 rounded-[9px] bg-white/[.05] px-2.5 py-2 text-left text-[12px] text-fg transition-colors duration-[120ms] ease-out hover:bg-white/[.09] aria-disabled:cursor-not-allowed aria-disabled:opacity-40"
             >
-              <Sparkles size={12} className="shrink-0 text-accent" /> {s.replace("Make a plugin that ", "")}
+              <Sparkles size={12} className="shrink-0 text-accent" /> {s}
             </button>
           </li>
         ))}
       </ul>
       <div className="mt-3 flex flex-wrap justify-center gap-1">
         <Button variant="ghost" className="h-7 gap-1.5 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => showTab("gallery")}>
-          <Store size={13} /> Browse the gallery
+          <Store size={13} /> Prohlédnout galerii
         </Button>
         <Button variant="ghost" className="h-7 gap-1.5 px-2 text-[12px] text-accent! hover:text-accent!" onClick={() => void showFolder(null)}>
-          <FolderOpen size={13} /> Show plugins folder
+          <FolderOpen size={13} /> Otevřít složku doplňků
         </Button>
       </div>
     </div>
@@ -136,9 +136,9 @@ function Installed() {
   return (
     <>
       <div className="flex h-10 shrink-0 items-center justify-between px-3.5">
-        <h3 className="text-[13px] font-semibold text-fg">Your plugins</h3>
+        <h3 className="text-[13px] font-semibold text-fg">Vaše doplňky</h3>
         <Button variant="ghost" className="h-7 gap-1 px-2 text-[12px] text-accent! hover:text-accent!" onClick={makeWithAi}>
-          <Sparkles size={13} /> Make a plugin
+          <Sparkles size={13} /> Vytvořit doplněk
         </Button>
       </div>
       <ul className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" aria-label="Plugins">
@@ -151,8 +151,8 @@ function Installed() {
 }
 
 const TABS = [
-  { id: "installed" as const, label: "Installed" },
-  { id: "gallery" as const, label: "Gallery" },
+  { id: "installed" as const, label: "Nainstalované" },
+  { id: "gallery" as const, label: "Galerie" },
 ];
 
 /** The user's plugins, and the gallery of plugins other people wrote. */

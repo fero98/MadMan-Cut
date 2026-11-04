@@ -48,9 +48,9 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
     body = (
       <div className="flex flex-col gap-2" data-gallery-progress>
         <div className="flex items-center justify-between gap-2 text-[12px] text-muted">
-          <span className="tabular">Installing… {installing.percent}%</span>
+          <span className="tabular">Instaluji… {installing.percent}%</span>
           <Button data-gallery-main className="h-7 text-[12px]" onClick={act(stopInstall)}>
-            Stop
+            Zastavit
           </Button>
         </div>
         <ProgressBar value={installing.percent / 100} label={`Installing ${p.name}`} />
@@ -60,7 +60,7 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
   else if (p.state === "newer")
     body = (
       <div className="flex flex-col gap-2.5">
-        <p className="text-[12px] text-muted">This plugin needs a newer Nuzky.</p>
+        <p className="text-[12px] text-muted">Tento doplněk vyžaduje novější MadMan Cut.</p>
         <UpdateNuzkyButton className="h-8 w-full" />
       </div>
     );
@@ -75,9 +75,9 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
           : clash
             ? `Your own plugin “${own}” has the same name.`
             : p.state === "installed"
-              ? "This version is installed."
+              ? "Tato verze je nainstalovaná."
               : null;
-    const label = clash ? "Replace your plugin" : p.state === "changed" ? "Replace your edited copy" : p.state === "update" ? "Update" : "Install";
+    const label = clash ? "Nahradit doplněk" : p.state === "changed" ? "Nahradit upravenou kopii" : p.state === "update" ? "Aktualizovat" : "Nainstalovat";
     const problem = failed ? galleryError(failed, true) : null;
     const busy = installing ? "Another plugin is installing. Wait for it to finish." : undefined;
     const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -95,7 +95,7 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
             </p>
             <div ref={choice} className="flex gap-2" onKeyDown={onKeyDown}>
               <Button pill className="h-8 flex-1" onClick={cancel}>
-                Cancel
+                Zrušit
               </Button>
               <Button variant="primary" pill className="h-8 flex-1 px-3" onClick={install}>
                 {label}
@@ -104,11 +104,11 @@ function Action({ plugin: p }: { plugin: GalleryPlugin }) {
           </>
         ) : p.state === "installed" ? (
           <Button data-gallery-main pill className="h-8 w-full" onClick={() => openPlugin(p.id)}>
-            Open
+            Otevřít
           </Button>
         ) : (
           <Button data-gallery-main variant={replace ? "secondary" : "primary"} pill className="h-8 w-full" disabled={!!busy} disabledReason={busy} onClick={replace ? () => setConfirming(true) : install}>
-            {problem?.retry ? "Try again" : label}
+            {problem?.retry ? "Zkusit znovu" : label}
           </Button>
         )}
         {problem && failed && !confirming && (
@@ -134,21 +134,21 @@ export function GalleryInspector({ plugin: p }: { plugin: GalleryPlugin }) {
         <div className="min-w-0 flex-1">
           <div className="truncate text-[15px] leading-5 font-semibold tracking-[-0.015em] text-fg">{p.name}</div>
           <div className="mt-[3px] truncate text-[12px] text-muted">
-            {p.author ? `By ${p.author}` : "From the gallery"}
+            {p.author ? `Autor: ${p.author}` : "Z galerie"}
             {p.version && ` · ${p.version}`}
           </div>
         </div>
-        <IconButton label="Close plugin" className="size-7 shrink-0" onClick={() => openGalleryPlugin(null)}>
+        <IconButton label="Zavřít doplněk" className="size-7 shrink-0" onClick={() => openGalleryPlugin(null)}>
           <X size={16} />
         </IconButton>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto border-t border-white/[.07]" data-gallery-detail={p.id}>
         {p.summary.length > 0 && (
-          <Section title="What Nuzky lets it do">
+          <Section title="Co doplněk může dělat">
             <ul className="flex flex-col gap-1.5 text-[12px] text-fg/85" data-gallery-summary>
               {p.summary.map((line) => (
                 <li key={line.text} data-new={line.new || undefined}>
-                  {line.new && <span className="mr-1.5 font-medium text-accent">New</span>}
+                  {line.new && <span className="mr-1.5 font-medium text-accent">Nové</span>}
                   {line.text}
                 </li>
               ))}
@@ -159,18 +159,18 @@ export function GalleryInspector({ plugin: p }: { plugin: GalleryPlugin }) {
           <Action key={p.state} plugin={p} />
         </section>
         {p.description && (
-          <Section title="From the author">
+          <Section title="Od autora">
             <p className="text-[12px] whitespace-pre-line text-fg/85 select-text" data-gallery-author>
               {p.description}
             </p>
           </Section>
         )}
-        <Section title="Files">
+        <Section title="Soubory">
           <ul className="flex flex-col gap-1 text-[12px]" data-gallery-files>
             {p.files.map((f) => (
               <li key={f.path} className={`flex justify-between gap-3 ${f.refused ? "text-warn" : ""}`} data-refused={f.refused || undefined}>
                 <span className={`min-w-0 truncate ${f.refused ? "" : "text-fg/85"}`}>{f.path}</span>
-                <span className={`tabular shrink-0 ${f.refused ? "" : "text-muted"}`}>{f.refused ? "Not allowed" : size(f.size)}</span>
+                <span className={`tabular shrink-0 ${f.refused ? "" : "text-muted"}`}>{f.refused ? "Nepovoleno" : size(f.size)}</span>
               </li>
             ))}
           </ul>

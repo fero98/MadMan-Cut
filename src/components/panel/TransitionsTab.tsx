@@ -7,6 +7,7 @@ import { deleteSelection, editClip, mainClips, transitionTarget, useEditor, type
 import { US, formatTime } from "../../lib/time";
 import type { TransitionKind } from "../../lib/types";
 import { Button, PresetTile, Slider } from "../ui";
+import sampleScene from "../../../assets/madman/filter-preview.svg";
 
 export const TRANSITION_ICONS: Record<TransitionKind, LucideIcon> = {
   dissolve: Blend,
@@ -42,7 +43,7 @@ const MOTION: Record<TransitionKind, { a?: string; b: string; flash?: string }> 
 };
 
 function layer(url: string | null | undefined, fallback: string): CSSProperties {
-  return url ? { backgroundImage: `url(${url})`, backgroundSize: "cover", backgroundPosition: "center" } : { background: fallback };
+  return url ? { backgroundImage: `url("${url}")`, backgroundSize: "cover", backgroundPosition: "center" } : { background: fallback };
 }
 
 /** The two clips around the cut, playing the transition between them. */
@@ -155,10 +156,15 @@ export function TransitionsTab() {
   const target = useEditor(useShallow((s) => (s.snap ? transitionTarget(s.snap.project, s.selection, s.cut, s.timeUs) : null)));
   if (!target)
     return (
-      <div className="m-3.5 flex flex-1 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-white/[.1] p-6 text-center">
-        <Blend size={28} className="text-muted" />
-        <p className="text-[13px] text-fg">Zatím tu není žádný střih</p>
-        <p className="text-[12px] text-muted">Přidejte na hlavní stopu dva klipy a mezi nimi vyberte přechod.</p>
+      <div className="flex flex-col gap-3 overflow-y-auto p-3.5">
+        <p className="flex items-start gap-1.5 text-[12px] text-muted"><Blend size={14} className="mt-0.5 shrink-0" /> Náhledy přechodů. Přidejte dva klipy na hlavní stopu nebo rozdělte jeden klip a vyberte střih mezi nimi.</p>
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(84px,1fr))] gap-2">
+          {TRANSITIONS.map((t) => (
+            <PresetTile key={t.kind} label={t.label} selected={false} disabled previewWhenDisabled title="Nejprve vytvořte střih mezi dvěma klipy" onClick={() => {}}>
+              <TransitionPreview kind={t.kind} a={sampleScene} />
+            </PresetTile>
+          ))}
+        </div>
       </div>
     );
   return (

@@ -1,0 +1,176 @@
+{
+  "nuzkyGallery": 1,
+  "commit": "2d65ba543f9d823f06919765e8976fabd04bf7d3",
+  "plugins": [
+    {
+      "author": "Nuzky contributors; Czech adaptation by MadMan Studio",
+      "manifest": {
+        "nuzkyPlugin": 2,
+        "id": "vhs",
+        "name": "Filmové VHS",
+        "description": "Retro vzhled videokazety: barevný posun, řádky a zrnění.",
+        "version": "1.0.0",
+        "effects": [
+          {
+            "id": "vhs",
+            "name": "Filmové VHS",
+            "params": [
+              {
+                "type": "number",
+                "id": "amount",
+                "label": "Intenzita",
+                "min": 0,
+                "max": 1,
+                "step": 0.05,
+                "default": 0.6
+              },
+              {
+                "type": "toggle",
+                "id": "lines",
+                "label": "Řádky",
+                "default": true
+              },
+              {
+                "type": "color",
+                "id": "tint",
+                "label": "Odstín",
+                "default": "#FFC890"
+              }
+            ]
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "effects/vhs.wgsl",
+          "size": 1061,
+          "sha256": "4e023556501779dfba07c27bffced1746342d2363d7499c9a004cbee76cbe7d9"
+        },
+        {
+          "path": "plugin.json",
+          "size": 769,
+          "sha256": "2e8f9875cafc82073f9e4109fcdc178366f61b3307c4bda5942d29c9eced5362"
+        },
+        {
+          "path": "README.md",
+          "size": 138,
+          "sha256": "c893b334ada694434769c1758b36c4e6d52f21853dd895f548c0abb0413b4c65"
+        }
+      ]
+    },
+    {
+      "author": "Nuzky contributors; Czech adaptation by MadMan Studio",
+      "manifest": {
+        "nuzkyPlugin": 1,
+        "id": "remove-short-clips",
+        "name": "Odstranit krátké klipy",
+        "description": "Vyhledá a odstraní klipy kratší než zvolená délka. Střih lze vrátit zpět.",
+        "version": "1.0.0",
+        "action": "Odstranit klipy",
+        "inputs": [
+          {
+            "type": "number",
+            "id": "minSeconds",
+            "label": "Kratší než",
+            "min": 0.1,
+            "max": 10,
+            "step": 0.1,
+            "default": 1,
+            "unit": "s"
+          },
+          {
+            "type": "choice",
+            "id": "tracks",
+            "label": "Stopy",
+            "options": [
+              {
+                "value": "main",
+                "label": "Hlavní stopa"
+              },
+              {
+                "value": "all",
+                "label": "Všechny stopy"
+              }
+            ],
+            "default": "main"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "plugin.js",
+          "size": 730,
+          "sha256": "a48c8b6daafb640bbef1322edbcee8e5365d12eef595182315f7d1315b658f55"
+        },
+        {
+          "path": "plugin.json",
+          "size": 789,
+          "sha256": "dbcf9d25e3f15f2d562ade2f5dd3495523e213ed06f251e13e7614b914608e84"
+        },
+        {
+          "path": "README.md",
+          "size": 129,
+          "sha256": "f743cf9f592d15f11603bbe6d443a2828460a0bf7098b420456cf96cd1c0ac0a"
+        }
+      ]
+    },
+    {
+      "author": "Nuzky contributors; Czech adaptation by MadMan Studio",
+      "manifest": {
+        "nuzkyPlugin": 1,
+        "id": "follow-end-card",
+        "name": "Závěrečná výzva",
+        "description": "Přidá vlastní text do závěru videa, například výzvu ke sledování.",
+        "version": "1.0.0",
+        "action": "Přidat text",
+        "inputs": [
+          {
+            "type": "text",
+            "id": "text",
+            "label": "Text",
+            "default": "Sledujte pro další videa"
+          },
+          {
+            "type": "number",
+            "id": "seconds",
+            "label": "Poslední",
+            "min": 1,
+            "max": 10,
+            "step": 0.5,
+            "default": 3,
+            "unit": "s"
+          },
+          {
+            "type": "color",
+            "id": "color",
+            "label": "Barva",
+            "default": "#FFFFFF"
+          },
+          {
+            "type": "toggle",
+            "id": "bold",
+            "label": "Tučně",
+            "default": true
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "plugin.js",
+          "size": 983,
+          "sha256": "b8437fea7ad33db55c904c4cf46684fa3b443d8ed67ab143e6b0088a6cda75e8"
+        },
+        {
+          "path": "plugin.json",
+          "size": 801,
+          "sha256": "ff4d195dc19d6c12880abc1607dc55e3264823484bf661d9fb0963c4b8872f5d"
+        },
+        {
+          "path": "README.md",
+          "size": 126,
+          "sha256": "55119ce9acde22ad91a6b8b96803b3cc591cc389593144ba00c08ae9f19a648d"
+        }
+      ]
+    }
+  ]
+}

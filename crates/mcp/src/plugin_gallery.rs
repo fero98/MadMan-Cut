@@ -1,5 +1,5 @@
-//! Plugins other people wrote, listed in github.com/nuzkyapp/nuzky-plugins, which the maintainer curates through pull
-//! requests. Nuzky reads the list only from one fixed address, and a plugin's files only from that repository at the
+//! Plugins reviewed for MadMan Cut, listed in the MadMan Cut repository. The application reads the list only from one
+//! fixed address, and a plugin's files only from that repository at the
 //! commit the list names, by addresses Nuzky builds itself. Every name is checked before any request, every file
 //! against the size and SHA-256 the list gives, and installing writes files only: it runs none of the plugin's code.
 use std::collections::{BTreeMap, HashSet};
@@ -22,7 +22,7 @@ use crate::plugin_files;
 use crate::plugin_tools::Tool;
 use crate::plugins::{self, Manifest, Need};
 
-const REPO: &str = "https://raw.githubusercontent.com/nuzkyapp/nuzky-plugins";
+const REPO: &str = "https://raw.githubusercontent.com/fero98/MadMan-Cut";
 const VERSION: u64 = 1;
 const MAX_INDEX_BYTES: u64 = 1 << 20;
 const INDEX_TIMEOUT: Duration = Duration::from_secs(15);

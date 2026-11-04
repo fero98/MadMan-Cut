@@ -4,15 +4,16 @@ import { FILTERS, adjustCss, sameAdjust } from "../../lib/presets";
 import { findClip, useEditor } from "../../lib/store";
 import type { Adjust } from "../../lib/types";
 import { PresetTile } from "../ui";
+import sampleScene from "../../../assets/madman/filter-preview.svg";
 
 // Shown when the clip has no thumbnail yet: a sky, a horizon and grass reveal colour shifts.
-const SCENE = "linear-gradient(180deg, #7fb2e5 0%, #d9c7a3 52%, #4f7d3f 53%, #2c4a25 100%)";
+const SCENE = `url("${sampleScene}")`;
 
 function FilterPreview({ adjust, thumb }: { adjust: Adjust; thumb: string | null }) {
   const css = adjustCss(adjust);
   return (
     <span className="absolute inset-0" style={{ filter: css.filter }}>
-      <span className="absolute inset-0" style={thumb ? { backgroundImage: `url(${thumb})`, backgroundSize: "cover", backgroundPosition: "center" } : { background: SCENE }} />
+      <span className="absolute inset-0" style={{ backgroundImage: thumb ? `url("${thumb}")` : SCENE, backgroundSize: "cover", backgroundPosition: "center" }} />
       {css.tint && <span className="absolute inset-0 mix-blend-multiply" style={{ background: css.tint }} />}
       {css.vignette > 0 && <span className="absolute inset-0" style={{ background: `radial-gradient(ellipse at center, transparent 45%, rgba(0,0,0,${css.vignette}) 100%)` }} />}
     </span>
@@ -40,7 +41,7 @@ export function FiltersTab() {
     <div className="flex flex-col gap-3 overflow-y-auto p-3.5">
       {!clipId && (
         <p className="flex items-center gap-1.5 text-[12px] text-muted">
-          <Palette size={14} className="shrink-0" /> Pro použití filtru vyberte video nebo obrázek.
+          <Palette size={14} className="shrink-0" /> Ukázkové náhledy. Pro použití filtru vyberte klip na časové ose.
         </p>
       )}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(84px,1fr))] gap-2">
@@ -50,6 +51,7 @@ export function FiltersTab() {
             label={f.label}
             selected={!!adjust && sameAdjust(adjust, f.adjust)}
             disabled={!clipId}
+            previewWhenDisabled
             title={clipId ? `Použít filtr ${f.label}` : "Nejprve vyberte video nebo obrázek"}
             onClick={() => clipId && edit({ type: "updateClip", clipId, adjust: f.adjust })}
           >

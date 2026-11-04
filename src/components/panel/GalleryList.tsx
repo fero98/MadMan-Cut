@@ -1,11 +1,11 @@
 import { useEffect } from "react";
 import { AlertCircle, Puzzle, WifiOff } from "lucide-react";
-import { galleryError, loadGallery, openGalleryPlugin, useGallery, type GalleryPlugin } from "../../lib/gallery";
+import { galleryError, loadGallery, openGalleryPlugin, showTab, useGallery, type GalleryPlugin } from "../../lib/gallery";
 import { UpdateNuzkyButton } from "../Updates";
 import { Button } from "../ui";
 import { PluginMark } from "./PluginsTab";
 
-const MARKS: Partial<Record<GalleryPlugin["state"], string>> = { installed: "Installed", update: "Update", changed: "Edited", clash: "Same name as yours" };
+const MARKS: Partial<Record<GalleryPlugin["state"], string>> = { installed: "Nainstalováno", update: "Aktualizovat", changed: "Upraveno", clash: "Stejné jméno" };
 
 function Row({ plugin: p, open }: { plugin: GalleryPlugin; open: boolean }) {
   const off = p.state === "newer" ? "Needs a newer Nuzky" : p.state === "refused" ? "Can’t be installed" : null;
@@ -39,7 +39,7 @@ function Problem({ error }: { error: string }) {
       {detail && <p className="mt-1 max-w-[260px] text-[12px] text-muted">{detail}</p>}
       {retry && (
         <Button className="mt-3 h-7 text-[12px]" onClick={() => void loadGallery()}>
-          Try again
+          Zkusit znovu
         </Button>
       )}
       {error.startsWith("GALLERY_NEWER") && <UpdateNuzkyButton className="mt-3 h-8 px-4" />}
@@ -56,7 +56,7 @@ export function GalleryList() {
     void loadGallery();
   }, []);
   if (error) return <Problem error={error} />;
-  const shared = <p className="shrink-0 px-3.5 pt-1 pb-1.5 text-[12px] text-muted">Shared by other people. Nuzky’s maintainer checks each one before it’s listed.</p>;
+  const shared = <p className="shrink-0 px-3.5 pt-1 pb-1.5 text-[12px] text-muted">Doplňky pro MadMan Cut. Před instalací si můžete prohlédnout, co dělají.</p>;
   if (!list)
     return (
       <>
@@ -78,8 +78,9 @@ export function GalleryList() {
     return (
       <div className="flex flex-col items-center px-5 pt-8 pb-4 text-center">
         <Puzzle size={30} strokeWidth={1.6} className="text-muted" aria-hidden />
-        <h3 className="mt-2.5 text-[13px] font-semibold text-fg">The gallery is empty</h3>
-        <p className="mt-1 max-w-[260px] text-[12px] text-muted">Plugins other people share will show up here.</p>
+        <h3 className="mt-2.5 text-[13px] font-semibold text-fg">Galerie je zatím prázdná</h3>
+        <p className="mt-1 max-w-[260px] text-[12px] text-muted">Zde se zobrazí dostupné doplňky. V části Nainstalované můžete otevřít své doplňky nebo požádat AI o vytvoření nového.</p>
+        <Button className="mt-3 h-8 text-[12px]" onClick={() => showTab("installed")}>Nainstalované doplňky</Button>
       </div>
     );
   return (

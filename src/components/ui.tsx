@@ -995,6 +995,7 @@ export function PresetTile({
   selected,
   onClick,
   disabled,
+  previewWhenDisabled,
   title,
   children,
 }: {
@@ -1002,6 +1003,7 @@ export function PresetTile({
   selected: boolean;
   onClick: () => void;
   disabled?: boolean;
+  previewWhenDisabled?: boolean;
   title?: string;
   children: ReactNode;
 }) {
@@ -1013,7 +1015,7 @@ export function PresetTile({
       aria-pressed={selected}
       title={lock ?? title ?? label}
       {...disabledProps(disabled, onClick)}
-      className="group flex min-w-0 flex-col gap-1.5 rounded-[10px] text-left disabled:cursor-not-allowed disabled:opacity-40 aria-disabled:cursor-not-allowed aria-disabled:opacity-40"
+      className={`group flex min-w-0 flex-col gap-1.5 rounded-[10px] text-left disabled:cursor-not-allowed aria-disabled:cursor-not-allowed ${previewWhenDisabled ? "disabled:opacity-100 aria-disabled:opacity-100" : "disabled:opacity-40 aria-disabled:opacity-40"}`}
     >
       <span
         className={`relative block aspect-[4/3] w-full overflow-hidden rounded-[10px] border bg-bg ${
