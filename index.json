@@ -43,18 +43,18 @@
       "files": [
         {
           "path": "effects/vhs.wgsl",
-          "size": 1061,
-          "sha256": "4e023556501779dfba07c27bffced1746342d2363d7499c9a004cbee76cbe7d9"
+          "size": 1043,
+          "sha256": "bf0b9d62059f18f89878917a006051779bd4f9b6f06fdd5b63fda55623b3a6b4"
         },
         {
           "path": "plugin.json",
-          "size": 769,
-          "sha256": "2e8f9875cafc82073f9e4109fcdc178366f61b3307c4bda5942d29c9eced5362"
+          "size": 733,
+          "sha256": "ae1e7253f54581138d3bd418138df4b3bb2767df33b3a8a2d3617b17b9ecbc9b"
         },
         {
           "path": "README.md",
-          "size": 138,
-          "sha256": "c893b334ada694434769c1758b36c4e6d52f21853dd895f548c0abb0413b4c65"
+          "size": 135,
+          "sha256": "68250c2781410501083e5ccfa04912d093d46850bfae03ff29f476aca6f6f7e2"
         }
       ]
     },
@@ -99,18 +99,18 @@
       "files": [
         {
           "path": "plugin.js",
-          "size": 730,
-          "sha256": "a48c8b6daafb640bbef1322edbcee8e5365d12eef595182315f7d1315b658f55"
+          "size": 713,
+          "sha256": "7d634926e41a92f0ba34864723277ace03ce4270c3afc379ab26a81098d0c395"
         },
         {
           "path": "plugin.json",
-          "size": 789,
-          "sha256": "dbcf9d25e3f15f2d562ade2f5dd3495523e213ed06f251e13e7614b914608e84"
+          "size": 753,
+          "sha256": "f2e9cac3c55d81245f011ea87a6c64e15bb5cd09ce1fd8fe7ede6d0cabc77a76"
         },
         {
           "path": "README.md",
-          "size": 129,
-          "sha256": "f743cf9f592d15f11603bbe6d443a2828460a0bf7098b420456cf96cd1c0ac0a"
+          "size": 126,
+          "sha256": "37dca1dbd2b5f27ff96bbbdad9e8f19d21e8b9b2808bc58a744feee2e53b3bf1"
         }
       ]
     },
@@ -157,18 +157,18 @@
       "files": [
         {
           "path": "plugin.js",
-          "size": 983,
-          "sha256": "b8437fea7ad33db55c904c4cf46684fa3b443d8ed67ab143e6b0088a6cda75e8"
+          "size": 961,
+          "sha256": "c9273487c780895d12918116b896a58820f2566a847663de5dfddd497f7a5dc6"
         },
         {
           "path": "plugin.json",
-          "size": 801,
-          "sha256": "ff4d195dc19d6c12880abc1607dc55e3264823484bf661d9fb0963c4b8872f5d"
+          "size": 763,
+          "sha256": "f42bd30ad9b09fc15d37ab904d23615d7c097162c24eea605942698479dfe1df"
         },
         {
           "path": "README.md",
-          "size": 126,
-          "sha256": "55119ce9acde22ad91a6b8b96803b3cc591cc389593144ba00c08ae9f19a648d"
+          "size": 123,
+          "sha256": "bcfe450caeda8e515712e1a8ac2b48ea7b0ce19736a29cdef8c8828fc56e0404"
         }
       ]
     }
